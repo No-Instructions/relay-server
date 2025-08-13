@@ -29,7 +29,12 @@ quick-xml = "0.31.0"
 serde = { version = "1.0.173", features = ["derive"] }
 serde_json = "1.0.103"
 sha2 = "0.10.7"
+hmac = "0.12.1"
 thiserror = "1.0.44"
+coset = "0.3.7"
+ciborium = "0.2.2"
+p256 = "0.13.2"
+ecdsa = "0.16.9"
 time = { version = "0.3.25", features = ["wasm-bindgen", "parsing"] }
 tokio = { version = "1.29.1", features = ["time"] }
 urlencoding = "2.1.3"

@@ -736,13 +736,61 @@ async fn handle_socket_upgrade_full_path(
     Query(params): Query<HandlerParams>,
     State(server_state): State<Arc<Server>>,
 ) -> Result<Response, AppError> {
+    tracing::debug!("WebSocket upgrade request for doc: {}", doc_id);
+
     if doc_id != doc_id2 {
+        tracing::debug!("Doc ID mismatch: {} != {}", doc_id, doc_id2);
         return Err(AppError(
             StatusCode::BAD_REQUEST,
             anyhow!("For Yjs compatibility, the doc_id appears twice in the URL. It must be the same in both places, but we got {} and {}.", doc_id, doc_id2),
         ));
     }
-    let authorization = server_state.verify_doc_token(params.token.as_deref(), &doc_id)?;
+
+    let permission = if let Some(authenticator) = &server_state.authenticator {
+        if let Some(token) = params.token.as_deref() {
+            let current_time = current_time_epoch_millis();
+
+            authenticator
+                .verify_token_auto(token, current_time)
+                .map_err(|e| {
+                    tracing::debug!("Token verification failed: {:?}", e);
+                    (StatusCode::UNAUTHORIZED, e)
+                })?
+        } else {
+            y_sweet_core::auth::Permission::Server
+        }
+    } else {
+        y_sweet_core::auth::Permission::Server
+    };
+
+    let authorization = match permission {
+        y_sweet_core::auth::Permission::Doc(doc_perm) => {
+            if doc_perm.doc_id != doc_id {
+                return Err(AppError(
+                    StatusCode::FORBIDDEN,
+                    anyhow!("Token not valid for this document"),
+                ));
+            }
+            doc_perm.authorization
+        }
+        y_sweet_core::auth::Permission::Server => Authorization::Full,
+        y_sweet_core::auth::Permission::Prefix(prefix_perm) => {
+            if !doc_id.starts_with(&prefix_perm.prefix) {
+                return Err(AppError(
+                    StatusCode::FORBIDDEN,
+                    anyhow!("Token not valid for this document"),
+                ));
+            }
+            prefix_perm.authorization
+        }
+        y_sweet_core::auth::Permission::File(_) => {
+            return Err(AppError(
+                StatusCode::FORBIDDEN,
+                anyhow!("File token not valid for document access"),
+            ));
+        }
+    };
+
     handle_socket_upgrade(ws, Path(doc_id), authorization, State(server_state)).await
 }
 
@@ -952,7 +1000,7 @@ async fn auth_doc(
         ExpirationTimeEpochMillis(current_time_epoch_millis() + valid_for_seconds * 1000);
 
     let token = if let Some(auth) = &server_state.authenticator {
-        let token = auth.gen_doc_token(&doc_id, authorization, expiration_time);
+        let token = auth.gen_doc_token(&doc_id, authorization, expiration_time, None);
         Some(token)
     } else {
         None
@@ -1008,12 +1056,12 @@ async fn handle_file_upload_url(
                 ));
             }
 
-            // Decode the token to get the file metadata
-            let payload = authenticator
-                .decode_token(token)
+            // Verify the token and get the file metadata
+            let permission = authenticator
+                .verify_token_auto(token, current_time_epoch_millis())
                 .map_err(|_| AppError(StatusCode::UNAUTHORIZED, anyhow!("Invalid token")))?;
 
-            if let Permission::File(file_permission) = payload.payload {
+            if let Permission::File(file_permission) = permission {
                 let file_hash = file_permission.file_hash;
 
                 // Validate the file hash
@@ -1090,43 +1138,44 @@ async fn handle_file_download_url(
             // Extract hash from query parameter if present
             let query_hash = params.hash;
 
-            // Decode the token to determine its type
-            let payload = authenticator
-                .decode_token(token)
+            // Verify the token and determine its type
+            let permission = authenticator
+                .verify_token_auto(token, current_time_epoch_millis())
                 .map_err(|_| AppError(StatusCode::UNAUTHORIZED, anyhow!("Invalid token")))?;
 
-            match payload.payload {
+            match permission {
                 Permission::File(file_permission) => {
-                    // Verify file token for doc
-                    if let Ok(auth) = authenticator.verify_file_token_for_doc(
-                        token,
-                        &doc_id,
-                        current_time_epoch_millis(),
-                    ) {
-                        // Both ReadOnly and Full can download files
-                        if !matches!(auth, Authorization::ReadOnly | Authorization::Full) {
-                            return Err(AppError(
-                                StatusCode::FORBIDDEN,
-                                anyhow!("Insufficient permissions to download file"),
-                            ));
-                        }
-
-                        let file_hash = file_permission.file_hash;
-
-                        // Validate the file hash
-                        if !validate_file_hash(&file_hash) {
-                            return Err(AppError(
-                                StatusCode::BAD_REQUEST,
-                                anyhow!("Invalid file hash format in token"),
-                            ));
-                        }
-
-                        // Generate download URL using hash from token
-                        return generate_file_download_url(&server_state, &doc_id, &file_hash)
-                            .await;
-                    } else {
-                        return Err(AppError(StatusCode::UNAUTHORIZED, anyhow!("Invalid token")));
+                    // Check if file token is for this doc_id
+                    if file_permission.doc_id != doc_id {
+                        return Err(AppError(
+                            StatusCode::UNAUTHORIZED,
+                            anyhow!("Token not valid for this document"),
+                        ));
                     }
+
+                    // Both ReadOnly and Full can download files
+                    if !matches!(
+                        file_permission.authorization,
+                        Authorization::ReadOnly | Authorization::Full
+                    ) {
+                        return Err(AppError(
+                            StatusCode::FORBIDDEN,
+                            anyhow!("Insufficient permissions to download file"),
+                        ));
+                    }
+
+                    let file_hash = file_permission.file_hash;
+
+                    // Validate the file hash
+                    if !validate_file_hash(&file_hash) {
+                        return Err(AppError(
+                            StatusCode::BAD_REQUEST,
+                            anyhow!("Invalid file hash format in token"),
+                        ));
+                    }
+
+                    // Generate download URL using hash from token
+                    return generate_file_download_url(&server_state, &doc_id, &file_hash).await;
                 }
                 Permission::Server => {
                     // Server token is valid, use hash from query parameter
@@ -1153,6 +1202,45 @@ async fn handle_file_download_url(
                         StatusCode::BAD_REQUEST,
                         anyhow!("Document tokens cannot be used for file operations"),
                     ));
+                }
+                Permission::Prefix(prefix_perm) => {
+                    // Check if doc_id matches the prefix
+                    if !doc_id.starts_with(&prefix_perm.prefix) {
+                        return Err(AppError(
+                            StatusCode::FORBIDDEN,
+                            anyhow!("Token not valid for this document"),
+                        ));
+                    }
+
+                    // Both ReadOnly and Full can download files
+                    if !matches!(
+                        prefix_perm.authorization,
+                        Authorization::ReadOnly | Authorization::Full
+                    ) {
+                        return Err(AppError(
+                            StatusCode::FORBIDDEN,
+                            anyhow!("Insufficient permissions to download file"),
+                        ));
+                    }
+
+                    // Use hash from query parameter for prefix tokens
+                    if let Some(hash) = query_hash {
+                        // Validate the file hash from query parameter
+                        if !validate_file_hash(&hash) {
+                            return Err(AppError(
+                                StatusCode::BAD_REQUEST,
+                                anyhow!("Invalid file hash format in query parameter"),
+                            ));
+                        }
+
+                        // Generate download URL using hash from query parameter
+                        return generate_file_download_url(&server_state, &doc_id, &hash).await;
+                    } else {
+                        return Err(AppError(
+                            StatusCode::BAD_REQUEST,
+                            anyhow!("Hash query parameter required when using prefix token"),
+                        ));
+                    }
                 }
             }
         } else {
@@ -1528,12 +1616,12 @@ async fn handle_file_head(
                 ));
             }
 
-            // Decode the token to get the file hash
-            let payload = authenticator
-                .decode_token(token)
+            // Verify the token and get the file hash
+            let permission = authenticator
+                .verify_token_auto(token, current_time_epoch_millis())
                 .map_err(|_| AppError(StatusCode::UNAUTHORIZED, anyhow!("Invalid token")))?;
 
-            if let Permission::File(file_permission) = payload.payload {
+            if let Permission::File(file_permission) = permission {
                 let file_hash = file_permission.file_hash;
 
                 // Validate the file hash
@@ -1811,6 +1899,7 @@ mod test {
             ExpirationTimeEpochMillis(u64::MAX), // Never expires for test
             None,
             None,
+            None,
         );
 
         // Set up the mock store with the test file
@@ -1862,6 +1951,7 @@ mod test {
             doc_id,
             Authorization::Full,
             ExpirationTimeEpochMillis(u64::MAX),
+            None,
             None,
             None,
         );

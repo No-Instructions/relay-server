@@ -158,7 +158,7 @@ pub async fn sign_stdin(auth: &Authenticator) -> anyhow::Result<()> {
                 .doc_id
                 .ok_or_else(|| anyhow::anyhow!("docId is required for document tokens"))?;
 
-            let token = auth.gen_doc_token(&doc_id, authorization.clone(), expiration);
+            let token = auth.gen_doc_token(&doc_id, authorization.clone(), expiration, None);
 
             let (url, base_url) = if let Ok(prefix_url) = std::env::var("RELAY_SERVER_PREFIX_URL") {
                 let prefix_url = Url::parse(&prefix_url)?;
@@ -210,6 +210,7 @@ pub async fn sign_stdin(auth: &Authenticator) -> anyhow::Result<()> {
                 &doc_id,
                 authorization.clone(),
                 expiration,
+                None,
                 None,
                 None,
             );

@@ -1,7 +1,7 @@
 use anyhow::Context;
 use anyhow::Result;
 use axum::middleware;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::json;
 use std::{
     env,
@@ -27,6 +27,26 @@ use y_sweet_core::{
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+fn generate_public_key_from_private(private_key_b64: &str) -> Result<String, anyhow::Error> {
+    use p256::SecretKey;
+    use y_sweet_core::auth::BASE64_CUSTOM;
+
+    let private_key_bytes = BASE64_CUSTOM.decode(private_key_b64.as_bytes())?;
+    let secret_key = SecretKey::from_slice(&private_key_bytes)?;
+    let public_key = secret_key.public_key();
+    let public_key_bytes = public_key.to_sec1_bytes();
+
+    Ok(BASE64_CUSTOM.encode(&public_key_bytes))
+}
+
+#[derive(Clone, ValueEnum)]
+enum KeyType {
+    #[value(name = "HMAC-SHA-256")]
+    HmacSha256,
+    #[value(name = "ES256")]
+    Es256,
+}
 
 #[derive(Parser)]
 struct Opts {
@@ -69,6 +89,9 @@ enum ServSubcommand {
     GenAuth {
         #[clap(long)]
         json: bool,
+
+        #[clap(long, default_value = "HMAC-SHA-256")]
+        key_type: KeyType,
     },
 
     /// Convert from a YDoc v1 update format to a .ysweet file.
@@ -315,18 +338,40 @@ async fn main() -> Result<()> {
             let _ = tokio::join!(main_handle, metrics_handle);
             tracing::info!("Server shut down.");
         }
-        ServSubcommand::GenAuth { json } => {
-            let auth = Authenticator::gen_key()?;
+        ServSubcommand::GenAuth { json, key_type } => {
+            let auth = match key_type {
+                KeyType::HmacSha256 => Authenticator::gen_key_hmac()?,
+                KeyType::Es256 => Authenticator::gen_key_ecdsa()?,
+            };
 
             if *json {
-                let result = json!({
+                let mut result = json!({
                     "private_key": auth.private_key(),
                     "server_token": auth.server_token(),
                 });
 
+                // For ES256, also include public key
+                if matches!(key_type, KeyType::Es256) {
+                    if let Ok(public_key) = generate_public_key_from_private(&auth.private_key()) {
+                        result
+                            .as_object_mut()
+                            .unwrap()
+                            .insert("public_key".to_string(), json!(public_key));
+                    }
+                }
+
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
                 print_auth_message(&auth);
+
+                // For ES256, also print public key
+                if matches!(key_type, KeyType::Es256) {
+                    if let Ok(public_key) = generate_public_key_from_private(&auth.private_key()) {
+                        println!("Public key for ES256:");
+                        println!("   {}", public_key);
+                        println!();
+                    }
+                }
             }
         }
         ServSubcommand::ConvertFromUpdate { store, doc_id } => {

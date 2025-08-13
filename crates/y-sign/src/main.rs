@@ -29,9 +29,13 @@ async fn sign_stdin(auth: &Authenticator) -> Result<()> {
     let content_type = input.get("contentType").and_then(|v| v.as_str());
     let content_length = input.get("contentLength").and_then(|v| v.as_u64());
 
-    if token_type != "document" && token_type != "file" && token_type != "server" {
+    if token_type != "document"
+        && token_type != "file"
+        && token_type != "server"
+        && token_type != "prefix"
+    {
         anyhow::bail!(
-            "Invalid token type: {}. Must be 'document', 'file', or 'server'",
+            "Invalid token type: {}. Must be 'document', 'file', 'server', or 'prefix'",
             token_type
         );
     }
@@ -60,7 +64,7 @@ async fn sign_stdin(auth: &Authenticator) -> Result<()> {
             let doc_id =
                 doc_id.ok_or_else(|| anyhow::anyhow!("docId is required for document tokens"))?;
 
-            let token = auth.gen_doc_token(doc_id, authorization, expiration);
+            let token = auth.gen_doc_token(doc_id, authorization, expiration, None);
 
             output.insert(
                 "docId".to_string(),
@@ -95,6 +99,7 @@ async fn sign_stdin(auth: &Authenticator) -> Result<()> {
                 expiration,
                 content_type,
                 content_length,
+                None,
             );
 
             output.insert(
@@ -151,6 +156,43 @@ async fn sign_stdin(auth: &Authenticator) -> Result<()> {
                 "authorization".to_string(),
                 serde_json::Value::String("full".to_string()),
             );
+        }
+        "prefix" => {
+            let prefix = input
+                .get("prefix")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("prefix is required for prefix tokens"))?;
+
+            let user = input.get("user").and_then(|v| v.as_str());
+
+            // Generate CWT prefix token
+            let token = auth.gen_prefix_token_cwt(prefix, authorization, expiration, user);
+
+            output.insert("token".to_string(), serde_json::Value::String(token));
+            output.insert(
+                "prefix".to_string(),
+                serde_json::Value::String(prefix.to_string()),
+            );
+            output.insert(
+                "type".to_string(),
+                serde_json::Value::String("prefix".to_string()),
+            );
+
+            let auth_value = match authorization {
+                Authorization::ReadOnly => "read-only",
+                Authorization::Full => "full",
+            };
+            output.insert(
+                "authorization".to_string(),
+                serde_json::Value::String(auth_value.to_string()),
+            );
+
+            if let Some(user) = user {
+                output.insert(
+                    "user".to_string(),
+                    serde_json::Value::String(user.to_string()),
+                );
+            }
         }
         _ => unreachable!(), // Already validated above
     }
@@ -266,6 +308,39 @@ async fn verify_stdin(auth: &Authenticator, id: Option<&str>) -> Result<()> {
                     }
 
                     "file"
+                }
+                Permission::Prefix(prefix_permission) => {
+                    // Extract prefix for the verification section
+                    verification.insert(
+                        "prefix".to_string(),
+                        serde_json::Value::String(prefix_permission.prefix.clone()),
+                    );
+
+                    // Add authorization
+                    let auth_str = match prefix_permission.authorization {
+                        Authorization::ReadOnly => "read-only",
+                        Authorization::Full => "full",
+                    };
+                    verification.insert(
+                        "authorization".to_string(),
+                        serde_json::Value::String(auth_str.to_string()),
+                    );
+
+                    // Add user if present
+                    if let Some(user) = &prefix_permission.user {
+                        verification
+                            .insert("user".to_string(), serde_json::Value::String(user.clone()));
+                    }
+
+                    // Add expiration if present
+                    if let Some(expiration) = payload.expiration_millis {
+                        verification.insert(
+                            "expiresAt".to_string(),
+                            serde_json::Value::Number(serde_json::Number::from(expiration.0)),
+                        );
+                    }
+
+                    "prefix"
                 }
             }
         }
@@ -830,6 +905,7 @@ mod tests {
             ExpirationTimeEpochMillis(u64::MAX), // Never expires for testing
             Some(content_type),
             Some(content_length),
+            None,
         );
 
         // Create a mock context that simulates the verify_stdin function's behavior
@@ -903,6 +979,7 @@ mod tests {
             ExpirationTimeEpochMillis(u64::MAX), // Never expires for testing
             Some(content_type),
             Some(content_length),
+            None,
         );
 
         // Simulate the verification JSON output without providing a file hash

@@ -1,11 +1,11 @@
-FROM rust:1.83-slim-bookworm AS builder
+FROM rust:1.89-slim-trixie AS builder
 
 WORKDIR /build
 
 COPY . .
 RUN cargo build --release
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 # Write to disk by default
 ENV YSWEET_STORE="data"
