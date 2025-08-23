@@ -9,6 +9,7 @@ pub struct WebhookMetrics {
     pub webhook_retry_attempts_total: CounterVec,
     pub webhook_active_dispatchers: GaugeVec,
     pub webhook_config_reloads_total: CounterVec,
+    pub websocket_connections: GaugeVec,
 }
 
 static WEBHOOK_METRICS: OnceLock<Result<Arc<WebhookMetrics>, prometheus::Error>> = OnceLock::new();
@@ -78,6 +79,15 @@ impl WebhookMetrics {
         )?;
         registry.register(Box::new(webhook_config_reloads_total.clone()))?;
 
+        let websocket_connections = GaugeVec::new(
+            Opts::new(
+                "relay_server_websocket_connections",
+                "Number of active WebSocket connections for event streaming",
+            ),
+            &["prefix"],
+        )?;
+        registry.register(Box::new(websocket_connections.clone()))?;
+
         Ok(Arc::new(Self {
             webhook_requests_total,
             webhook_request_duration_seconds,
@@ -85,6 +95,7 @@ impl WebhookMetrics {
             webhook_retry_attempts_total,
             webhook_active_dispatchers,
             webhook_config_reloads_total,
+            websocket_connections,
         }))
     }
 
@@ -132,6 +143,12 @@ impl WebhookMetrics {
         self.webhook_config_reloads_total
             .with_label_values(&[status])
             .inc();
+    }
+
+    pub fn set_websocket_connections(&self, prefix: &str, count: usize) {
+        self.websocket_connections
+            .with_label_values(&[prefix])
+            .set(count as f64);
     }
 }
 

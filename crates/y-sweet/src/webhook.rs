@@ -4,7 +4,8 @@ use y_sweet_core::{
     webhook::{WebhookConfig, WebhookConfigDocument, WebhookDispatcher},
 };
 
-pub fn create_webhook_dispatcher() -> Option<WebhookDispatcher> {
+/// Load webhook configs from environment variable
+pub fn load_webhook_configs() -> Option<Vec<WebhookConfig>> {
     let config_json = env::var("RELAY_SERVER_WEBHOOK_CONFIG").ok()?;
 
     let configs: Vec<WebhookConfig> = serde_json::from_str(&config_json)
@@ -13,6 +14,44 @@ pub fn create_webhook_dispatcher() -> Option<WebhookDispatcher> {
             e
         })
         .ok()?;
+
+    Some(configs)
+}
+
+/// Load webhook configs from store or environment variable fallback
+pub async fn load_webhook_configs_from_store(
+    store: Option<Arc<Box<dyn Store>>>,
+) -> Result<Option<Vec<WebhookConfig>>, Box<dyn std::error::Error>> {
+    // First try to load from store
+    if let Some(store) = store {
+        let config_key = ".config/webhooks.json";
+
+        match store.get(config_key).await {
+            Ok(Some(data)) => {
+                let config_str = String::from_utf8(data)?;
+                let config_doc: WebhookConfigDocument = serde_json::from_str(&config_str)?;
+                config_doc
+                    .validate()
+                    .map_err(|e| format!("Invalid webhook config: {}", e))?;
+                return Ok(Some(config_doc.configs));
+            }
+            Ok(None) => {
+                tracing::info!("No webhook configuration found in store");
+            }
+            Err(e) => {
+                tracing::error!("Failed to load webhook config from store: {}", e);
+                return Err(e.into());
+            }
+        }
+    }
+
+    // Fallback to environment variable
+    Ok(load_webhook_configs())
+}
+
+#[deprecated(note = "Use load_webhook_configs() instead")]
+pub fn create_webhook_dispatcher() -> Option<WebhookDispatcher> {
+    let configs = load_webhook_configs()?;
 
     WebhookDispatcher::new(configs)
         .map_err(|e| {

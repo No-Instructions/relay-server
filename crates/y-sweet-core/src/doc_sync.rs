@@ -1,6 +1,6 @@
 use crate::{
-    doc_connection::DOC_NAME, store::Store, sync::awareness::Awareness, sync_kv::SyncKv,
-    webhook::WebhookCallback,
+    doc_connection::DOC_NAME, event::DocumentUpdatedEvent, store::Store,
+    sync::awareness::Awareness, sync_kv::SyncKv, webhook::WebhookCallback,
 };
 use anyhow::{anyhow, Context, Result};
 use std::sync::{Arc, RwLock};
@@ -58,7 +58,11 @@ impl DocWithSyncKv {
 
                 // Trigger webhook if callback is configured
                 if let Some(ref callback) = webhook_callback {
-                    callback(doc_key.clone());
+                    // Step 1: Create the event payload with business data
+                    let event = DocumentUpdatedEvent::new(doc_key.clone());
+
+                    // Step 2: Callback handles envelope creation and dispatch
+                    callback(event);
                 }
             })
             .map_err(|_| anyhow!("Failed to subscribe to updates"))?

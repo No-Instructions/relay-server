@@ -36,13 +36,21 @@ use y_sweet_core::{
         DocCreationRequest, DocumentVersionEntry, DocumentVersionResponse, FileDownloadUrlResponse,
         FileHistoryEntry, FileHistoryResponse, FileUploadUrlResponse, NewDocResponse,
     },
-    auth::{Authenticator, ExpirationTimeEpochMillis, Permission, DEFAULT_EXPIRATION_SECONDS},
+    auth::{
+        Authenticator, ExpirationTimeEpochMillis, Permission, PrefixPermission,
+        DEFAULT_EXPIRATION_SECONDS,
+    },
     doc_connection::DocConnection,
     doc_sync::DocWithSyncKv,
+    event::{
+        DocumentUpdatedEvent, EventDispatcher, EventEnvelope, EventSender, ServerMessage,
+        UnifiedEventDispatcher, WebSocketSender, WebhookSender,
+    },
     store::Store,
     sync::awareness::Awareness,
     sync_kv::SyncKv,
-    webhook::{DebouncedWebhookQueue, WebhookCallback, WebhookDispatcher},
+    webhook::WebhookConfig,
+    webhook_metrics::WebhookMetrics,
 };
 
 const PLANE_VERIFIED_USER_DATA_HEADER: &str = "x-verified-user-data";
@@ -100,8 +108,8 @@ pub struct Server {
     /// Whether to garbage collect docs that are no longer in use.
     /// Disabled for single-doc mode, since we only have one doc.
     doc_gc: bool,
-    webhook_queue: Arc<RwLock<Option<Arc<DebouncedWebhookQueue>>>>,
-    pending_webhooks: Arc<RwLock<Vec<String>>>,
+    event_dispatcher: Option<Arc<dyn EventDispatcher>>,
+    websocket_sender: Arc<WebSocketSender>,
 }
 
 impl Server {
@@ -113,10 +121,29 @@ impl Server {
         allowed_hosts: Vec<AllowedHost>,
         cancellation_token: CancellationToken,
         doc_gc: bool,
-        webhook_dispatcher: Option<WebhookDispatcher>,
+        webhook_configs: Option<Vec<WebhookConfig>>,
     ) -> Result<Self> {
-        let webhook_queue = webhook_dispatcher
-            .map(|dispatcher| Arc::new(DebouncedWebhookQueue::new(Arc::new(dispatcher))));
+        let websocket_sender = Arc::new(WebSocketSender::new());
+
+        let event_dispatcher = if let Some(configs) = webhook_configs {
+            let metrics = WebhookMetrics::new()
+                .map_err(|e| anyhow!("Failed to initialize webhook metrics: {}", e))?;
+
+            let webhook_sender = Arc::new(
+                WebhookSender::new(configs.clone(), metrics)
+                    .map_err(|e| anyhow!("Failed to create webhook sender: {}", e))?,
+            );
+
+            let senders: Vec<Arc<dyn EventSender>> = vec![webhook_sender, websocket_sender.clone()];
+
+            Some(Arc::new(UnifiedEventDispatcher::new(senders)) as Arc<dyn EventDispatcher>)
+        } else {
+            tracing::info!("No webhook configs provided, creating WebSocket-only event dispatcher");
+            let senders: Vec<Arc<dyn EventSender>> = vec![websocket_sender.clone()];
+            Some(Arc::new(UnifiedEventDispatcher::new(senders)) as Arc<dyn EventDispatcher>)
+        };
+
+        tracing::info!("Event dispatcher created successfully");
 
         Ok(Self {
             docs: Arc::new(DashMap::new()),
@@ -128,8 +155,8 @@ impl Server {
             allowed_hosts,
             cancellation_token,
             doc_gc,
-            webhook_queue: Arc::new(RwLock::new(webhook_queue)),
-            pending_webhooks: Arc::new(RwLock::new(Vec::new())),
+            event_dispatcher,
+            websocket_sender,
         })
     }
 
@@ -159,97 +186,12 @@ impl Server {
     }
 
     pub async fn reload_webhook_config(&self) -> Result<String, anyhow::Error> {
-        use y_sweet_core::webhook::WebhookDispatcher;
-
-        // Try to load new configuration from store
-        let new_dispatcher = WebhookDispatcher::from_store(self.store.clone())
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to load webhook config from store: {}", e))?;
-
-        // If no store config found, try environment variable fallback
-        let (new_dispatcher, config_source) = if new_dispatcher.is_none() {
-            if let Some(env_dispatcher) = crate::webhook::create_webhook_dispatcher() {
-                (Some(env_dispatcher), "environment variable")
-            } else {
-                (None, "none")
-            }
-        } else {
-            (new_dispatcher, "store")
-        };
-
-        // Get reference to old queue and collect pending webhooks
-        let (old_queue, pending_webhooks) = {
-            let queue_guard = self.webhook_queue.read().unwrap();
-            let old_queue = queue_guard.clone();
-            drop(queue_guard);
-
-            // Collect any pending webhooks while queue is None
-            let mut pending = self.pending_webhooks.write().unwrap();
-            let webhooks = pending.drain(..).collect::<Vec<_>>();
-            drop(pending);
-
-            (old_queue, webhooks)
-        };
-
-        // Create new queue and update atomically
-        let new_queue = new_dispatcher
-            .map(|dispatcher| Arc::new(DebouncedWebhookQueue::new(Arc::new(dispatcher))));
-
-        // Update webhook queue with write lock
-        {
-            let mut queue_guard = self.webhook_queue.write().unwrap();
-            *queue_guard = new_queue.clone();
-        }
-
-        // Replay any pending webhooks to the new queue
-        if let Some(queue) = new_queue.as_ref() {
-            for doc_id in pending_webhooks {
-                let queue_clone = queue.clone();
-                tokio::spawn(async move {
-                    queue_clone.queue_webhook(doc_id).await;
-                });
-            }
-        }
-
-        // Gracefully shutdown old queue after new queue is active
-        if let Some(old_queue) = old_queue {
-            old_queue.shutdown().await;
-        }
-
-        // Record metrics for config reload
-        if let Some(queue) = &*self.webhook_queue.read().unwrap() {
-            queue.metrics().record_config_reload("success");
-        }
-
-        // Return status message and log configuration details
-        let status = match &*self.webhook_queue.read().unwrap() {
-            Some(queue) => {
-                // Access dispatcher configs through the queue
-                let configs = queue.configs();
-
-                // Print configuration details
-                for config in configs {
-                    tracing::info!(
-                        "Webhook config: prefix='{}' -> url='{}' (timeout: {}ms)",
-                        config.prefix,
-                        config.url,
-                        config.timeout_ms
-                    );
-                }
-                format!(
-                    "Webhook configuration loaded from {} with {} configs",
-                    config_source,
-                    configs.len()
-                )
-            }
-            None => format!(
-                "Webhook configuration loaded from {} - webhooks disabled",
-                config_source
-            ),
-        };
-
-        tracing::info!("{}", status);
-        Ok(status)
+        // For now, webhook configuration reloading is not supported with the new event system
+        // This would require a more complex architecture to hot-reload the event dispatcher
+        // In the meantime, server restart is required to change webhook configuration
+        Err(anyhow::anyhow!(
+            "Webhook configuration reloading is not yet supported with the new event system. Please restart the server to load new configuration."
+        ))
     }
 
     fn validate_doc_id(doc_id: &str) -> Result<()> {
@@ -266,25 +208,22 @@ impl Server {
         Self::validate_doc_id(doc_id)?;
         let (send, recv) = channel(1024);
 
-        let webhook_callback = {
-            let webhook_queue_ref = self.webhook_queue.clone();
-            let pending_webhooks_ref = self.pending_webhooks.clone();
-            Some(Arc::new(move |doc_id: String| {
-                // Try to get current webhook queue
-                let queue_guard = webhook_queue_ref.read().unwrap();
-                if let Some(queue) = queue_guard.as_ref() {
-                    let queue_clone = queue.clone();
-                    drop(queue_guard); // Release read lock before async work
-                    tokio::spawn(async move {
-                        queue_clone.queue_webhook(doc_id).await;
-                    });
-                } else {
-                    // No queue available, buffer the webhook for replay after reload
-                    drop(queue_guard); // Release read lock before write lock
-                    let mut pending = pending_webhooks_ref.write().unwrap();
-                    pending.push(doc_id);
-                }
-            }) as WebhookCallback)
+        let event_callback = {
+            let event_dispatcher = self.event_dispatcher.clone();
+
+            let routing_channel = doc_id.to_string();
+
+            if let Some(dispatcher) = event_dispatcher {
+                Some(Arc::new(move |event: DocumentUpdatedEvent| {
+                    // Step 1: Create the envelope with routing channel and payload
+                    let envelope = EventEnvelope::new(routing_channel.clone(), event);
+
+                    // Step 2: Send via dispatcher
+                    dispatcher.send_event(envelope);
+                }) as y_sweet_core::webhook::WebhookCallback)
+            } else {
+                None
+            }
         };
 
         let dwskv = DocWithSyncKv::new(
@@ -293,7 +232,7 @@ impl Server {
             move || {
                 send.try_send(()).unwrap();
             },
-            webhook_callback,
+            event_callback,
         )
         .await?;
 
@@ -511,6 +450,7 @@ impl Server {
             .route("/f/:doc_id/:hash", delete(handle_file_delete_by_hash))
             .route("/f/:doc_id", head(handle_file_head))
             .route("/webhook/reload", post(reload_webhook_config_endpoint))
+            .route("/e/:prefix/ws", get(handle_event_websocket_upgrade))
             .with_state(self.clone())
     }
 
@@ -543,12 +483,29 @@ impl Server {
             app.layer(middleware::from_fn(Self::redact_error_middleware))
         };
 
+        tracing::info!("Starting HTTP server...");
         axum::serve(listener, app.into_make_service())
-            .with_graceful_shutdown(async move { token.cancelled().await })
+            .with_graceful_shutdown(async move {
+                tracing::info!("Waiting for cancellation token...");
+                token.cancelled().await;
+                tracing::info!("Cancellation token triggered, starting graceful shutdown");
+            })
             .await?;
 
+        tracing::info!("HTTP server stopped, shutting down event dispatcher...");
+
+        // Explicitly shutdown event dispatcher before waiting on doc workers
+        if let Some(event_dispatcher) = &self.event_dispatcher {
+            tracing::info!("Shutting down event dispatcher...");
+            event_dispatcher.shutdown();
+            tracing::info!("Event dispatcher shutdown complete");
+        }
+
+        tracing::info!("Closing doc worker tracker...");
         self.doc_worker_tracker.close();
+        tracing::info!("Waiting for doc workers to finish...");
         self.doc_worker_tracker.wait().await;
+        tracing::info!("All doc workers stopped");
 
         Ok(())
     }
@@ -598,6 +555,11 @@ impl Server {
 #[derive(Deserialize)]
 struct HandlerParams {
     token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct EventWebSocketPath {
+    prefix: String,
 }
 
 async fn get_doc_as_update(
@@ -899,7 +861,68 @@ async fn new_doc(
     State(server_state): State<Arc<Server>>,
     Json(body): Json<DocCreationRequest>,
 ) -> Result<Json<NewDocResponse>, AppError> {
-    server_state.check_auth(auth_header)?;
+    let token = get_token_from_header(auth_header);
+
+    if let Some(authenticator) = &server_state.authenticator {
+        if let Some(token) = token.as_deref() {
+            // First try server token
+            if authenticator
+                .verify_server_token(token, current_time_epoch_millis())
+                .is_ok()
+            {
+                // Server token allows creating any document
+            } else {
+                // Try prefix token - we need to check if the doc_id matches the prefix
+                if let Some(doc_id) = &body.doc_id {
+                    let permission = authenticator
+                        .verify_token_auto(token, current_time_epoch_millis())
+                        .map_err(|e| {
+                            AppError(StatusCode::UNAUTHORIZED, anyhow!("Invalid token: {}", e))
+                        })?;
+
+                    match permission {
+                        Permission::Prefix(prefix_perm) => {
+                            // Check if the document ID starts with the prefix
+                            if !doc_id.starts_with(&prefix_perm.prefix) {
+                                return Err(AppError(
+                                    StatusCode::FORBIDDEN,
+                                    anyhow!(
+                                        "Document ID '{}' does not match prefix '{}'",
+                                        doc_id,
+                                        prefix_perm.prefix
+                                    ),
+                                ));
+                            }
+                            // Check if we have Full permissions (needed for creation)
+                            if prefix_perm.authorization != Authorization::Full {
+                                return Err(AppError(
+                                    StatusCode::FORBIDDEN,
+                                    anyhow!("Prefix token requires Full authorization to create documents")
+                                ));
+                            }
+                        }
+                        _ => {
+                            return Err(AppError(
+                                StatusCode::FORBIDDEN,
+                                anyhow!("Only server or prefix tokens can create documents"),
+                            ));
+                        }
+                    }
+                } else {
+                    // No doc_id provided - only server tokens can create with auto-generated ID
+                    return Err(AppError(
+                        StatusCode::FORBIDDEN,
+                        anyhow!("Prefix tokens must specify a docId that matches their prefix"),
+                    ));
+                }
+            }
+        } else {
+            return Err(AppError(
+                StatusCode::UNAUTHORIZED,
+                anyhow!("No token provided"),
+            ));
+        }
+    }
 
     let doc_id = if let Some(doc_id) = body.doc_id {
         if !validate_doc_name(doc_id.as_str()) {
@@ -1754,6 +1777,221 @@ async fn metrics_endpoint(State(_server_state): State<Arc<Server>>) -> Result<St
             anyhow!("Failed to convert metrics to string: {}", e),
         )
     })?)
+}
+
+async fn handle_event_websocket_upgrade(
+    ws: WebSocketUpgrade,
+    Path(path): Path<EventWebSocketPath>,
+    Query(params): Query<HandlerParams>,
+    State(server_state): State<Arc<Server>>,
+) -> Result<Response, AppError> {
+    use y_sweet_core::auth::{detect_token_format, TokenFormat};
+
+    tracing::info!(
+        "WebSocket upgrade request received for prefix: {}",
+        path.prefix
+    );
+
+    if let Some(authenticator) = &server_state.authenticator {
+        if let Some(token) = params.token.as_deref() {
+            tracing::info!("Token provided, checking format...");
+
+            // Check token format - only accept CWT tokens
+            let token_format = detect_token_format(token);
+            tracing::info!("Token format detected: {:?}", token_format);
+
+            if token_format != TokenFormat::Cwt {
+                tracing::warn!("Rejecting non-CWT token");
+                return Err(AppError(
+                    StatusCode::UNAUTHORIZED,
+                    anyhow!("Only CWT tokens are supported for WebSocket event streaming"),
+                ));
+            }
+
+            // Verify the CWT token using the auto method (which will route to CWT verification)
+            tracing::info!("Verifying CWT token...");
+            let permission = authenticator
+                .verify_token_auto(token, current_time_epoch_millis())
+                .map_err(|e| {
+                    tracing::error!("Token verification failed: {}", e);
+                    AppError(
+                        StatusCode::UNAUTHORIZED,
+                        anyhow!("Invalid CWT token: {}", e),
+                    )
+                })?;
+
+            match permission {
+                Permission::Prefix(prefix_perm) => {
+                    tracing::info!("Valid prefix token for prefix: {}", prefix_perm.prefix);
+
+                    // Validate that the URL path prefix matches the token prefix
+                    if prefix_perm.prefix != path.prefix {
+                        tracing::warn!(
+                            "URL prefix '{}' does not match token prefix '{}'",
+                            path.prefix,
+                            prefix_perm.prefix
+                        );
+                        return Err(AppError(
+                            StatusCode::FORBIDDEN,
+                            anyhow!(
+                                "URL prefix '{}' does not match token prefix '{}'",
+                                path.prefix,
+                                prefix_perm.prefix
+                            ),
+                        ));
+                    }
+
+                    return Ok(ws.on_upgrade(move |socket| {
+                        handle_prefix_event_stream(socket, server_state, prefix_perm)
+                    }));
+                }
+                Permission::Server => {
+                    tracing::info!("Valid server token - creating synthetic prefix permission");
+
+                    // Server tokens have full access, so create a synthetic prefix permission
+                    // for the requested prefix with full authorization
+                    let synthetic_prefix_perm = PrefixPermission {
+                        prefix: path.prefix.clone(),
+                        authorization: Authorization::Full,
+                        user: None, // Server tokens don't have a user
+                    };
+
+                    return Ok(ws.on_upgrade(move |socket| {
+                        handle_prefix_event_stream(socket, server_state, synthetic_prefix_perm)
+                    }));
+                }
+                _ => {
+                    tracing::warn!("Token is neither a prefix nor server token");
+                    return Err(AppError(
+                        StatusCode::FORBIDDEN,
+                        anyhow!("Only CWT prefix tokens and server tokens are supported for event streaming"),
+                    ));
+                }
+            }
+        } else {
+            tracing::warn!("No token provided in request");
+            return Err(AppError(
+                StatusCode::UNAUTHORIZED,
+                anyhow!("No token provided"),
+            ));
+        }
+    } else {
+        tracing::error!("No authenticator configured");
+        return Err(AppError(
+            StatusCode::UNAUTHORIZED,
+            anyhow!("Authentication required"),
+        ));
+    }
+}
+
+async fn handle_prefix_event_stream(
+    socket: WebSocket,
+    server_state: Arc<Server>,
+    prefix_perm: PrefixPermission,
+) {
+    tracing::info!(
+        "WebSocket connection established for prefix: {}",
+        prefix_perm.prefix
+    );
+
+    let conn_id = nanoid::nanoid!();
+    let (mut sink, mut stream) = socket.split();
+    let (send, mut recv) = tokio::sync::mpsc::unbounded_channel();
+
+    // Get cancellation token for graceful shutdown
+    let cancellation_token = server_state.cancellation_token.clone();
+
+    // Register temporary prefix in websocket sender
+    server_state.websocket_sender.register_websocket_prefix(
+        prefix_perm.prefix.clone(),
+        conn_id.clone(),
+        send.clone(),
+        prefix_perm.authorization,
+    );
+
+    tracing::info!(
+        "Registered WebSocket connection {} for prefix: {}",
+        conn_id,
+        prefix_perm.prefix
+    );
+
+    // Clone what we need for the tasks
+    let send_clone = send.clone();
+    let cancellation_token_outgoing = cancellation_token.clone();
+    let cancellation_token_incoming = cancellation_token.clone();
+
+    // Handle outgoing messages (events)
+    let outgoing_task = tokio::spawn(async move {
+        tracing::info!("Outgoing task started");
+        loop {
+            tokio::select! {
+                _ = cancellation_token_outgoing.cancelled() => {
+                    // Server is shutting down, close the connection
+                    let _ = sink.send(Message::Close(None)).await;
+                    break;
+                }
+                msg = recv.recv() => {
+                    match msg {
+                        Some(msg) => {
+                            tracing::info!("Received message to send: {:?}", msg);
+                            let json = serde_json::to_string(&msg).unwrap();
+                            tracing::info!("Sending JSON to WebSocket: {}", json);
+                            if sink.send(Message::Text(json)).await.is_err() {
+                                tracing::error!("Failed to send message to WebSocket - connection closed");
+                                break; // Connection closed
+                            }
+                            tracing::info!("Message sent successfully");
+                        }
+                        None => {
+                            tracing::info!("Channel closed by sender - shutting down");
+                            break; // Channel closed by sender (cleanup/shutdown)
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // Handle incoming messages (ping only)
+    let incoming_task = tokio::spawn(async move {
+        tracing::info!("Incoming task started");
+        loop {
+            tokio::select! {
+                _ = cancellation_token_incoming.cancelled() => {
+                    break; // Server is shutting down
+                }
+                msg = stream.next() => {
+                    match msg {
+                        Some(Ok(Message::Text(text))) => {
+                            if text.trim() == "ping" {
+                                if send_clone.send(ServerMessage::Pong).is_err() {
+                                    break;
+                                }
+                            }
+                            // Ignore all other messages
+                        }
+                        Some(Ok(Message::Close(_))) => break,
+                        None => break, // Stream ended
+                        _ => continue,
+                    }
+                }
+            }
+        }
+    });
+
+    // Wait for connection to close or shutdown signal
+    tokio::select! {
+        _ = cancellation_token.cancelled() => {
+            // Shutdown requested - tasks will detect this via their own cancellation tokens
+        }
+        _ = outgoing_task => {},
+        _ = incoming_task => {},
+    }
+
+    // Cleanup: unregister this specific connection
+    server_state
+        .websocket_sender
+        .unregister_websocket_connection(&prefix_perm.prefix, &conn_id);
 }
 
 #[cfg(test)]

@@ -271,7 +271,15 @@ async fn main() -> Result<()> {
             }
 
             let token = CancellationToken::new();
-            let webhook_dispatcher = y_sweet::webhook::create_webhook_dispatcher();
+
+            // Load webhook configs from environment for now (store loading can be added later)
+            let webhook_configs = y_sweet::webhook::load_webhook_configs();
+            if let Some(ref configs) = webhook_configs {
+                tracing::info!(
+                    "Loaded {} webhook configurations from environment",
+                    configs.len()
+                );
+            }
 
             let server = y_sweet::server::Server::new(
                 store,
@@ -281,14 +289,9 @@ async fn main() -> Result<()> {
                 allowed_hosts,
                 token.clone(),
                 true,
-                webhook_dispatcher,
+                webhook_configs,
             )
             .await?;
-
-            // Try to load webhook config from store on startup
-            if let Err(e) = server.reload_webhook_config().await {
-                tracing::warn!("Failed to load webhook config from store: {}", e);
-            }
 
             let prod = *prod;
             let server = Arc::new(server);
@@ -317,9 +320,11 @@ async fn main() -> Result<()> {
 
             let metrics_handle = tokio::spawn({
                 let server = server.clone();
+                let token = token.clone();
                 async move {
                     let metrics_routes = server.metrics_routes();
                     axum::serve(metrics_listener, metrics_routes.into_make_service())
+                        .with_graceful_shutdown(async move { token.cancelled().await })
                         .await
                         .unwrap();
                 }
@@ -444,7 +449,16 @@ async fn main() -> Result<()> {
             };
 
             let cancellation_token = CancellationToken::new();
-            let webhook_dispatcher = y_sweet::webhook::create_webhook_dispatcher();
+
+            // Load webhook configs from environment for single doc mode
+            let webhook_configs = y_sweet::webhook::load_webhook_configs();
+            if let Some(ref configs) = webhook_configs {
+                tracing::info!(
+                    "Loaded {} webhook configurations for single doc mode from environment",
+                    configs.len()
+                );
+            }
+
             let server = y_sweet::server::Server::new(
                 store,
                 std::time::Duration::from_secs(*checkpoint_freq_seconds),
@@ -453,14 +467,9 @@ async fn main() -> Result<()> {
                 vec![], // No allowed hosts for single doc mode
                 cancellation_token.clone(),
                 false,
-                webhook_dispatcher,
+                webhook_configs,
             )
             .await?;
-
-            // Try to load webhook config from store on startup
-            if let Err(e) = server.reload_webhook_config().await {
-                tracing::warn!("Failed to load webhook config from store: {}", e);
-            }
 
             // Load the one document we're operating with
             server
