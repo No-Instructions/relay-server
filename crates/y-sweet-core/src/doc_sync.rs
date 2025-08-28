@@ -97,4 +97,23 @@ impl DocWithSyncKv {
 
         Ok(())
     }
+
+    /// Set the channel for this document in metadata
+    pub fn set_channel(&self, channel: &str) {
+        self.sync_kv.update_metadata(
+            "channel".to_string(),
+            ciborium::value::Value::Text(channel.to_string()),
+        );
+    }
+
+    /// Get the channel for this document from metadata
+    pub fn get_channel(&self) -> Option<String> {
+        self.sync_kv.get_metadata()?.get("channel").and_then(|v| {
+            if let ciborium::value::Value::Text(channel) = v {
+                Some(channel.clone())
+            } else {
+                None
+            }
+        })
+    }
 }

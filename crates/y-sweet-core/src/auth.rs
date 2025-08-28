@@ -592,13 +592,21 @@ impl Authenticator {
         authorization: Authorization,
         expiration_time: ExpirationTimeEpochMillis,
         user: Option<&str>,
+        channel: Option<String>,
     ) -> String {
+        // Validate channel if provided
+        if let Some(ref channel_name) = channel {
+            if !crate::api_types::validate_key(channel_name) {
+                panic!("Invalid channel name: must contain only alphanumeric characters, hyphens, and underscores");
+            }
+        }
+
         let permission = Permission::Doc(DocPermission {
             doc_id: doc_id.to_string(),
             authorization,
             user: user.map(|u| u.to_string()),
         });
-        self.gen_cwt_token(permission, Some(expiration_time))
+        self.gen_cwt_token_with_channel(permission, Some(expiration_time), channel)
     }
 
     /// Generate a CWT file token
@@ -611,7 +619,15 @@ impl Authenticator {
         content_type: Option<&str>,
         content_length: Option<u64>,
         user: Option<&str>,
+        channel: Option<String>,
     ) -> String {
+        // Validate channel if provided
+        if let Some(ref channel_name) = channel {
+            if !crate::api_types::validate_key(channel_name) {
+                panic!("Invalid channel name: must contain only alphanumeric characters, hyphens, and underscores");
+            }
+        }
+
         let permission = Permission::File(FilePermission {
             file_hash: file_hash.to_string(),
             doc_id: doc_id.to_string(),
@@ -620,7 +636,7 @@ impl Authenticator {
             content_length,
             user: user.map(|u| u.to_string()),
         });
-        self.gen_cwt_token(permission, Some(expiration_time))
+        self.gen_cwt_token_with_channel(permission, Some(expiration_time), channel)
     }
 
     /// Generate a prefix token (custom format)
@@ -664,6 +680,15 @@ impl Authenticator {
         permission: Permission,
         expiration_time: Option<ExpirationTimeEpochMillis>,
     ) -> String {
+        self.gen_cwt_token_with_channel(permission, expiration_time, None)
+    }
+
+    fn gen_cwt_token_with_channel(
+        &self,
+        permission: Permission,
+        expiration_time: Option<ExpirationTimeEpochMillis>,
+        channel: Option<String>,
+    ) -> String {
         use crate::cwt::{permission_to_scope, CwtAuthenticator, CwtClaims};
 
         let cwt_auth = CwtAuthenticator::new(&self.private_key, self.key_id.clone())
@@ -689,6 +714,7 @@ impl Authenticator {
                     .as_secs(),
             ),
             scope: permission_to_scope(&permission),
+            channel,
         };
 
         let token_bytes = cwt_auth
@@ -878,6 +904,16 @@ impl Authenticator {
 
     /// Verify a CWT token and extract the permission
     fn verify_cwt_token(&self, token: &str, current_time: u64) -> Result<Permission, AuthError> {
+        let (permission, _) = self.verify_cwt_token_with_channel(token, current_time)?;
+        Ok(permission)
+    }
+
+    /// Verify a CWT token and extract both permission and channel
+    fn verify_cwt_token_with_channel(
+        &self,
+        token: &str,
+        current_time: u64,
+    ) -> Result<(Permission, Option<String>), AuthError> {
         use crate::cwt::{scope_to_permission, CwtAuthenticator};
 
         tracing::debug!("Starting CWT token verification");
@@ -983,7 +1019,7 @@ impl Authenticator {
         }
 
         tracing::debug!("CWT token verification successful");
-        Ok(permission)
+        Ok((permission, claims.channel))
     }
 
     /// Extract user information from a token (works with both custom and CWT tokens)
@@ -1075,6 +1111,25 @@ impl Authenticator {
                 }
             }
             _ => Err(AuthError::InvalidResource),
+        }
+    }
+
+    /// Verify a token and extract channel claim (CWT tokens only)
+    pub fn verify_token_with_channel(
+        &self,
+        token: &str,
+        current_time: u64,
+    ) -> Result<(Permission, Option<String>), AuthError> {
+        match detect_token_format(token) {
+            TokenFormat::Custom => {
+                let payload = self.verify(token, current_time)?;
+                Ok((payload.payload, None)) // Custom tokens don't have channel claims
+            }
+            TokenFormat::Cwt => {
+                let (permission, channel) =
+                    self.verify_cwt_token_with_channel(token, current_time)?;
+                Ok((permission, channel))
+            }
         }
     }
 }
@@ -1399,6 +1454,7 @@ mod tests {
             Authorization::Full,
             ExpirationTimeEpochMillis(u64::MAX),
             None,
+            None,
         );
 
         assert_eq!(detect_token_format(&token), TokenFormat::Cwt);
@@ -1429,6 +1485,7 @@ mod tests {
             ExpirationTimeEpochMillis(u64::MAX),
             Some("application/json"),
             Some(12345),
+            None,
             None,
         );
 
@@ -1466,6 +1523,7 @@ mod tests {
             Authorization::Full,
             ExpirationTimeEpochMillis(u64::MAX),
             None,
+            None,
         );
         assert_eq!(detect_token_format(&cwt_token), TokenFormat::Cwt);
     }
@@ -1492,6 +1550,7 @@ mod tests {
             Authorization::ReadOnly,
             ExpirationTimeEpochMillis(u64::MAX),
             None,
+            None,
         );
         assert!(matches!(
             authenticator.verify_doc_token(&cwt_token, "doc123", 0),
@@ -1510,6 +1569,7 @@ mod tests {
             Authorization::Full,
             ExpirationTimeEpochMillis(u64::MAX),
             None,
+            None,
         );
 
         assert!(token.starts_with("test_key."));
@@ -1527,8 +1587,13 @@ mod tests {
         let authenticator = Authenticator::gen_key().unwrap();
         let short_expiration = ExpirationTimeEpochMillis(1000); // 1 second after epoch
 
-        let token =
-            authenticator.gen_doc_token_cwt("doc123", Authorization::Full, short_expiration, None);
+        let token = authenticator.gen_doc_token_cwt(
+            "doc123",
+            Authorization::Full,
+            short_expiration,
+            None,
+            None,
+        );
 
         // Should fail with expired error
         assert!(matches!(
@@ -1546,6 +1611,7 @@ mod tests {
             "doc123",
             Authorization::Full,
             ExpirationTimeEpochMillis(u64::MAX),
+            None,
             None,
         );
 
@@ -1621,6 +1687,7 @@ mod tests {
             Authorization::Full,
             ExpirationTimeEpochMillis(u64::MAX),
             Some("user123"),
+            None,
         );
 
         let user = authenticator.extract_user_from_token(&doc_token).unwrap();
@@ -1641,6 +1708,7 @@ mod tests {
             Some("application/json"),
             Some(1024),
             Some("user456"),
+            None,
         );
 
         let user = authenticator.extract_user_from_token(&file_token).unwrap();
@@ -1657,6 +1725,7 @@ mod tests {
             "doc789",
             Authorization::Full,
             ExpirationTimeEpochMillis(u64::MAX),
+            None,
             None,
         );
 
@@ -1714,6 +1783,87 @@ mod tests {
     }
 
     #[test]
+    fn test_cwt_channel_claims() {
+        let authenticator = Authenticator::gen_key().unwrap();
+        let doc_id = "test_doc_123";
+        let channel = "team-updates";
+
+        // Test document token with channel claim
+        let token_with_channel = authenticator.gen_doc_token_cwt(
+            doc_id,
+            Authorization::Full,
+            ExpirationTimeEpochMillis(u64::MAX),
+            Some("user123"),
+            Some(channel.to_string()),
+        );
+
+        // Test document token without channel claim
+        let token_without_channel = authenticator.gen_doc_token_cwt(
+            doc_id,
+            Authorization::Full,
+            ExpirationTimeEpochMillis(u64::MAX),
+            Some("user123"),
+            None,
+        );
+
+        // Verify token with channel returns the channel
+        let (permission, extracted_channel) = authenticator
+            .verify_token_with_channel(&token_with_channel, 0)
+            .unwrap();
+
+        match permission {
+            Permission::Doc(doc_perm) => {
+                assert_eq!(doc_perm.doc_id, doc_id);
+                assert_eq!(doc_perm.authorization, Authorization::Full);
+                assert_eq!(doc_perm.user, Some("user123".to_string()));
+            }
+            _ => panic!("Expected doc permission"),
+        }
+        assert_eq!(extracted_channel, Some(channel.to_string()));
+
+        // Verify token without channel returns None for channel
+        let (permission, extracted_channel) = authenticator
+            .verify_token_with_channel(&token_without_channel, 0)
+            .unwrap();
+
+        match permission {
+            Permission::Doc(doc_perm) => {
+                assert_eq!(doc_perm.doc_id, doc_id);
+                assert_eq!(doc_perm.authorization, Authorization::Full);
+                assert_eq!(doc_perm.user, Some("user123".to_string()));
+            }
+            _ => panic!("Expected doc permission"),
+        }
+        assert_eq!(extracted_channel, None);
+
+        // Test file token with channel claim
+        let file_token_with_channel = authenticator.gen_file_token_cwt(
+            "file_hash_123",
+            doc_id,
+            Authorization::ReadOnly,
+            ExpirationTimeEpochMillis(u64::MAX),
+            Some("application/json"),
+            Some(1024),
+            Some("user456"),
+            Some(channel.to_string()),
+        );
+
+        let (permission, extracted_channel) = authenticator
+            .verify_token_with_channel(&file_token_with_channel, 0)
+            .unwrap();
+
+        match permission {
+            Permission::File(file_perm) => {
+                assert_eq!(file_perm.doc_id, doc_id);
+                assert_eq!(file_perm.authorization, Authorization::ReadOnly);
+                assert_eq!(file_perm.user, Some("user456".to_string()));
+            }
+            _ => panic!("Expected file permission"),
+        }
+        assert_eq!(extracted_channel, Some(channel.to_string()));
+    }
+
+    #[test]
     fn test_user_identification_mixed_tokens() {
         let authenticator = Authenticator::gen_key().unwrap();
 
@@ -1730,6 +1880,7 @@ mod tests {
             Authorization::ReadOnly,
             ExpirationTimeEpochMillis(u64::MAX),
             Some("cwt_user"),
+            None,
         );
 
         // Verify both can extract users correctly

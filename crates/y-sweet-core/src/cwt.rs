@@ -30,6 +30,7 @@ pub struct CwtClaims {
     pub expiration: Option<u64>,
     pub issued_at: Option<u64>,
     pub scope: String,
+    pub channel: Option<String>,
 }
 
 pub struct CwtAuthenticator {
@@ -518,6 +519,14 @@ impl CwtAuthenticator {
             ciborium::Value::Text(claims.scope),
         ));
 
+        // Custom channel claim (private claim 10)
+        if let Some(channel) = claims.channel {
+            map.push((
+                ciborium::Value::Integer(10.into()),
+                ciborium::Value::Text(channel),
+            ));
+        }
+
         Ok(ciborium::Value::Map(map))
     }
 
@@ -536,6 +545,7 @@ impl CwtAuthenticator {
         let mut expiration = None;
         let mut issued_at = None;
         let mut scope = None;
+        let mut channel = None;
 
         for (key, value) in map {
             match (key, value) {
@@ -545,6 +555,7 @@ impl CwtAuthenticator {
                         Ok(2) => subject = Some(s),
                         Ok(3) => audience = Some(s),
                         Ok(9) => scope = Some(s),
+                        Ok(10) => channel = Some(s),
                         _ => {} // Ignore unknown claims
                     }
                 }
@@ -568,6 +579,7 @@ impl CwtAuthenticator {
             expiration,
             issued_at,
             scope,
+            channel,
         })
     }
 
@@ -746,6 +758,7 @@ mod tests {
             expiration: Some(1444064944),
             issued_at: Some(1443944944),
             scope: "server".to_string(),
+            channel: None,
         };
 
         let token = authenticator.create_cwt(claims).unwrap();
@@ -771,6 +784,7 @@ mod tests {
             expiration: Some(1444064944),
             issued_at: Some(1443944944),
             scope: "doc:test_doc_123:rw".to_string(),
+            channel: None,
         };
 
         let token = authenticator.create_cwt(claims).unwrap();
@@ -791,6 +805,7 @@ mod tests {
             expiration: Some(1444064944),
             issued_at: None,
             scope: "file:abcdef1234567890:doc123:r".to_string(),
+            channel: None,
         };
 
         let token = authenticator.create_cwt(claims).unwrap();
@@ -871,6 +886,7 @@ mod tests {
             expiration: Some(1444064944),
             issued_at: Some(1443944944),
             scope: "prefix:org123-:rw".to_string(),
+            channel: None,
         };
 
         let token = authenticator.create_cwt(claims).unwrap();
@@ -905,6 +921,7 @@ mod tests {
             expiration: Some(1444064944),
             issued_at: Some(1443944944),
             scope: "server".to_string(), // Using our custom scope claim
+            channel: None,
         };
 
         // Test COSE_Mac0 token creation and verification
@@ -984,6 +1001,7 @@ mod tests {
                     expiration: Some(1444064944),
                     issued_at: Some(1443944944),
                     scope: "server".to_string(),
+                    channel: None,
                 };
                 cwt_auth.create_cwt_mac0(test_claims).unwrap()
             });
@@ -1005,6 +1023,7 @@ mod tests {
             expiration: Some(2000000000),
             issued_at: Some(1000000000),
             scope: "test:scope".to_string(),
+            channel: None,
         };
 
         // Test HMAC_256_64 (8-byte MAC)
@@ -1043,20 +1062,39 @@ mod tests {
     fn test_channel_claim_roundtrip() {
         let cwt_auth = create_test_authenticator();
 
-        // Test basic claim roundtrip without channel functionality
-        let claims = CwtClaims {
+        // Test with channel claim
+        let claims_with_channel = CwtClaims {
             issuer: Some("test-issuer".to_string()),
             subject: None,
             audience: None,
             expiration: Some(1444064944),
             issued_at: Some(1443944944),
             scope: "doc:test_doc:rw".to_string(),
+            channel: Some("team-updates".to_string()),
         };
 
-        let token_bytes = cwt_auth.create_cwt(claims.clone()).unwrap();
+        let token_bytes = cwt_auth.create_cwt(claims_with_channel.clone()).unwrap();
         let decoded_claims = cwt_auth.verify_cwt(&token_bytes).unwrap();
 
-        assert_eq!(decoded_claims, claims);
+        assert_eq!(decoded_claims, claims_with_channel);
+        assert_eq!(decoded_claims.channel, Some("team-updates".to_string()));
+
+        // Test without channel claim
+        let claims_without_channel = CwtClaims {
+            issuer: Some("test-issuer".to_string()),
+            subject: None,
+            audience: None,
+            expiration: Some(1444064944),
+            issued_at: Some(1443944944),
+            scope: "doc:test_doc:rw".to_string(),
+            channel: None,
+        };
+
+        let token_bytes = cwt_auth.create_cwt(claims_without_channel.clone()).unwrap();
+        let decoded_claims = cwt_auth.verify_cwt(&token_bytes).unwrap();
+
+        assert_eq!(decoded_claims, claims_without_channel);
+        assert_eq!(decoded_claims.channel, None);
     }
 
     #[test]
@@ -1072,6 +1110,7 @@ mod tests {
             expiration: None,
             issued_at: None,
             scope: "server".to_string(),
+            channel: None,
         };
 
         let token = authenticator.create_cwt(claims).unwrap();
@@ -1102,6 +1141,7 @@ mod tests {
             expiration: Some(9999999999),
             issued_at: None,
             scope: "server".to_string(),
+            channel: None,
         };
 
         // Should create COSE_Mac0 token with symmetric key

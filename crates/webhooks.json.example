@@ -1,0 +1,17 @@
+{
+  "configs": [
+    {
+      "relay_id": "85a06712-af14-47bc-a859-e8106cc786e8",
+      "url": "https://relay-git-connector-staging.fly.dev/",
+      "timeout_ms": 5000
+    },
+    {
+      "url": "https://example.com/webhook"
+    },
+    {
+      "prefix": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+      "url": "https://example.com/project-webhook",
+      "auth_token": "secret_token"
+    }
+  ]
+}

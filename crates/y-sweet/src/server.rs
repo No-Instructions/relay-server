@@ -180,7 +180,7 @@ impl Server {
 
     pub async fn create_doc(&self) -> Result<String> {
         let doc_id = nanoid::nanoid!();
-        self.load_doc(&doc_id).await?;
+        self.load_doc(&doc_id, None).await?;
         tracing::info!(doc_id=?doc_id, "Created doc");
         Ok(doc_id)
     }
@@ -204,19 +204,24 @@ impl Server {
         Ok(())
     }
 
-    pub async fn load_doc(&self, doc_id: &str) -> Result<()> {
+    pub async fn load_doc(&self, doc_id: &str, routing_channel: Option<String>) -> Result<()> {
         Self::validate_doc_id(doc_id)?;
         let (send, recv) = channel(1024);
 
+        // Determine routing channel: use provided channel or fallback to doc_id
+        let routing_channel_name = routing_channel
+            .clone()
+            .unwrap_or_else(|| doc_id.to_string());
+
+        // Create event callback with the determined routing channel
         let event_callback = {
             let event_dispatcher = self.event_dispatcher.clone();
-
-            let routing_channel = doc_id.to_string();
+            let routing_channel_for_callback = routing_channel_name.clone();
 
             if let Some(dispatcher) = event_dispatcher {
                 Some(Arc::new(move |event: DocumentUpdatedEvent| {
-                    // Step 1: Create the envelope with routing channel and payload
-                    let envelope = EventEnvelope::new(routing_channel.clone(), event);
+                    // Step 1: Create the envelope with predetermined routing channel
+                    let envelope = EventEnvelope::new(routing_channel_for_callback.clone(), event);
 
                     // Step 2: Send via dispatcher
                     dispatcher.send_event(envelope);
@@ -235,6 +240,11 @@ impl Server {
             event_callback,
         )
         .await?;
+
+        // If channel is provided in token, store it in document metadata
+        if let Some(channel_name) = routing_channel {
+            dwskv.set_channel(&channel_name);
+        }
 
         dwskv
             .sync_kv()
@@ -378,7 +388,24 @@ impl Server {
     ) -> Result<MappedRef<String, DocWithSyncKv, DocWithSyncKv>> {
         if !self.docs.contains_key(doc_id) {
             tracing::info!(doc_id=?doc_id, "Loading doc");
-            self.load_doc(doc_id).await?;
+            self.load_doc(doc_id, None).await?;
+        }
+
+        Ok(self
+            .docs
+            .get(doc_id)
+            .ok_or_else(|| anyhow!("Failed to get-or-create doc"))?
+            .map(|d| d))
+    }
+
+    pub async fn get_or_create_doc_with_channel(
+        &self,
+        doc_id: &str,
+        routing_channel: Option<String>,
+    ) -> Result<MappedRef<String, DocWithSyncKv, DocWithSyncKv>> {
+        if !self.docs.contains_key(doc_id) {
+            tracing::info!(doc_id=?doc_id, channel=?routing_channel, "Loading doc with channel");
+            self.load_doc(doc_id, routing_channel).await?;
         }
 
         Ok(self
@@ -660,6 +687,17 @@ async fn handle_socket_upgrade(
     authorization: Authorization,
     State(server_state): State<Arc<Server>>,
 ) -> Result<Response, AppError> {
+    handle_socket_upgrade_with_channel(ws, Path(doc_id), authorization, None, State(server_state))
+        .await
+}
+
+async fn handle_socket_upgrade_with_channel(
+    ws: WebSocketUpgrade,
+    Path(doc_id): Path<String>,
+    authorization: Authorization,
+    routing_channel: Option<String>,
+    State(server_state): State<Arc<Server>>,
+) -> Result<Response, AppError> {
     if !matches!(authorization, Authorization::Full) && !server_state.docs.contains_key(&doc_id) {
         return Err(AppError(
             StatusCode::NOT_FOUND,
@@ -668,7 +706,7 @@ async fn handle_socket_upgrade(
     }
 
     let dwskv = server_state
-        .get_or_create_doc(&doc_id)
+        .get_or_create_doc_with_channel(&doc_id, routing_channel)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let awareness = dwskv.awareness();
@@ -688,41 +726,16 @@ async fn handle_socket_upgrade_deprecated(
     tracing::warn!(
         "/doc/ws/:doc_id is deprecated; call /doc/:doc_id/auth instead and use the returned URL."
     );
-    let authorization = server_state.verify_doc_token(params.token.as_deref(), &doc_id)?;
-    handle_socket_upgrade(ws, Path(doc_id), authorization, State(server_state)).await
-}
-
-async fn handle_socket_upgrade_full_path(
-    ws: WebSocketUpgrade,
-    Path((doc_id, doc_id2)): Path<(String, String)>,
-    Query(params): Query<HandlerParams>,
-    State(server_state): State<Arc<Server>>,
-) -> Result<Response, AppError> {
-    tracing::debug!("WebSocket upgrade request for doc: {}", doc_id);
-
-    if doc_id != doc_id2 {
-        tracing::debug!("Doc ID mismatch: {} != {}", doc_id, doc_id2);
-        return Err(AppError(
-            StatusCode::BAD_REQUEST,
-            anyhow!("For Yjs compatibility, the doc_id appears twice in the URL. It must be the same in both places, but we got {} and {}.", doc_id, doc_id2),
-        ));
-    }
-
-    let permission = if let Some(authenticator) = &server_state.authenticator {
+    let (permission, channel) = if let Some(authenticator) = &server_state.authenticator {
         if let Some(token) = params.token.as_deref() {
-            let current_time = current_time_epoch_millis();
-
             authenticator
-                .verify_token_auto(token, current_time)
-                .map_err(|e| {
-                    tracing::debug!("Token verification failed: {:?}", e);
-                    (StatusCode::UNAUTHORIZED, e)
-                })?
+                .verify_token_with_channel(token, current_time_epoch_millis())
+                .map_err(|e| (StatusCode::UNAUTHORIZED, e))?
         } else {
-            y_sweet_core::auth::Permission::Server
+            (y_sweet_core::auth::Permission::Server, None)
         }
     } else {
-        y_sweet_core::auth::Permission::Server
+        (y_sweet_core::auth::Permission::Server, None)
     };
 
     let authorization = match permission {
@@ -753,7 +766,85 @@ async fn handle_socket_upgrade_full_path(
         }
     };
 
-    handle_socket_upgrade(ws, Path(doc_id), authorization, State(server_state)).await
+    handle_socket_upgrade_with_channel(
+        ws,
+        Path(doc_id),
+        authorization,
+        channel,
+        State(server_state),
+    )
+    .await
+}
+
+async fn handle_socket_upgrade_full_path(
+    ws: WebSocketUpgrade,
+    Path((doc_id, doc_id2)): Path<(String, String)>,
+    Query(params): Query<HandlerParams>,
+    State(server_state): State<Arc<Server>>,
+) -> Result<Response, AppError> {
+    tracing::debug!("WebSocket upgrade request for doc: {}", doc_id);
+
+    if doc_id != doc_id2 {
+        tracing::debug!("Doc ID mismatch: {} != {}", doc_id, doc_id2);
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            anyhow!("For Yjs compatibility, the doc_id appears twice in the URL. It must be the same in both places, but we got {} and {}.", doc_id, doc_id2),
+        ));
+    }
+
+    let (permission, channel) = if let Some(authenticator) = &server_state.authenticator {
+        if let Some(token) = params.token.as_deref() {
+            let current_time = current_time_epoch_millis();
+
+            authenticator
+                .verify_token_with_channel(token, current_time)
+                .map_err(|e| {
+                    tracing::debug!("Token verification failed: {:?}", e);
+                    (StatusCode::UNAUTHORIZED, e)
+                })?
+        } else {
+            (y_sweet_core::auth::Permission::Server, None)
+        }
+    } else {
+        (y_sweet_core::auth::Permission::Server, None)
+    };
+
+    let authorization = match permission {
+        y_sweet_core::auth::Permission::Doc(doc_perm) => {
+            if doc_perm.doc_id != doc_id {
+                return Err(AppError(
+                    StatusCode::FORBIDDEN,
+                    anyhow!("Token not valid for this document"),
+                ));
+            }
+            doc_perm.authorization
+        }
+        y_sweet_core::auth::Permission::Server => Authorization::Full,
+        y_sweet_core::auth::Permission::Prefix(prefix_perm) => {
+            if !doc_id.starts_with(&prefix_perm.prefix) {
+                return Err(AppError(
+                    StatusCode::FORBIDDEN,
+                    anyhow!("Token not valid for this document"),
+                ));
+            }
+            prefix_perm.authorization
+        }
+        y_sweet_core::auth::Permission::File(_) => {
+            return Err(AppError(
+                StatusCode::FORBIDDEN,
+                anyhow!("File token not valid for document access"),
+            ));
+        }
+    };
+
+    handle_socket_upgrade_with_channel(
+        ws,
+        Path(doc_id),
+        authorization,
+        channel,
+        State(server_state),
+    )
+    .await
 }
 
 async fn handle_socket_upgrade_single(
@@ -2343,7 +2434,7 @@ mod test {
             .unwrap(),
         );
 
-        server_state2.load_doc(&doc_id).await.unwrap();
+        server_state2.load_doc(&doc_id, None).await.unwrap();
 
         let token = auth_doc(
             None,

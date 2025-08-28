@@ -473,7 +473,7 @@ async fn main() -> Result<()> {
 
             // Load the one document we're operating with
             server
-                .load_doc(&doc_id)
+                .load_doc(&doc_id, None)
                 .await
                 .context("Failed to load document")?;
 

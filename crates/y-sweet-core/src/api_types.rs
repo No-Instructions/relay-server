@@ -137,14 +137,19 @@ pub struct DocCreationRequest {
 
 /// Validate that the document name contains only alphanumeric characters, dashes, and underscores.
 /// This is the same alphabet used by nanoid when we generate a document name.
-pub fn validate_doc_name(doc_name: &str) -> bool {
-    if doc_name.is_empty() {
+pub fn validate_key(key: &str) -> bool {
+    if key.is_empty() {
         return false;
     }
-    for c in doc_name.chars() {
+    for c in key.chars() {
         if !c.is_ascii_alphanumeric() && c != '-' && c != '_' {
             return false;
         }
     }
     true
+}
+
+/// Alias for backward compatibility
+pub fn validate_doc_name(doc_name: &str) -> bool {
+    validate_key(doc_name)
 }
