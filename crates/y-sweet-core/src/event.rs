@@ -1,31 +1,117 @@
 use crate::api_types::{Authorization, NANOID_ALPHABET};
+use crate::sync_kv::SyncKv;
 use crate::webhook::WebhookConfig;
 use crate::webhook_metrics::WebhookMetrics;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tracing::{debug, error, info};
 
+/// Convert CBOR metadata values to JSON values for event serialization
+fn cbor_metadata_to_json(
+    cbor_metadata: &BTreeMap<String, ciborium::value::Value>,
+) -> Result<BTreeMap<String, serde_json::Value>, Box<dyn std::error::Error>> {
+    let mut json_metadata = BTreeMap::new();
+
+    for (key, cbor_value) in cbor_metadata {
+        let json_value = cbor_value_to_json_value(cbor_value)?;
+        json_metadata.insert(key.clone(), json_value);
+    }
+
+    Ok(json_metadata)
+}
+
+/// Convert a single CBOR value to a JSON value
+fn cbor_value_to_json_value(
+    cbor_value: &ciborium::value::Value,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    match cbor_value {
+        ciborium::value::Value::Integer(i) => {
+            // CBOR integers can be larger than i64, so we need to handle the conversion carefully
+            if let Ok(i64_val) = TryInto::<i64>::try_into(*i) {
+                Ok(serde_json::Value::Number(serde_json::Number::from(i64_val)))
+            } else if let Ok(u64_val) = TryInto::<u64>::try_into(*i) {
+                // Try to convert to u64 if i64 fails
+                if let Some(num) = serde_json::Number::from_f64(u64_val as f64) {
+                    Ok(serde_json::Value::Number(num))
+                } else {
+                    Ok(serde_json::Value::Null)
+                }
+            } else {
+                // If conversion fails, convert to null
+                Ok(serde_json::Value::Null)
+            }
+        }
+        ciborium::value::Value::Text(s) => Ok(serde_json::Value::String(s.clone())),
+        ciborium::value::Value::Bool(b) => Ok(serde_json::Value::Bool(*b)),
+        ciborium::value::Value::Null => Ok(serde_json::Value::Null),
+        ciborium::value::Value::Array(arr) => {
+            let json_array: Result<Vec<_>, _> = arr.iter().map(cbor_value_to_json_value).collect();
+            Ok(serde_json::Value::Array(json_array?))
+        }
+        ciborium::value::Value::Map(map) => {
+            let mut json_obj = serde_json::Map::new();
+            for (k, v) in map {
+                if let ciborium::value::Value::Text(key_str) = k {
+                    let json_val = cbor_value_to_json_value(v)?;
+                    json_obj.insert(key_str.clone(), json_val);
+                } else {
+                    return Err("Map keys must be strings for JSON conversion".into());
+                }
+            }
+            Ok(serde_json::Value::Object(json_obj))
+        }
+        ciborium::value::Value::Float(f) => {
+            if let Some(num) = serde_json::Number::from_f64(*f) {
+                Ok(serde_json::Value::Number(num))
+            } else {
+                Err("Invalid floating point number for JSON".into())
+            }
+        }
+        _ => Ok(serde_json::Value::Null),
+    }
+}
+
 /// Event payloads contain only business data
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DocumentUpdatedEvent {
     pub doc_id: String,
     pub user: Option<String>,
+    pub metadata: BTreeMap<String, serde_json::Value>,
 }
 
 impl DocumentUpdatedEvent {
     /// Create a new document updated event payload
     pub fn new(doc_id: String) -> Self {
-        Self { doc_id, user: None }
+        Self {
+            doc_id,
+            user: None,
+            metadata: BTreeMap::new(),
+        }
     }
 
     /// Builder method to add user
     pub fn with_user(mut self, user: String) -> Self {
         self.user = Some(user);
+        self
+    }
+
+    /// Builder method to add metadata from SyncKv
+    pub fn with_metadata(mut self, sync_kv: &SyncKv) -> Self {
+        if let Some(cbor_metadata) = sync_kv.get_metadata() {
+            match cbor_metadata_to_json(&cbor_metadata) {
+                Ok(json_metadata) => {
+                    self.metadata = json_metadata;
+                }
+                Err(e) => {
+                    error!("Failed to convert CBOR metadata to JSON: {}", e);
+                }
+            }
+        }
         self
     }
 
@@ -519,6 +605,7 @@ mod tests {
 
         assert_eq!(event.doc_id, doc_id);
         assert_eq!(event.user, None);
+        assert!(event.metadata.is_empty());
         assert_eq!(DocumentUpdatedEvent::event_type(), "document.updated");
     }
 
@@ -530,6 +617,7 @@ mod tests {
 
         assert_eq!(event.doc_id, doc_id);
         assert_eq!(event.user, Some(user));
+        assert!(event.metadata.is_empty());
     }
 
     #[test]
@@ -549,6 +637,10 @@ mod tests {
         let payload_obj = envelope.payload.as_object().unwrap();
         assert_eq!(payload_obj["doc_id"], doc_id);
         assert_eq!(payload_obj["user"], serde_json::Value::Null);
+        assert_eq!(
+            payload_obj["metadata"],
+            serde_json::Value::Object(serde_json::Map::new())
+        );
     }
 
     #[test]
@@ -571,6 +663,10 @@ mod tests {
                 assert_eq!(event_id, envelope.event_id);
                 assert_eq!(channel, envelope.channel);
                 assert_eq!(payload["doc_id"], doc_id);
+                assert_eq!(
+                    payload["metadata"],
+                    serde_json::Value::Object(serde_json::Map::new())
+                );
             }
             _ => panic!("Expected Event message"),
         }
@@ -590,6 +686,10 @@ mod tests {
         // Check payload structure
         let payload_obj = payload.payload.as_object().unwrap();
         assert_eq!(payload_obj["doc_id"], doc_id);
+        assert_eq!(
+            payload_obj["metadata"],
+            serde_json::Value::Object(serde_json::Map::new())
+        );
     }
 
     #[tokio::test]
@@ -818,5 +918,109 @@ mod tests {
         assert_eq!(parsed["eventType"], "document.updated");
         assert!(parsed["eventId"].as_str().unwrap().starts_with("evt_"));
         assert_eq!(parsed["payload"]["doc_id"], "test_doc");
+        assert_eq!(
+            parsed["payload"]["metadata"],
+            serde_json::Value::Object(serde_json::Map::new())
+        );
+    }
+
+    #[test]
+    fn test_cbor_to_json_conversion() {
+        use std::collections::BTreeMap;
+
+        // Create CBOR metadata
+        let mut cbor_metadata = BTreeMap::new();
+        cbor_metadata.insert(
+            "channel".to_string(),
+            ciborium::value::Value::Text("test-channel".to_string()),
+        );
+        cbor_metadata.insert(
+            "max_users".to_string(),
+            ciborium::value::Value::Integer(10.into()),
+        );
+        cbor_metadata.insert("is_active".to_string(), ciborium::value::Value::Bool(true));
+
+        // Convert to JSON
+        let json_result = cbor_metadata_to_json(&cbor_metadata).unwrap();
+
+        assert_eq!(json_result.len(), 3);
+        assert_eq!(
+            json_result["channel"],
+            serde_json::Value::String("test-channel".to_string())
+        );
+        assert_eq!(
+            json_result["max_users"],
+            serde_json::Value::Number(serde_json::Number::from(10))
+        );
+        assert_eq!(json_result["is_active"], serde_json::Value::Bool(true));
+    }
+
+    #[test]
+    fn test_document_event_with_metadata_method() {
+        use crate::store::Store;
+        use async_trait::async_trait;
+        use dashmap::DashMap;
+        use std::sync::Arc;
+
+        #[derive(Default, Clone)]
+        struct TestStore {
+            data: Arc<DashMap<String, Vec<u8>>>,
+        }
+
+        #[cfg_attr(not(feature = "single-threaded"), async_trait)]
+        #[cfg_attr(feature = "single-threaded", async_trait(?Send))]
+        impl Store for TestStore {
+            async fn init(&self) -> crate::store::Result<()> {
+                Ok(())
+            }
+            async fn get(&self, key: &str) -> crate::store::Result<Option<Vec<u8>>> {
+                Ok(self.data.get(key).map(|v| v.clone()))
+            }
+            async fn set(&self, key: &str, value: Vec<u8>) -> crate::store::Result<()> {
+                self.data.insert(key.to_owned(), value);
+                Ok(())
+            }
+            async fn remove(&self, key: &str) -> crate::store::Result<()> {
+                self.data.remove(key);
+                Ok(())
+            }
+            async fn exists(&self, key: &str) -> crate::store::Result<bool> {
+                Ok(self.data.contains_key(key))
+            }
+        }
+
+        // This test should use a runtime to be async, but for now we'll test the sync parts
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let store = TestStore::default();
+            let sync_kv =
+                crate::sync_kv::SyncKv::new(Some(Arc::new(Box::new(store))), "test_doc", || ())
+                    .await
+                    .unwrap();
+
+            // Add metadata to sync_kv
+            sync_kv.update_metadata(
+                "doc_type".to_string(),
+                ciborium::value::Value::Text("collaborative".to_string()),
+            );
+            sync_kv.update_metadata(
+                "version".to_string(),
+                ciborium::value::Value::Integer(2.into()),
+            );
+
+            // Create event with metadata
+            let event = DocumentUpdatedEvent::new("test_doc".to_string()).with_metadata(&sync_kv);
+
+            // Verify metadata was included
+            assert_eq!(event.metadata.len(), 2);
+            assert_eq!(
+                event.metadata["doc_type"],
+                serde_json::Value::String("collaborative".to_string())
+            );
+            assert_eq!(
+                event.metadata["version"],
+                serde_json::Value::Number(serde_json::Number::from(2))
+            );
+        });
     }
 }
