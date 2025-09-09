@@ -87,6 +87,16 @@ pub enum StoreConfig {
     Filesystem(FilesystemStoreConfig),
     #[serde(rename = "s3")]
     S3(S3StoreConfig),
+    #[serde(rename = "aws")]
+    Aws(AwsStoreConfig),
+    #[serde(rename = "cloudflare")]
+    Cloudflare(CloudflareStoreConfig),
+    #[serde(rename = "backblaze")]
+    Backblaze(BackblazeStoreConfig),
+    #[serde(rename = "minio")]
+    Minio(MinioStoreConfig),
+    #[serde(rename = "tigris")]
+    Tigris(TigrisStoreConfig),
     #[serde(rename = "memory")]
     Memory,
 }
@@ -117,6 +127,77 @@ pub struct S3StoreConfig {
 
     pub access_key_id: Option<String>,
     pub secret_access_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AwsStoreConfig {
+    pub bucket: String,
+
+    #[serde(default = "default_s3_region")]
+    pub region: String,
+
+    pub access_key_id: String,
+    pub secret_access_key: String,
+
+    #[serde(default)]
+    pub prefix: String,
+
+    #[serde(default = "default_presigned_url_expiration")]
+    pub presigned_url_expiration: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CloudflareStoreConfig {
+    pub bucket: String,
+    pub account_id: String,
+    pub access_key_id: String,
+    pub secret_access_key: String,
+
+    #[serde(default)]
+    pub prefix: String,
+
+    #[serde(default = "default_presigned_url_expiration")]
+    pub presigned_url_expiration: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BackblazeStoreConfig {
+    pub bucket: String,
+    pub key_id: String,
+    pub application_key: String,
+
+    #[serde(default)]
+    pub prefix: String,
+
+    #[serde(default = "default_presigned_url_expiration")]
+    pub presigned_url_expiration: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MinioStoreConfig {
+    pub bucket: String,
+    pub endpoint: String,
+    pub access_key: String,
+    pub secret_key: String,
+
+    #[serde(default)]
+    pub prefix: String,
+
+    #[serde(default = "default_presigned_url_expiration")]
+    pub presigned_url_expiration: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TigrisStoreConfig {
+    pub bucket: String,
+    pub access_key_id: String,
+    pub secret_access_key: String,
+
+    #[serde(default)]
+    pub prefix: String,
+
+    #[serde(default = "default_presigned_url_expiration")]
+    pub presigned_url_expiration: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -202,6 +283,66 @@ impl Default for AuthConfig {
 impl Default for StoreConfig {
     fn default() -> Self {
         Self::Memory
+    }
+}
+
+impl StoreConfig {
+    /// Convert provider-specific configs to generic S3 config for internal use
+    pub fn to_s3_config(&self) -> Option<S3StoreConfig> {
+        match self {
+            StoreConfig::S3(config) => Some(config.clone()),
+            StoreConfig::Aws(aws) => Some(S3StoreConfig {
+                bucket: aws.bucket.clone(),
+                region: aws.region.clone(),
+                endpoint: String::new(),
+                path_style: false,
+                presigned_url_expiration: aws.presigned_url_expiration,
+                prefix: aws.prefix.clone(),
+                access_key_id: Some(aws.access_key_id.clone()),
+                secret_access_key: Some(aws.secret_access_key.clone()),
+            }),
+            StoreConfig::Cloudflare(cf) => Some(S3StoreConfig {
+                bucket: cf.bucket.clone(),
+                region: "auto".to_string(),
+                endpoint: format!("https://{}.r2.cloudflarestorage.com", cf.account_id),
+                path_style: true,
+                presigned_url_expiration: cf.presigned_url_expiration,
+                prefix: cf.prefix.clone(),
+                access_key_id: Some(cf.access_key_id.clone()),
+                secret_access_key: Some(cf.secret_access_key.clone()),
+            }),
+            StoreConfig::Backblaze(b2) => Some(S3StoreConfig {
+                bucket: b2.bucket.clone(),
+                region: "us-west-000".to_string(),
+                endpoint: "https://s3.us-west-000.backblazeb2.com".to_string(),
+                path_style: false,
+                presigned_url_expiration: b2.presigned_url_expiration,
+                prefix: b2.prefix.clone(),
+                access_key_id: Some(b2.key_id.clone()),
+                secret_access_key: Some(b2.application_key.clone()),
+            }),
+            StoreConfig::Minio(minio) => Some(S3StoreConfig {
+                bucket: minio.bucket.clone(),
+                region: "us-east-1".to_string(),
+                endpoint: minio.endpoint.clone(),
+                path_style: true,
+                presigned_url_expiration: minio.presigned_url_expiration,
+                prefix: minio.prefix.clone(),
+                access_key_id: Some(minio.access_key.clone()),
+                secret_access_key: Some(minio.secret_key.clone()),
+            }),
+            StoreConfig::Tigris(tigris) => Some(S3StoreConfig {
+                bucket: tigris.bucket.clone(),
+                region: "auto".to_string(),
+                endpoint: "https://fly.storage.tigris.dev".to_string(),
+                path_style: false,
+                presigned_url_expiration: tigris.presigned_url_expiration,
+                prefix: tigris.prefix.clone(),
+                access_key_id: Some(tigris.access_key_id.clone()),
+                secret_access_key: Some(tigris.secret_access_key.clone()),
+            }),
+            _ => None,
+        }
     }
 }
 
@@ -476,6 +617,41 @@ impl Config {
             StoreConfig::S3(s3) if s3.bucket.is_empty() => {
                 return Err(ConfigError::InvalidConfiguration(
                     "S3 bucket name cannot be empty".to_string(),
+                ));
+            }
+            StoreConfig::Aws(aws) if aws.bucket.is_empty() => {
+                return Err(ConfigError::InvalidConfiguration(
+                    "AWS S3 bucket name cannot be empty".to_string(),
+                ));
+            }
+            StoreConfig::Cloudflare(cf) if cf.bucket.is_empty() => {
+                return Err(ConfigError::InvalidConfiguration(
+                    "Cloudflare R2 bucket name cannot be empty".to_string(),
+                ));
+            }
+            StoreConfig::Cloudflare(cf) if cf.account_id.is_empty() => {
+                return Err(ConfigError::InvalidConfiguration(
+                    "Cloudflare R2 account_id cannot be empty".to_string(),
+                ));
+            }
+            StoreConfig::Backblaze(b2) if b2.bucket.is_empty() => {
+                return Err(ConfigError::InvalidConfiguration(
+                    "Backblaze B2 bucket name cannot be empty".to_string(),
+                ));
+            }
+            StoreConfig::Minio(minio) if minio.bucket.is_empty() => {
+                return Err(ConfigError::InvalidConfiguration(
+                    "MinIO bucket name cannot be empty".to_string(),
+                ));
+            }
+            StoreConfig::Minio(minio) if minio.endpoint.is_empty() => {
+                return Err(ConfigError::InvalidConfiguration(
+                    "MinIO endpoint cannot be empty".to_string(),
+                ));
+            }
+            StoreConfig::Tigris(tigris) if tigris.bucket.is_empty() => {
+                return Err(ConfigError::InvalidConfiguration(
+                    "Tigris bucket name cannot be empty".to_string(),
                 ));
             }
             StoreConfig::Filesystem(fs) if fs.path.is_empty() => {

@@ -298,6 +298,47 @@ fn get_store_from_config(
             let store = S3Store::new(s3_store_config);
             Ok(Some(Box::new(store)))
         }
+        // Convert provider-specific configs to generic S3 config
+        StoreConfig::Aws(_)
+        | StoreConfig::Cloudflare(_)
+        | StoreConfig::Backblaze(_)
+        | StoreConfig::Minio(_)
+        | StoreConfig::Tigris(_) => {
+            let s3_config = store_config
+                .to_s3_config()
+                .ok_or_else(|| anyhow::anyhow!("Failed to convert provider config to S3 config"))?;
+
+            // Build S3 configuration from our config
+            let s3_store_config = S3Config {
+                key: s3_config
+                    .access_key_id
+                    .clone()
+                    .or_else(|| env::var("AWS_ACCESS_KEY_ID").ok())
+                    .ok_or_else(|| anyhow::anyhow!("AWS_ACCESS_KEY_ID is required"))?,
+                secret: s3_config
+                    .secret_access_key
+                    .clone()
+                    .or_else(|| env::var("AWS_SECRET_ACCESS_KEY").ok())
+                    .ok_or_else(|| anyhow::anyhow!("AWS_SECRET_ACCESS_KEY is required"))?,
+                token: env::var("AWS_SESSION_TOKEN").ok(),
+                endpoint: if s3_config.endpoint.is_empty() {
+                    format!("https://s3.dualstack.{}.amazonaws.com", s3_config.region)
+                } else {
+                    s3_config.endpoint.clone()
+                },
+                region: s3_config.region.clone(),
+                bucket: s3_config.bucket.clone(),
+                bucket_prefix: if s3_config.prefix.is_empty() {
+                    None
+                } else {
+                    Some(s3_config.prefix.clone())
+                },
+                path_style: s3_config.path_style,
+            };
+
+            let store = S3Store::new(s3_store_config);
+            Ok(Some(Box::new(store)))
+        }
     }
 }
 
@@ -642,6 +683,16 @@ async fn main() -> Result<()> {
                                         format!("Filesystem ({})", fs.path),
                                     y_sweet_core::config::StoreConfig::S3(s3) =>
                                         format!("S3 ({})", s3.bucket),
+                                    y_sweet_core::config::StoreConfig::Aws(aws) =>
+                                        format!("AWS S3 ({})", aws.bucket),
+                                    y_sweet_core::config::StoreConfig::Cloudflare(cf) =>
+                                        format!("Cloudflare R2 ({})", cf.bucket),
+                                    y_sweet_core::config::StoreConfig::Backblaze(b2) =>
+                                        format!("Backblaze B2 ({})", b2.bucket),
+                                    y_sweet_core::config::StoreConfig::Minio(minio) =>
+                                        format!("MinIO ({} at {})", minio.bucket, minio.endpoint),
+                                    y_sweet_core::config::StoreConfig::Tigris(tigris) =>
+                                        format!("Tigris ({})", tigris.bucket),
                                 }
                             );
                             println!("  Webhooks: {}", config.webhooks.len());
