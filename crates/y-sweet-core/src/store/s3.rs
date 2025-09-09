@@ -92,18 +92,17 @@ impl S3Config {
             false
         };
 
+        let region = env::var(S3_REGION).unwrap_or_else(|_| DEFAULT_S3_REGION.to_string());
+        let endpoint = env::var(S3_ENDPOINT)
+            .unwrap_or_else(|_| format!("https://s3.dualstack.{}.amazonaws.com", &region));
+
         Ok(S3Config {
             key: env::var(S3_ACCESS_KEY_ID)
                 .map_err(|_| anyhow::anyhow!("{} env var not supplied", S3_ACCESS_KEY_ID))?,
             secret: env::var(S3_SECRET_ACCESS_KEY)
                 .map_err(|_| anyhow::anyhow!("{} env var not supplied", S3_SECRET_ACCESS_KEY))?,
-            endpoint: env::var(S3_ENDPOINT).unwrap_or_else(|_| {
-                format!(
-                    "https://s3.dualstack.{}.amazonaws.com",
-                    env::var(S3_REGION).unwrap_or_else(|_| DEFAULT_S3_REGION.to_string())
-                )
-            }),
-            region: env::var(S3_REGION).unwrap_or_else(|_| DEFAULT_S3_REGION.to_string()),
+            endpoint,
+            region,
             token: env::var(S3_SESSION_TOKEN).ok(),
             bucket,
             bucket_prefix,

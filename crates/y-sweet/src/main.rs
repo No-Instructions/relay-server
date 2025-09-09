@@ -20,6 +20,7 @@ use y_sweet::server::AllowedHost;
 use y_sweet::stores::filesystem::FileSystemStore;
 use y_sweet_core::{
     auth::Authenticator,
+    config::Config,
     store::{
         s3::{S3Config, S3Store},
         Store,
@@ -57,6 +58,11 @@ struct Opts {
 #[derive(Subcommand)]
 enum ServSubcommand {
     Serve {
+        /// Path to configuration file
+        #[clap(short = 'c', long = "config")]
+        config: Option<PathBuf>,
+
+        // Legacy CLI arguments - kept for backward compatibility
         #[clap(env = "RELAY_SERVER_STORAGE")]
         store: Option<String>,
 
@@ -64,8 +70,8 @@ enum ServSubcommand {
         port: u16,
         #[clap(long, env = "RELAY_SERVER_HOST")]
         host: Option<IpAddr>,
-        #[clap(long, default_value = "9090", env = "METRICS_PORT")]
-        metrics_port: u16,
+        #[clap(long, env = "METRICS_PORT")]
+        metrics_port: Option<u16>,
         #[clap(
             long,
             default_value = "10",
@@ -107,6 +113,12 @@ enum ServSubcommand {
 
     Version,
 
+    /// Configuration management commands
+    Config {
+        #[clap(subcommand)]
+        cmd: ConfigSubcommand,
+    },
+
     ServeDoc {
         #[clap(long, default_value = "8080", env = "PORT")]
         port: u16,
@@ -137,6 +149,201 @@ enum ServSubcommand {
         #[clap(long)]
         file_hash: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum ConfigSubcommand {
+    /// Validate a TOML configuration file
+    Validate {
+        /// Path to configuration file to validate
+        #[clap(short = 'c', long = "config", default_value = "relay.toml")]
+        config: PathBuf,
+    },
+
+    /// Show the current configuration (merged from file and environment)
+    Show {
+        /// Path to configuration file
+        #[clap(short = 'c', long = "config", default_value = "relay.toml")]
+        config: PathBuf,
+    },
+}
+
+fn load_config_for_serve_args(
+    config: Option<&PathBuf>,
+    // CLI overrides
+    store: &Option<String>,
+    port: u16,
+    host: &Option<IpAddr>,
+    metrics_port: &Option<u16>,
+    checkpoint_freq_seconds: u64,
+    auth: &Option<String>,
+    url_prefix: &Option<Url>,
+    allowed_hosts: &Option<Vec<String>>,
+) -> Result<Config> {
+    // Load base configuration
+    let mut config = Config::load(config.as_deref().map(|v| v.as_path()))?;
+
+    // Apply CLI overrides (these have highest precedence)
+    if let Some(store_path) = store {
+        use y_sweet_core::config::{FilesystemStoreConfig, S3StoreConfig, StoreConfig};
+
+        if store_path.starts_with("s3://") {
+            let url = Url::parse(store_path)?;
+            let bucket = url
+                .host_str()
+                .ok_or_else(|| anyhow::anyhow!("Invalid S3 URL: missing bucket"))?
+                .to_string();
+            let prefix = url.path().trim_start_matches('/');
+            let prefix = if prefix.is_empty() {
+                String::new()
+            } else {
+                prefix.to_string()
+            };
+
+            config.store = StoreConfig::S3(S3StoreConfig {
+                bucket,
+                prefix,
+                region: env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
+                endpoint: String::new(),
+                path_style: false,
+                presigned_url_expiration: 3600,
+                access_key_id: None,
+                secret_access_key: None,
+            });
+        } else {
+            config.store = StoreConfig::Filesystem(FilesystemStoreConfig {
+                path: store_path.clone(),
+            });
+        }
+    }
+
+    // Override server settings with CLI args (non-default values)
+    if port != 8080 {
+        config.server.port = port;
+    }
+    if let Some(port) = metrics_port {
+        if config.metrics.is_none() {
+            config.metrics = Some(y_sweet_core::config::MetricsConfig { port: *port });
+        } else if let Some(ref mut metrics_config) = config.metrics {
+            metrics_config.port = *port;
+        }
+    }
+    if checkpoint_freq_seconds != 10 {
+        config.server.checkpoint_freq_seconds = checkpoint_freq_seconds;
+    }
+
+    if let Some(host) = host {
+        config.server.host = host.to_string();
+    }
+
+    if let Some(auth_key) = auth {
+        config.auth.enabled = true;
+        config.auth.private_key = Some(auth_key.clone());
+    }
+
+    if let Some(url_prefix) = url_prefix {
+        config.server.url_prefix = Some(url_prefix.to_string());
+    }
+
+    if let Some(allowed_hosts) = allowed_hosts {
+        let parsed_hosts = parse_allowed_hosts(allowed_hosts.clone())?;
+        config.server.allowed_hosts = parsed_hosts
+            .into_iter()
+            .map(|h| y_sweet_core::config::AllowedHost {
+                host: h.host,
+                scheme: h.scheme,
+            })
+            .collect();
+    }
+
+    Ok(config)
+}
+
+fn get_store_from_config(
+    store_config: &y_sweet_core::config::StoreConfig,
+) -> Result<Option<Box<dyn Store>>> {
+    use y_sweet_core::config::StoreConfig;
+
+    match store_config {
+        StoreConfig::Memory => Ok(None),
+        StoreConfig::Filesystem(fs_config) => {
+            let store = FileSystemStore::new(PathBuf::from(&fs_config.path))?;
+            Ok(Some(Box::new(store)))
+        }
+        StoreConfig::S3(s3_config) => {
+            // Build S3 configuration from our config
+            let s3_store_config = S3Config {
+                key: s3_config
+                    .access_key_id
+                    .clone()
+                    .or_else(|| env::var("AWS_ACCESS_KEY_ID").ok())
+                    .ok_or_else(|| anyhow::anyhow!("AWS_ACCESS_KEY_ID is required"))?,
+                secret: s3_config
+                    .secret_access_key
+                    .clone()
+                    .or_else(|| env::var("AWS_SECRET_ACCESS_KEY").ok())
+                    .ok_or_else(|| anyhow::anyhow!("AWS_SECRET_ACCESS_KEY is required"))?,
+                token: env::var("AWS_SESSION_TOKEN").ok(),
+                endpoint: if s3_config.endpoint.is_empty() {
+                    format!("https://s3.dualstack.{}.amazonaws.com", s3_config.region)
+                } else {
+                    s3_config.endpoint.clone()
+                },
+                region: s3_config.region.clone(),
+                bucket: s3_config.bucket.clone(),
+                bucket_prefix: if s3_config.prefix.is_empty() {
+                    None
+                } else {
+                    Some(s3_config.prefix.clone())
+                },
+                path_style: s3_config.path_style,
+            };
+
+            let store = S3Store::new(s3_store_config);
+            Ok(Some(Box::new(store)))
+        }
+        // Convert provider-specific configs to generic S3 config
+        StoreConfig::Aws(_)
+        | StoreConfig::Cloudflare(_)
+        | StoreConfig::Backblaze(_)
+        | StoreConfig::Minio(_)
+        | StoreConfig::Tigris(_) => {
+            let s3_config = store_config
+                .to_s3_config()
+                .ok_or_else(|| anyhow::anyhow!("Failed to convert provider config to S3 config"))?;
+
+            // Build S3 configuration from our config
+            let s3_store_config = S3Config {
+                key: s3_config
+                    .access_key_id
+                    .clone()
+                    .or_else(|| env::var("AWS_ACCESS_KEY_ID").ok())
+                    .ok_or_else(|| anyhow::anyhow!("AWS_ACCESS_KEY_ID is required"))?,
+                secret: s3_config
+                    .secret_access_key
+                    .clone()
+                    .or_else(|| env::var("AWS_SECRET_ACCESS_KEY").ok())
+                    .ok_or_else(|| anyhow::anyhow!("AWS_SECRET_ACCESS_KEY is required"))?,
+                token: env::var("AWS_SESSION_TOKEN").ok(),
+                endpoint: if s3_config.endpoint.is_empty() {
+                    format!("https://s3.dualstack.{}.amazonaws.com", s3_config.region)
+                } else {
+                    s3_config.endpoint.clone()
+                },
+                region: s3_config.region.clone(),
+                bucket: s3_config.bucket.clone(),
+                bucket_prefix: if s3_config.prefix.is_empty() {
+                    None
+                } else {
+                    Some(s3_config.prefix.clone())
+                },
+                path_style: s3_config.path_style,
+            };
+
+            let store = S3Store::new(s3_store_config);
+            Ok(Some(Box::new(store)))
+        }
+    }
 }
 
 fn get_store_from_opts(store_path: &str) -> Result<Box<dyn Store>> {
@@ -223,6 +430,7 @@ async fn main() -> Result<()> {
 
     match &opts.subcmd {
         ServSubcommand::Serve {
+            config,
             port,
             host,
             metrics_port,
@@ -233,30 +441,60 @@ async fn main() -> Result<()> {
             allowed_hosts,
             prod,
         } => {
-            let auth = if let Some(auth) = auth {
-                Some(Authenticator::new(auth)?)
+            // Load configuration
+            let config = load_config_for_serve_args(
+                config.as_ref(),
+                store,
+                *port,
+                host,
+                metrics_port,
+                *checkpoint_freq_seconds,
+                auth,
+                url_prefix,
+                allowed_hosts,
+            )?;
+
+            // Initialize logging based on config
+            let log_level = &config.logging.level;
+            tracing::info!("Using log level: {}", log_level);
+
+            // Create authenticator from config
+            let auth = if config.auth.enabled {
+                if let Some(private_key) = &config.auth.private_key {
+                    Some(Authenticator::new(private_key)?)
+                } else {
+                    return Err(anyhow::anyhow!(
+                        "Auth is enabled but no private key provided"
+                    ));
+                }
             } else {
                 tracing::warn!("No auth key set. Only use this for local development!");
                 None
             };
 
-            let addr = SocketAddr::new(
-                host.unwrap_or(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
-                *port,
-            );
+            // Parse server host
+            let server_host: IpAddr = config
+                .server
+                .host
+                .parse()
+                .unwrap_or(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
 
+            let addr = SocketAddr::new(server_host, config.server.port);
             let listener = TcpListener::bind(addr).await?;
             let addr = listener.local_addr()?;
 
-            let metrics_addr = SocketAddr::new(
-                host.unwrap_or(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
-                *metrics_port,
-            );
-            let metrics_listener = TcpListener::bind(metrics_addr).await?;
-            let metrics_addr = metrics_listener.local_addr()?;
+            // Only bind metrics listener if metrics are enabled
+            let metrics_listener_and_addr = if let Some(ref metrics_config) = config.metrics {
+                let metrics_addr = SocketAddr::new(server_host, metrics_config.port);
+                let metrics_listener = TcpListener::bind(metrics_addr).await?;
+                let metrics_addr = metrics_listener.local_addr()?;
+                Some((metrics_listener, metrics_addr))
+            } else {
+                None
+            };
 
-            let store = if let Some(store) = store {
-                let store = get_store_from_opts(store)?;
+            // Create store from config
+            let store = if let Some(store) = get_store_from_config(&config.store)? {
                 store.init().await?;
                 Some(store)
             } else {
@@ -264,7 +502,34 @@ async fn main() -> Result<()> {
                 None
             };
 
-            let allowed_hosts = generate_allowed_hosts(url_prefix.as_ref(), allowed_hosts.clone())?;
+            // Parse URL prefix
+            let url_prefix = config
+                .server
+                .url_prefix
+                .as_ref()
+                .map(|s| Url::parse(s))
+                .transpose()?;
+
+            // Generate allowed hosts (use config + auto-generation from URL prefix)
+            let allowed_hosts = if config.server.allowed_hosts.is_empty() {
+                // Auto-generate from url_prefix if no explicit hosts configured
+                generate_allowed_hosts(url_prefix.as_ref(), None)?
+            } else {
+                // Use configured hosts, but also add Fly.io auto-detection if applicable
+                let explicit_hosts: Vec<String> = config
+                    .server
+                    .allowed_hosts
+                    .iter()
+                    .map(|h| {
+                        if h.scheme == "https" || h.scheme == "http" {
+                            format!("{}://{}", h.scheme, h.host)
+                        } else {
+                            h.host.clone()
+                        }
+                    })
+                    .collect();
+                generate_allowed_hosts(url_prefix.as_ref(), Some(explicit_hosts))?
+            };
 
             if !prod {
                 print_server_url(auth.as_ref(), url_prefix.as_ref(), addr);
@@ -272,28 +537,32 @@ async fn main() -> Result<()> {
 
             let token = CancellationToken::new();
 
-            // Load webhook configs from environment for now (store loading can be added later)
-            let webhook_configs = y_sweet::webhook::load_webhook_configs();
+            // Use webhook configs from configuration (TOML file or env vars)
+            let webhook_configs = if config.webhooks.is_empty() {
+                // Fallback to environment variable for backward compatibility
+                y_sweet::webhook::load_webhook_configs()
+            } else {
+                Some(config.webhooks.clone())
+            };
+
             if let Some(ref configs) = webhook_configs {
-                tracing::info!(
-                    "Loaded {} webhook configurations from environment",
-                    configs.len()
-                );
+                tracing::info!("Loaded {} webhook configurations", configs.len());
             }
 
             let server = y_sweet::server::Server::new(
                 store,
-                std::time::Duration::from_secs(*checkpoint_freq_seconds),
+                std::time::Duration::from_secs(config.server.checkpoint_freq_seconds),
                 auth,
                 url_prefix.clone(),
                 allowed_hosts,
                 token.clone(),
-                true,
+                config.server.doc_gc,
                 webhook_configs,
             )
             .await?;
 
-            let prod = *prod;
+            let _prod = *prod;
+            let redact_errors = config.server.redact_errors;
             let server = Arc::new(server);
 
             let main_handle = tokio::spawn({
@@ -304,12 +573,12 @@ async fn main() -> Result<()> {
                     let app = routes.layer(middleware::from_fn(
                         y_sweet::server::Server::version_header_middleware,
                     ));
-                    let app = if prod {
-                        app
-                    } else {
+                    let app = if redact_errors {
                         app.layer(middleware::from_fn(
                             y_sweet::server::Server::redact_error_middleware,
                         ))
+                    } else {
+                        app
                     };
                     axum::serve(listener, app.into_make_service())
                         .with_graceful_shutdown(async move { token.cancelled().await })
@@ -318,20 +587,31 @@ async fn main() -> Result<()> {
                 }
             });
 
-            let metrics_handle = tokio::spawn({
-                let server = server.clone();
-                let token = token.clone();
-                async move {
-                    let metrics_routes = server.metrics_routes();
-                    axum::serve(metrics_listener, metrics_routes.into_make_service())
-                        .with_graceful_shutdown(async move { token.cancelled().await })
-                        .await
-                        .unwrap();
-                }
-            });
+            let metrics_addr_for_logging =
+                metrics_listener_and_addr.as_ref().map(|(_, addr)| *addr);
+
+            let metrics_handle = if let Some((metrics_listener, _)) = metrics_listener_and_addr {
+                Some(tokio::spawn({
+                    let server = server.clone();
+                    let token = token.clone();
+                    async move {
+                        let metrics_routes = server.metrics_routes();
+                        axum::serve(metrics_listener, metrics_routes.into_make_service())
+                            .with_graceful_shutdown(async move { token.cancelled().await })
+                            .await
+                            .unwrap();
+                    }
+                }))
+            } else {
+                None
+            };
 
             tracing::info!("Listening on ws://{}", addr);
-            tracing::info!("Metrics listening on http://{}", metrics_addr);
+            if let Some(metrics_addr) = metrics_addr_for_logging {
+                tracing::info!("Metrics listening on http://{}", metrics_addr);
+            } else {
+                tracing::info!("Metrics disabled");
+            }
 
             tokio::signal::ctrl_c()
                 .await
@@ -340,7 +620,11 @@ async fn main() -> Result<()> {
             tracing::info!("Shutting down.");
             token.cancel();
 
-            let _ = tokio::join!(main_handle, metrics_handle);
+            if let Some(metrics_handle) = metrics_handle {
+                let _ = tokio::join!(main_handle, metrics_handle);
+            } else {
+                let _ = main_handle.await;
+            }
             tracing::info!("Server shut down.");
         }
         ServSubcommand::GenAuth { json, key_type } => {
@@ -391,6 +675,102 @@ async fn main() -> Result<()> {
         }
         ServSubcommand::Version => {
             println!("{}", VERSION);
+        }
+        ServSubcommand::Config { cmd } => {
+            match cmd {
+                ConfigSubcommand::Validate { config } => {
+                    println!("Validating configuration file: {}", config.display());
+
+                    match Config::load(Some(config.as_path())) {
+                        Ok(config) => {
+                            println!("✅ Configuration is valid!");
+                            println!();
+                            println!("Configuration summary:");
+                            println!("  Server: {}:{}", config.server.host, config.server.port);
+                            if let Some(ref metrics_config) = config.metrics {
+                                println!(
+                                    "  Metrics: {}:{}",
+                                    config.server.host, metrics_config.port
+                                );
+                            } else {
+                                println!("  Metrics: disabled");
+                            }
+                            println!(
+                                "  Auth: {}",
+                                if config.auth.enabled {
+                                    "enabled"
+                                } else {
+                                    "disabled"
+                                }
+                            );
+                            println!(
+                                "  Store: {}",
+                                match &config.store {
+                                    y_sweet_core::config::StoreConfig::Memory =>
+                                        "Memory".to_string(),
+                                    y_sweet_core::config::StoreConfig::Filesystem(fs) =>
+                                        format!("Filesystem ({})", fs.path),
+                                    y_sweet_core::config::StoreConfig::S3(s3) =>
+                                        format!("S3 ({})", s3.bucket),
+                                    y_sweet_core::config::StoreConfig::Aws(aws) =>
+                                        format!("AWS S3 ({})", aws.bucket),
+                                    y_sweet_core::config::StoreConfig::Cloudflare(cf) =>
+                                        format!("Cloudflare R2 ({})", cf.bucket),
+                                    y_sweet_core::config::StoreConfig::Backblaze(b2) =>
+                                        format!("Backblaze B2 ({})", b2.bucket),
+                                    y_sweet_core::config::StoreConfig::Minio(minio) =>
+                                        format!("MinIO ({} at {})", minio.bucket, minio.endpoint),
+                                    y_sweet_core::config::StoreConfig::Tigris(tigris) =>
+                                        format!("Tigris ({})", tigris.bucket),
+                                }
+                            );
+                            println!("  Webhooks: {}", config.webhooks.len());
+                            println!(
+                                "  Logging: {} ({})",
+                                config.logging.level, config.logging.format
+                            );
+
+                            if let Some(url_prefix) = &config.server.url_prefix {
+                                println!("  URL prefix: {}", url_prefix);
+                            }
+
+                            if !config.server.allowed_hosts.is_empty() {
+                                println!("  Allowed hosts: {}", config.server.allowed_hosts.len());
+                                for host in &config.server.allowed_hosts {
+                                    println!("    - {}://{}", host.scheme, host.host);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("❌ Configuration validation failed:");
+                            eprintln!("   {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                ConfigSubcommand::Show { config } => {
+                    match Config::load(Some(config.as_path())) {
+                        Ok(config) => {
+                            println!("Current configuration:");
+                            println!();
+
+                            // Convert to TOML for display
+                            match toml::to_string_pretty(&config) {
+                                Ok(toml_str) => println!("{}", toml_str),
+                                Err(e) => {
+                                    eprintln!("❌ Failed to serialize configuration: {}", e);
+                                    std::process::exit(1);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("❌ Failed to load configuration:");
+                            eprintln!("   {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
         }
         ServSubcommand::Sign { auth } => {
             let authenticator = Authenticator::new(auth)?;
