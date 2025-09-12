@@ -532,11 +532,13 @@ impl Config {
                     prefix.to_string()
                 };
 
-                tracing::info!("Config override: store = S3 (bucket: {}, prefix: {}) (from RELAY_SERVER_STORAGE)", bucket, prefix);
+                let region = env::var("AWS_REGION").unwrap_or_else(|_| default_s3_region());
+                tracing::info!("Config override: store = S3 (bucket: {}, prefix: {}, region: {}) (from RELAY_SERVER_STORAGE, AWS_REGION={})", 
+                    bucket, prefix, region, env::var("AWS_REGION").unwrap_or_else(|_| "not set".to_string()));
                 self.store = StoreConfig::S3(S3StoreConfig {
                     bucket,
                     prefix,
-                    region: default_s3_region(),
+                    region,
                     endpoint: String::new(),
                     path_style: false,
                     presigned_url_expiration: default_presigned_url_expiration(),

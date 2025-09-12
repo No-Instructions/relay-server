@@ -203,7 +203,7 @@ fn load_config_for_serve_args(
             config.store = StoreConfig::S3(S3StoreConfig {
                 bucket,
                 prefix,
-                region: "us-east-1".to_string(),
+                region: env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
                 endpoint: String::new(),
                 path_style: false,
                 presigned_url_expiration: 3600,
