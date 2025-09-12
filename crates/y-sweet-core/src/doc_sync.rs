@@ -58,10 +58,12 @@ impl DocWithSyncKv {
 
                 // Trigger webhook if callback is configured
                 if let Some(ref callback) = webhook_callback {
-                    // Step 1: Create the event payload with business data and metadata
-                    let event = DocumentUpdatedEvent::new(doc_key.clone()).with_metadata(&sync_kv);
+                    // Create the event payload with business data, metadata, and update
+                    let event = DocumentUpdatedEvent::new(doc_key.clone())
+                        .with_metadata(&sync_kv)
+                        .with_update(event.update.to_vec());
 
-                    // Step 2: Callback handles envelope creation and dispatch
+                    // Callback handles envelope creation and dispatch
                     callback(event);
                 }
             })

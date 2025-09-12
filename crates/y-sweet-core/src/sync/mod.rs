@@ -3,10 +3,45 @@
 pub mod awareness;
 
 use awareness::{Awareness, AwarenessUpdate};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use yrs::updates::decoder::{Decode, Decoder};
 use yrs::updates::encoder::{Encode, Encoder};
 use yrs::{ReadTxn, StateVector, Transact, Update};
+
+/// Event message structure for CBOR serialization
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EventMessage {
+    pub event_id: String,   // Unique event identifier
+    pub event_type: String, // e.g., "document.updated"
+    pub doc_id: String,     // Document that triggered the event
+    pub timestamp: u64,     // Unix timestamp in milliseconds
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>, // User who triggered the event
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>, // Event-specific metadata
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub update: Option<Vec<u8>>, // Yjs update data for document.updated events
+}
+
+impl EventMessage {
+    /// Serialize to CBOR bytes
+    pub fn to_cbor(&self) -> Result<Vec<u8>, Error> {
+        let mut bytes = Vec::new();
+        ciborium::into_writer(self, &mut bytes)
+            .map_err(|e| Error::Other(format!("CBOR serialization failed: {}", e).into()))?;
+        Ok(bytes)
+    }
+
+    /// Deserialize from CBOR bytes
+    pub fn from_cbor(bytes: &[u8]) -> Result<Self, Error> {
+        ciborium::from_reader(bytes)
+            .map_err(|e| Error::Other(format!("CBOR deserialization failed: {}", e).into()))
+    }
+}
 
 /*
  Core Yjs defines two message types:
@@ -121,6 +156,39 @@ pub trait Protocol {
         Ok(None)
     }
 
+    /// Handle event subscription request. By default, logs the request and returns None.
+    /// Implementations can override this to manage event subscriptions.
+    fn handle_event_subscribe(
+        &self,
+        _awareness: &Awareness,
+        event_types: Vec<String>,
+    ) -> Result<Option<Message>, Error> {
+        tracing::debug!("Event subscription request for types: {:?}", event_types);
+        Ok(None)
+    }
+
+    /// Handle event unsubscription request. By default, logs the request and returns None.
+    /// Implementations can override this to manage event subscriptions.
+    fn handle_event_unsubscribe(
+        &self,
+        _awareness: &Awareness,
+        event_types: Vec<String>,
+    ) -> Result<Option<Message>, Error> {
+        tracing::debug!("Event unsubscription request for types: {:?}", event_types);
+        Ok(None)
+    }
+
+    /// Handle incoming event message. By default, logs and ignores the event.
+    /// This should generally not be called on the server side.
+    fn handle_event(
+        &self,
+        _awareness: &Awareness,
+        event_data: Vec<u8>,
+    ) -> Result<Option<Message>, Error> {
+        tracing::debug!("Received event message with {} bytes", event_data.len());
+        Ok(None)
+    }
+
     /// Y-sync protocol enables to extend its own settings with custom handles. These can be
     /// implemented here. By default, it returns an [Error::Unsupported].
     fn missing_handle(
@@ -141,6 +209,12 @@ pub const MSG_AWARENESS: u8 = 1;
 pub const MSG_AUTH: u8 = 2;
 /// Tag id for [Message::AwarenessQuery].
 pub const MSG_QUERY_AWARENESS: u8 = 3;
+/// Tag id for [Message::Event].
+pub const MSG_EVENT: u8 = 4;
+/// Tag id for [Message::EventSubscribe].
+pub const MSG_EVENT_SUBSCRIBE: u8 = 5;
+/// Tag id for [Message::EventUnsubscribe].
+pub const MSG_EVENT_UNSUBSCRIBE: u8 = 6;
 
 pub const PERMISSION_DENIED: u8 = 0;
 pub const PERMISSION_GRANTED: u8 = 1;
@@ -151,6 +225,9 @@ pub enum Message {
     Auth(Option<String>),
     AwarenessQuery,
     Awareness(AwarenessUpdate),
+    Event(Vec<u8>),                // CBOR-encoded EventMessage
+    EventSubscribe(Vec<String>),   // List of event types to subscribe to
+    EventUnsubscribe(Vec<String>), // List of event types to unsubscribe from
     Custom(u8, Vec<u8>),
 }
 
@@ -176,6 +253,24 @@ impl Encode for Message {
             Message::Awareness(update) => {
                 encoder.write_var(MSG_AWARENESS);
                 encoder.write_buf(update.encode_v1())
+            }
+            Message::Event(cbor_data) => {
+                encoder.write_var(MSG_EVENT);
+                encoder.write_buf(cbor_data);
+            }
+            Message::EventSubscribe(event_types) => {
+                encoder.write_var(MSG_EVENT_SUBSCRIBE);
+                encoder.write_var(event_types.len());
+                for event_type in event_types {
+                    encoder.write_string(event_type);
+                }
+            }
+            Message::EventUnsubscribe(event_types) => {
+                encoder.write_var(MSG_EVENT_UNSUBSCRIBE);
+                encoder.write_var(event_types.len());
+                for event_type in event_types {
+                    encoder.write_string(event_type);
+                }
             }
             Message::Custom(tag, data) => {
                 encoder.write_u8(*tag);
@@ -207,6 +302,28 @@ impl Decode for Message {
                 Ok(Message::Auth(reason))
             }
             MSG_QUERY_AWARENESS => Ok(Message::AwarenessQuery),
+            MSG_EVENT => {
+                let data = decoder.read_buf()?;
+                Ok(Message::Event(data.to_vec()))
+            }
+            MSG_EVENT_SUBSCRIBE => {
+                let count: u64 = decoder.read_var()?;
+                let mut event_types = Vec::new();
+                for _ in 0..count {
+                    let event_type = decoder.read_string()?.to_string();
+                    event_types.push(event_type);
+                }
+                Ok(Message::EventSubscribe(event_types))
+            }
+            MSG_EVENT_UNSUBSCRIBE => {
+                let count: u64 = decoder.read_var()?;
+                let mut event_types = Vec::new();
+                for _ in 0..count {
+                    let event_type = decoder.read_string()?.to_string();
+                    event_types.push(event_type);
+                }
+                Ok(Message::EventUnsubscribe(event_types))
+            }
             tag => {
                 let data = decoder.read_buf()?;
                 Ok(Message::Custom(tag, data.to_vec()))
@@ -319,7 +436,10 @@ impl<'a, D: Decoder> Iterator for MessageReader<'a, D> {
 
 #[cfg(test)]
 mod test {
-    use super::{Message, SyncMessage};
+    use super::{
+        EventMessage, Message, SyncMessage, MSG_AUTH, MSG_AWARENESS, MSG_EVENT,
+        MSG_EVENT_SUBSCRIBE, MSG_EVENT_UNSUBSCRIBE, MSG_QUERY_AWARENESS, MSG_SYNC,
+    };
     use crate::sync::awareness::Awareness;
     use crate::sync::{DefaultProtocol, MessageReader, Protocol};
     use std::collections::HashMap;
@@ -459,5 +579,245 @@ mod test {
         }
 
         assert_eq!(a2.clients(), &HashMap::from([(1, "{x:3}".to_owned())]));
+    }
+
+    #[test]
+    fn test_event_message_cbor_serialization() {
+        let event = EventMessage {
+            event_id: "evt_test123".to_string(),
+            event_type: "document.updated".to_string(),
+            doc_id: "test_doc".to_string(),
+            timestamp: 1640995200000, // 2022-01-01 00:00:00 UTC
+            user: Some("alice@example.com".to_string()),
+            metadata: Some(serde_json::json!({
+                "version": 2,
+                "changes": ["text", "formatting"]
+            })),
+            update: None,
+        };
+
+        // Test serialization
+        let cbor_bytes = event.to_cbor().unwrap();
+        assert!(!cbor_bytes.is_empty());
+
+        // Test deserialization
+        let decoded_event = EventMessage::from_cbor(&cbor_bytes).unwrap();
+        assert_eq!(decoded_event, event);
+    }
+
+    #[test]
+    fn test_event_message_cbor_serialization_minimal() {
+        let event = EventMessage {
+            event_id: "evt_minimal".to_string(),
+            event_type: "document.updated".to_string(),
+            doc_id: "minimal_doc".to_string(),
+            timestamp: 1640995200000,
+            user: None,
+            metadata: None,
+            update: None,
+        };
+
+        let cbor_bytes = event.to_cbor().unwrap();
+        let decoded_event = EventMessage::from_cbor(&cbor_bytes).unwrap();
+        assert_eq!(decoded_event, event);
+    }
+
+    #[test]
+    fn test_event_message_invalid_cbor() {
+        let invalid_cbor = vec![0xff, 0x00, 0x01]; // Invalid CBOR data
+        let result = EventMessage::from_cbor(&invalid_cbor);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_event_subscribe_message_encoding() {
+        let event_types = vec!["document.updated".to_string(), "user.joined".to_string()];
+        let msg = Message::EventSubscribe(event_types.clone());
+
+        let encoded = msg.encode_v1();
+        let decoded = Message::decode_v1(&encoded).unwrap();
+
+        assert_eq!(decoded, msg);
+        if let Message::EventSubscribe(decoded_types) = decoded {
+            assert_eq!(decoded_types, event_types);
+        } else {
+            panic!("Expected EventSubscribe message");
+        }
+    }
+
+    #[test]
+    fn test_event_unsubscribe_message_encoding() {
+        let event_types = vec!["document.updated".to_string()];
+        let msg = Message::EventUnsubscribe(event_types.clone());
+
+        let encoded = msg.encode_v1();
+        let decoded = Message::decode_v1(&encoded).unwrap();
+
+        assert_eq!(decoded, msg);
+        if let Message::EventUnsubscribe(decoded_types) = decoded {
+            assert_eq!(decoded_types, event_types);
+        } else {
+            panic!("Expected EventUnsubscribe message");
+        }
+    }
+
+    #[test]
+    fn test_event_message_encoding() {
+        let event = EventMessage {
+            event_id: "evt_encode_test".to_string(),
+            event_type: "document.updated".to_string(),
+            doc_id: "encode_test_doc".to_string(),
+            timestamp: 1640995200000,
+            user: Some("test@example.com".to_string()),
+            metadata: Some(serde_json::json!({"test": true})),
+            update: None,
+        };
+
+        let cbor_data = event.to_cbor().unwrap();
+        let msg = Message::Event(cbor_data.clone());
+
+        let encoded = msg.encode_v1();
+        let decoded = Message::decode_v1(&encoded).unwrap();
+
+        assert_eq!(decoded, msg);
+        if let Message::Event(decoded_cbor) = decoded {
+            assert_eq!(decoded_cbor, cbor_data);
+
+            // Verify we can decode the CBOR back to the original event
+            let decoded_event = EventMessage::from_cbor(&decoded_cbor).unwrap();
+            assert_eq!(decoded_event, event);
+        } else {
+            panic!("Expected Event message");
+        }
+    }
+
+    #[test]
+    fn test_empty_event_subscription_list() {
+        let empty_types: Vec<String> = vec![];
+        let msg = Message::EventSubscribe(empty_types.clone());
+
+        let encoded = msg.encode_v1();
+        let decoded = Message::decode_v1(&encoded).unwrap();
+
+        assert_eq!(decoded, msg);
+        if let Message::EventSubscribe(decoded_types) = decoded {
+            assert_eq!(decoded_types, empty_types);
+            assert!(decoded_types.is_empty());
+        } else {
+            panic!("Expected EventSubscribe message");
+        }
+    }
+
+    #[test]
+    fn test_large_event_subscription_list() {
+        let event_types: Vec<String> = (0..100).map(|i| format!("event.type.{}", i)).collect();
+        let msg = Message::EventSubscribe(event_types.clone());
+
+        let encoded = msg.encode_v1();
+        let decoded = Message::decode_v1(&encoded).unwrap();
+
+        assert_eq!(decoded, msg);
+        if let Message::EventSubscribe(decoded_types) = decoded {
+            assert_eq!(decoded_types, event_types);
+            assert_eq!(decoded_types.len(), 100);
+        } else {
+            panic!("Expected EventSubscribe message");
+        }
+    }
+
+    #[test]
+    fn test_protocol_handles_event_messages() {
+        let protocol = DefaultProtocol;
+        let awareness = Awareness::default();
+
+        // Test event subscribe
+        let result =
+            protocol.handle_event_subscribe(&awareness, vec!["document.updated".to_string()]);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+
+        // Test event unsubscribe
+        let result =
+            protocol.handle_event_unsubscribe(&awareness, vec!["document.updated".to_string()]);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+
+        // Test event message
+        let event = EventMessage {
+            event_id: "evt_test".to_string(),
+            event_type: "document.updated".to_string(),
+            doc_id: "test_doc".to_string(),
+            timestamp: 1640995200000,
+            user: None,
+            metadata: None,
+            update: None,
+        };
+        let cbor_data = event.to_cbor().unwrap();
+        let result = protocol.handle_event(&awareness, cbor_data);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_message_type_constants() {
+        // Verify the message type constants have the expected values
+        assert_eq!(MSG_SYNC, 0);
+        assert_eq!(MSG_AWARENESS, 1);
+        assert_eq!(MSG_AUTH, 2);
+        assert_eq!(MSG_QUERY_AWARENESS, 3);
+        assert_eq!(MSG_EVENT, 4);
+        assert_eq!(MSG_EVENT_SUBSCRIBE, 5);
+        assert_eq!(MSG_EVENT_UNSUBSCRIBE, 6);
+    }
+
+    #[test]
+    fn test_all_message_types_roundtrip() {
+        let doc = Doc::new();
+        let txt = doc.get_or_insert_text("text");
+        txt.push(&mut doc.transact_mut(), "hello world");
+        let mut awareness = Awareness::new(doc);
+        awareness.set_local_state("{\"user\":{\"name\":\"Test\"}}");
+
+        // Test event message
+        let event = EventMessage {
+            event_id: "evt_roundtrip".to_string(),
+            event_type: "document.updated".to_string(),
+            doc_id: "roundtrip_doc".to_string(),
+            timestamp: 1640995200000,
+            user: Some("test@example.com".to_string()),
+            metadata: Some(serde_json::json!({"test": "data"})),
+            update: None,
+        };
+        let cbor_data = event.to_cbor().unwrap();
+
+        let messages = [
+            Message::Sync(SyncMessage::SyncStep1(
+                awareness.doc().transact().state_vector(),
+            )),
+            Message::Sync(SyncMessage::SyncStep2(
+                awareness
+                    .doc()
+                    .transact()
+                    .encode_state_as_update_v1(&StateVector::default()),
+            )),
+            Message::Awareness(awareness.update().unwrap()),
+            Message::Auth(Some("reason".to_string())),
+            Message::Auth(None),
+            Message::AwarenessQuery,
+            Message::Event(cbor_data),
+            Message::EventSubscribe(vec![
+                "document.updated".to_string(),
+                "user.joined".to_string(),
+            ]),
+            Message::EventUnsubscribe(vec!["user.left".to_string()]),
+            Message::Custom(100, vec![1, 2, 3, 4]),
+        ];
+
+        for msg in messages {
+            let encoded = msg.encode_v1();
+            let decoded = Message::decode_v1(&encoded)
+                .unwrap_or_else(|_| panic!("failed to decode {:?}", msg));
+            assert_eq!(decoded, msg);
+        }
     }
 }

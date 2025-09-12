@@ -384,7 +384,7 @@ impl WebhookDispatcher {
         match result {
             Ok(response) => {
                 if response.status().is_success() {
-                    metrics.record_webhook_request(&config.prefix, &doc_id, "success", duration);
+                    metrics.record_webhook_request(&config.prefix, "success", duration);
                     info!(
                         "Webhook sent successfully for document {} to prefix '{}'",
                         doc_id, config.prefix
@@ -392,7 +392,7 @@ impl WebhookDispatcher {
                     Ok(())
                 } else {
                     let status_code = response.status().as_u16().to_string();
-                    metrics.record_webhook_request(&config.prefix, &doc_id, &status_code, duration);
+                    metrics.record_webhook_request(&config.prefix, &status_code, duration);
                     let error_msg = format!("Webhook failed with status {}", response.status());
                     error!(
                         "Webhook failed for document {} to prefix '{}': {}",
@@ -402,7 +402,7 @@ impl WebhookDispatcher {
                 }
             }
             Err(e) => {
-                metrics.record_webhook_request(&config.prefix, &doc_id, "error", duration);
+                metrics.record_webhook_request(&config.prefix, "error", duration);
                 Err(e)
             }
         }
@@ -425,7 +425,7 @@ impl WebhookDispatcher {
 
             // Update metrics
             self.metrics
-                .set_websocket_connections(&prefix, connections.len());
+                .set_websocket_connections(&prefix, "all", connections.len());
         }
     }
 
@@ -437,10 +437,10 @@ impl WebhookDispatcher {
                 // Remove empty prefix entries
                 if connections.is_empty() {
                     temp_guard.remove(prefix);
-                    self.metrics.set_websocket_connections(prefix, 0);
+                    self.metrics.set_websocket_connections(prefix, "all", 0);
                 } else {
                     self.metrics
-                        .set_websocket_connections(prefix, connections.len());
+                        .set_websocket_connections(prefix, "all", connections.len());
                 }
             }
         }
