@@ -430,7 +430,8 @@ impl Server {
     ) -> Result<MappedRef<String, DocWithSyncKv, DocWithSyncKv>> {
         if !self.docs.contains_key(doc_id) {
             tracing::info!(doc_id=?doc_id, channel=?routing_channel, user=?user, "Loading doc with channel and user");
-            self.load_doc_with_user(doc_id, routing_channel, user).await?;
+            self.load_doc_with_user(doc_id, routing_channel, user)
+                .await?;
         }
 
         Ok(self
