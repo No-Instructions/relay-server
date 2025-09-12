@@ -205,6 +205,15 @@ impl Server {
     }
 
     pub async fn load_doc(&self, doc_id: &str, routing_channel: Option<String>) -> Result<()> {
+        self.load_doc_with_user(doc_id, routing_channel, None).await
+    }
+
+    pub async fn load_doc_with_user(
+        &self,
+        doc_id: &str,
+        routing_channel: Option<String>,
+        user: Option<String>,
+    ) -> Result<()> {
         Self::validate_doc_id(doc_id)?;
         let (send, recv) = channel(1024);
 
@@ -213,13 +222,32 @@ impl Server {
             .clone()
             .unwrap_or_else(|| doc_id.to_string());
 
-        // Create event callback with the determined routing channel
+        // Create event callback with the determined routing channel and user
         let event_callback = {
             let event_dispatcher = self.event_dispatcher.clone();
             let routing_channel_for_callback = routing_channel_name.clone();
+            let user_for_callback = user.clone();
 
             if let Some(dispatcher) = event_dispatcher {
-                Some(Arc::new(move |event: DocumentUpdatedEvent| {
+                Some(Arc::new(move |mut event: DocumentUpdatedEvent| {
+                    // Add user to event if available
+                    if let Some(ref user) = user_for_callback {
+                        event.user = Some(user.clone());
+                    }
+
+                    // Log the full event payload as JSON after user assignment
+                    match serde_json::to_string(&event) {
+                        Ok(json_str) => {
+                            tracing::info!("Document updated event dispatched: {}", json_str);
+                        }
+                        Err(e) => {
+                            tracing::info!(
+                                "Document updated event dispatched for doc_id: {} (JSON serialization failed: {})",
+                                event.doc_id, e
+                            );
+                        }
+                    }
+
                     // Step 1: Create the envelope with predetermined routing channel
                     let envelope = EventEnvelope::new(routing_channel_for_callback.clone(), event);
 
@@ -403,9 +431,20 @@ impl Server {
         doc_id: &str,
         routing_channel: Option<String>,
     ) -> Result<MappedRef<String, DocWithSyncKv, DocWithSyncKv>> {
+        self.get_or_create_doc_with_channel_and_user(doc_id, routing_channel, None)
+            .await
+    }
+
+    pub async fn get_or_create_doc_with_channel_and_user(
+        &self,
+        doc_id: &str,
+        routing_channel: Option<String>,
+        user: Option<String>,
+    ) -> Result<MappedRef<String, DocWithSyncKv, DocWithSyncKv>> {
         if !self.docs.contains_key(doc_id) {
-            tracing::info!(doc_id=?doc_id, channel=?routing_channel, "Loading doc with channel");
-            self.load_doc(doc_id, routing_channel).await?;
+            tracing::info!(doc_id=?doc_id, channel=?routing_channel, user=?user, "Loading doc with channel and user");
+            self.load_doc_with_user(doc_id, routing_channel, user)
+                .await?;
         }
 
         Ok(self
@@ -698,6 +737,25 @@ async fn handle_socket_upgrade_with_channel(
     routing_channel: Option<String>,
     State(server_state): State<Arc<Server>>,
 ) -> Result<Response, AppError> {
+    handle_socket_upgrade_with_channel_and_user(
+        ws,
+        Path(doc_id),
+        authorization,
+        routing_channel,
+        None,
+        State(server_state),
+    )
+    .await
+}
+
+async fn handle_socket_upgrade_with_channel_and_user(
+    ws: WebSocketUpgrade,
+    Path(doc_id): Path<String>,
+    authorization: Authorization,
+    routing_channel: Option<String>,
+    user: Option<String>,
+    State(server_state): State<Arc<Server>>,
+) -> Result<Response, AppError> {
     if !matches!(authorization, Authorization::Full) && !server_state.docs.contains_key(&doc_id) {
         return Err(AppError(
             StatusCode::NOT_FOUND,
@@ -706,7 +764,7 @@ async fn handle_socket_upgrade_with_channel(
     }
 
     let dwskv = server_state
-        .get_or_create_doc_with_channel(&doc_id, routing_channel)
+        .get_or_create_doc_with_channel_and_user(&doc_id, routing_channel, user)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let awareness = dwskv.awareness();
@@ -738,7 +796,7 @@ async fn handle_socket_upgrade_deprecated(
         (y_sweet_core::auth::Permission::Server, None)
     };
 
-    let authorization = match permission {
+    let (authorization, user) = match permission {
         y_sweet_core::auth::Permission::Doc(doc_perm) => {
             if doc_perm.doc_id != doc_id {
                 return Err(AppError(
@@ -746,9 +804,9 @@ async fn handle_socket_upgrade_deprecated(
                     anyhow!("Token not valid for this document"),
                 ));
             }
-            doc_perm.authorization
+            (doc_perm.authorization, doc_perm.user)
         }
-        y_sweet_core::auth::Permission::Server => Authorization::Full,
+        y_sweet_core::auth::Permission::Server => (Authorization::Full, None),
         y_sweet_core::auth::Permission::Prefix(prefix_perm) => {
             if !doc_id.starts_with(&prefix_perm.prefix) {
                 return Err(AppError(
@@ -756,7 +814,7 @@ async fn handle_socket_upgrade_deprecated(
                     anyhow!("Token not valid for this document"),
                 ));
             }
-            prefix_perm.authorization
+            (prefix_perm.authorization, prefix_perm.user)
         }
         y_sweet_core::auth::Permission::File(_) => {
             return Err(AppError(
@@ -766,11 +824,12 @@ async fn handle_socket_upgrade_deprecated(
         }
     };
 
-    handle_socket_upgrade_with_channel(
+    handle_socket_upgrade_with_channel_and_user(
         ws,
         Path(doc_id),
         authorization,
         channel,
+        user,
         State(server_state),
     )
     .await
@@ -809,7 +868,7 @@ async fn handle_socket_upgrade_full_path(
         (y_sweet_core::auth::Permission::Server, None)
     };
 
-    let authorization = match permission {
+    let (authorization, user) = match permission {
         y_sweet_core::auth::Permission::Doc(doc_perm) => {
             if doc_perm.doc_id != doc_id {
                 return Err(AppError(
@@ -817,9 +876,9 @@ async fn handle_socket_upgrade_full_path(
                     anyhow!("Token not valid for this document"),
                 ));
             }
-            doc_perm.authorization
+            (doc_perm.authorization, doc_perm.user)
         }
-        y_sweet_core::auth::Permission::Server => Authorization::Full,
+        y_sweet_core::auth::Permission::Server => (Authorization::Full, None),
         y_sweet_core::auth::Permission::Prefix(prefix_perm) => {
             if !doc_id.starts_with(&prefix_perm.prefix) {
                 return Err(AppError(
@@ -827,7 +886,7 @@ async fn handle_socket_upgrade_full_path(
                     anyhow!("Token not valid for this document"),
                 ));
             }
-            prefix_perm.authorization
+            (prefix_perm.authorization, prefix_perm.user)
         }
         y_sweet_core::auth::Permission::File(_) => {
             return Err(AppError(
@@ -837,11 +896,12 @@ async fn handle_socket_upgrade_full_path(
         }
     };
 
-    handle_socket_upgrade_with_channel(
+    handle_socket_upgrade_with_channel_and_user(
         ws,
         Path(doc_id),
         authorization,
         channel,
+        user,
         State(server_state),
     )
     .await
