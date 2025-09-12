@@ -1,4 +1,5 @@
 use crate::api_types::{Authorization, NANOID_ALPHABET};
+use crate::sync::EventMessage;
 use crate::sync_kv::SyncKv;
 use crate::webhook::WebhookConfig;
 use crate::webhook_metrics::WebhookMetrics;
@@ -590,6 +591,143 @@ impl EventSender for WebSocketSender {
         // We just need to clear our registry
         if let Ok(mut temp_guard) = self.temporary_prefixes.try_write() {
             temp_guard.clear();
+        }
+    }
+}
+
+/// Sync protocol event sender using weak references to avoid circular dependencies
+pub struct SyncProtocolEventSender {
+    // Map from document ID to list of weak references to DocConnections
+    doc_connections:
+        Arc<RwLock<HashMap<String, Vec<std::sync::Weak<crate::doc_connection::DocConnection>>>>>,
+}
+
+impl SyncProtocolEventSender {
+    pub fn new() -> Self {
+        Self {
+            doc_connections: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Register a DocConnection for a document
+    pub fn register_doc_connection(
+        &self,
+        doc_id: String,
+        connection: std::sync::Weak<crate::doc_connection::DocConnection>,
+    ) {
+        if let Ok(mut connections) = self.doc_connections.write() {
+            let doc_connections = connections.entry(doc_id.clone()).or_insert_with(Vec::new);
+            doc_connections.push(connection);
+
+            // Clean up any dead weak references while we're here
+            doc_connections.retain(|weak_conn| weak_conn.strong_count() > 0);
+
+            tracing::debug!(
+                "Registered DocConnection for document {}. Total connections: {}",
+                doc_id,
+                doc_connections.len()
+            );
+        }
+    }
+
+    /// Unregister all connections for a document (called when document is dropped)
+    pub fn unregister_document(&self, doc_id: &str) {
+        if let Ok(mut connections) = self.doc_connections.write() {
+            connections.remove(doc_id);
+            tracing::debug!("Unregistered all DocConnections for document {}", doc_id);
+        }
+    }
+
+    /// Convert DocumentUpdatedEvent to EventMessage
+    fn convert_to_event_message(
+        &self,
+        envelope: &EventEnvelope,
+        doc_id: &str,
+    ) -> Result<EventMessage, Box<dyn std::error::Error>> {
+        let timestamp = envelope.timestamp.timestamp_millis() as u64;
+
+        // Extract user from payload if present
+        let user = envelope
+            .payload
+            .get("user")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        // Convert metadata
+        let metadata = envelope.payload.get("metadata").cloned();
+
+        Ok(EventMessage {
+            event_id: envelope.event_id.clone(),
+            event_type: envelope.event_type.clone(),
+            doc_id: doc_id.to_string(),
+            timestamp,
+            user,
+            metadata,
+        })
+    }
+}
+
+impl EventSender for SyncProtocolEventSender {
+    fn send_event(&self, envelope: EventEnvelope) {
+        // For sync protocol events, the document ID should be extracted from the channel
+        // or from the payload. For now, let's use the channel as the document ID
+        let doc_id = &envelope.channel;
+
+        if let Ok(connections) = self.doc_connections.read() {
+            if let Some(doc_connections) = connections.get(doc_id) {
+                // Convert EventEnvelope to EventMessage
+                match self.convert_to_event_message(&envelope, doc_id) {
+                    Ok(event_message) => {
+                        let mut sent_count = 0;
+                        let mut failed_count = 0;
+
+                        for weak_conn in doc_connections {
+                            if let Some(connection) = weak_conn.upgrade() {
+                                match connection.send_event(&event_message) {
+                                    Ok(()) => sent_count += 1,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "Failed to send event to DocConnection: {}",
+                                            e
+                                        );
+                                        failed_count += 1;
+                                    }
+                                }
+                            }
+                        }
+
+                        tracing::debug!(
+                            "Sent event {} to {} DocConnections for document {} ({} failed)",
+                            event_message.event_id,
+                            sent_count,
+                            doc_id,
+                            failed_count
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to convert EventEnvelope to EventMessage: {}", e);
+                    }
+                }
+            } else {
+                tracing::debug!("No DocConnections registered for document {}", doc_id);
+            }
+        } else {
+            tracing::warn!("Failed to acquire DocConnections read lock");
+        }
+
+        // Clean up dead weak references periodically
+        if let Ok(mut connections) = self.doc_connections.write() {
+            for doc_connections in connections.values_mut() {
+                doc_connections.retain(|weak_conn| weak_conn.strong_count() > 0);
+            }
+            connections.retain(|_, doc_connections| !doc_connections.is_empty());
+        }
+    }
+
+    fn shutdown(&self) {
+        tracing::debug!("Shutting down SyncProtocolEventSender");
+        if let Ok(mut connections) = self.doc_connections.write() {
+            connections.clear();
         }
     }
 }

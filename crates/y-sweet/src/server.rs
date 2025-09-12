@@ -44,7 +44,7 @@ use y_sweet_core::{
     doc_sync::DocWithSyncKv,
     event::{
         DocumentUpdatedEvent, EventDispatcher, EventEnvelope, EventSender, ServerMessage,
-        UnifiedEventDispatcher, WebSocketSender, WebhookSender,
+        SyncProtocolEventSender, UnifiedEventDispatcher, WebSocketSender, WebhookSender,
     },
     store::Store,
     sync::awareness::Awareness,
@@ -110,6 +110,7 @@ pub struct Server {
     doc_gc: bool,
     event_dispatcher: Option<Arc<dyn EventDispatcher>>,
     websocket_sender: Arc<WebSocketSender>,
+    sync_protocol_event_sender: Arc<SyncProtocolEventSender>,
 }
 
 impl Server {
@@ -124,6 +125,7 @@ impl Server {
         webhook_configs: Option<Vec<WebhookConfig>>,
     ) -> Result<Self> {
         let websocket_sender = Arc::new(WebSocketSender::new());
+        let sync_protocol_event_sender = Arc::new(SyncProtocolEventSender::new());
 
         let event_dispatcher = if let Some(configs) = webhook_configs {
             let metrics = WebhookMetrics::new()
@@ -134,12 +136,17 @@ impl Server {
                     .map_err(|e| anyhow!("Failed to create webhook sender: {}", e))?,
             );
 
-            let senders: Vec<Arc<dyn EventSender>> = vec![webhook_sender, websocket_sender.clone()];
+            let senders: Vec<Arc<dyn EventSender>> = vec![
+                webhook_sender,
+                websocket_sender.clone(),
+                sync_protocol_event_sender.clone(),
+            ];
 
             Some(Arc::new(UnifiedEventDispatcher::new(senders)) as Arc<dyn EventDispatcher>)
         } else {
             tracing::info!("No webhook configs provided, creating WebSocket-only event dispatcher");
-            let senders: Vec<Arc<dyn EventSender>> = vec![websocket_sender.clone()];
+            let senders: Vec<Arc<dyn EventSender>> =
+                vec![websocket_sender.clone(), sync_protocol_event_sender.clone()];
             Some(Arc::new(UnifiedEventDispatcher::new(senders)) as Arc<dyn EventDispatcher>)
         };
 
@@ -157,6 +164,7 @@ impl Server {
             doc_gc,
             event_dispatcher,
             websocket_sender,
+            sync_protocol_event_sender,
         })
     }
 
@@ -756,9 +764,18 @@ async fn handle_socket_upgrade_with_channel_and_user(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let awareness = dwskv.awareness();
     let cancellation_token = server_state.cancellation_token.clone();
+    let sync_protocol_event_sender = server_state.sync_protocol_event_sender.clone();
+    let doc_id_clone = doc_id.clone();
 
     Ok(ws.on_upgrade(move |socket| {
-        handle_socket(socket, awareness, authorization, cancellation_token)
+        handle_socket(
+            socket,
+            awareness,
+            authorization,
+            cancellation_token,
+            sync_protocol_event_sender,
+            doc_id_clone,
+        )
     }))
 }
 
@@ -919,6 +936,8 @@ async fn handle_socket(
     awareness: Arc<RwLock<Awareness>>,
     authorization: Authorization,
     cancellation_token: CancellationToken,
+    sync_protocol_event_sender: Arc<SyncProtocolEventSender>,
+    doc_id: String,
 ) {
     let (mut sink, mut stream) = socket.split();
     let (send, mut recv) = channel(1024);
@@ -929,11 +948,14 @@ async fn handle_socket(
         }
     });
 
-    let connection = DocConnection::new(awareness, authorization, move |bytes| {
+    let connection = Arc::new(DocConnection::new(awareness, authorization, move |bytes| {
         if let Err(e) = send.try_send(bytes.to_vec()) {
             tracing::warn!(?e, "Error sending message");
         }
-    });
+    }));
+
+    // Register the connection with the sync protocol event sender
+    sync_protocol_event_sender.register_doc_connection(doc_id.clone(), Arc::downgrade(&connection));
 
     loop {
         tokio::select! {
