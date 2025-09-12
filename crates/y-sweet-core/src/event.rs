@@ -248,8 +248,8 @@ impl UnifiedEventDispatcher {
 
 impl EventDispatcher for UnifiedEventDispatcher {
     fn send_event(&self, envelope: EventEnvelope) {
-        debug!(
-            "Dispatching event {} for channel {} to {} senders",
+        info!(
+            "Dispatching event {} to channel '{}' ({} senders)",
             envelope.event_id,
             envelope.channel,
             self.senders.len()

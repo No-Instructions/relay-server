@@ -3,7 +3,9 @@ use crate::{
     sync::awareness::Awareness, sync_kv::SyncKv, webhook::WebhookCallback,
 };
 use anyhow::{anyhow, Context, Result};
+use serde_json;
 use std::sync::{Arc, RwLock};
+use tracing::info;
 use yrs::{updates::decoder::Decode, Doc, ReadTxn, StateVector, Subscription, Transact, Update};
 use yrs_kvstore::DocOps;
 
@@ -60,6 +62,18 @@ impl DocWithSyncKv {
                 if let Some(ref callback) = webhook_callback {
                     // Step 1: Create the event payload with business data and metadata
                     let event = DocumentUpdatedEvent::new(doc_key.clone()).with_metadata(&sync_kv);
+                    // Log the full event payload as JSON
+                    match serde_json::to_string(&event) {
+                        Ok(json_str) => {
+                            info!("Document updated event created: {}", json_str);
+                        }
+                        Err(e) => {
+                            info!(
+                                "Document updated event created for doc_id: {} (JSON serialization failed: {})",
+                                doc_key, e
+                            );
+                        }
+                    }
 
                     // Step 2: Callback handles envelope creation and dispatch
                     callback(event);
