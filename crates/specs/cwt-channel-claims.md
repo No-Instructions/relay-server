@@ -30,7 +30,7 @@ This tight coupling between document ID and routing prevents flexible event dist
 
 ### CWT Channel Claim
 
-Add a channel claim (10) to CWT document and file tokens only (not prefix or server tokens):
+Add a channel claim (-80202) to CWT document and file tokens only (not prefix or server tokens):
 
 ```rust
 // cwt.rs
@@ -41,8 +41,8 @@ pub struct CwtClaims {
     pub audience: Option<String>,
     pub expiration: Option<u64>,
     pub issued_at: Option<u64>,
-    pub scope: String,           // Claim 9: Permission
-    pub channel: Option<String>,  // Claim 10: Channel (NEW)
+    pub scope: String,           // Claim -80201: Permission
+    pub channel: Option<String>,  // Claim -80202: Channel (NEW)
 }
 
 impl CwtAuthenticator {
@@ -51,16 +51,16 @@ impl CwtAuthenticator {
         
         // ... existing standard claims (1-6) ...
         
-        // Custom scope claim (9)
+        // Custom scope claim (-80201)
         map.push((
-            ciborium::Value::Integer(9.into()),
+            ciborium::Value::Integer((-80201_i64).into()),
             ciborium::Value::Text(claims.scope),
         ));
         
-        // Custom channel claim (10) - NEW
+        // Custom channel claim (-80202) - NEW
         if let Some(channel) = claims.channel {
             map.push((
-                ciborium::Value::Integer(10.into()),
+                ciborium::Value::Integer((-80202_i64).into()),
                 ciborium::Value::Text(channel),
             ));
         }
@@ -75,9 +75,9 @@ impl CwtAuthenticator {
         for (key, value) in map {
             match (key, value) {
                 (ciborium::Value::Integer(k), ciborium::Value::Text(s)) => {
-                    match TryInto::<u64>::try_into(k) {
+                    match TryInto::<i64>::try_into(k) {
                         // ... existing claims ...
-                        Ok(10) => channel = Some(s),  // NEW
+                        Ok(-80202) => channel = Some(s),  // NEW
                         _ => {}
                     }
                 }
@@ -341,7 +341,7 @@ pub fn validate_key(key: &str) -> bool {
 
 1. Rename `validate_doc_name` to `validate_key` and update all references
 2. Add `channel` field to `CwtClaims` struct
-3. Update CWT claim parsing/building to handle claim 10 with channel validation
+3. Update CWT claim parsing/building to handle claim -80202 with channel validation
 4. Add optional `channel` parameter to `gen_doc_token_cwt` and `gen_file_token_cwt`
 5. Add `verify_cwt_with_channel` method to Authenticator
 6. Update `load_doc` to accept optional channel parameter and store in document metadata

@@ -68,10 +68,10 @@ Map relay server permissions to CWT claims:
 
 | Relay Server Permission | CWT Claim | Description |
 |------------------------|-----------|-------------|
-| Permission::Server | `scope` (private claim 9) | Value: "server" |
-| Permission::Doc | `scope` (private claim 9) | Value: "doc:{doc_id}:{auth}" |
-| Permission::File | `scope` (private claim 9) | Value: "file:{hash}:{doc_id}:{auth}" |
-| Permission::Prefix | `scope` (private claim 9) | Value: "prefix:{prefix}:{auth}" |
+| Permission::Server | `scope` (private use claim -80201) | Value: "server" |
+| Permission::Doc | `scope` (private use claim -80201) | Value: "doc:{doc_id}:{auth}" |
+| Permission::File | `scope` (private use claim -80201) | Value: "file:{hash}:{doc_id}:{auth}" |
+| Permission::Prefix | `scope` (private use claim -80201) | Value: "prefix:{prefix}:{auth}" |
 | Authorization | Part of scope | "r" for ReadOnly, "rw" for Full |
 | user | `sub` (claim 2) | User identifier string |
 | expiration_millis | `exp` (claim 4) | NumericDate (seconds since epoch) |
@@ -169,8 +169,8 @@ impl CwtAuthenticator {
             map.insert(Value::Integer(6), Value::Integer(iat as i128));
         }
         
-        // Custom scope claim (private claim 9)
-        map.insert(Value::Integer(9), Value::Text(claims.scope));
+        // Custom scope claim (private use claim -80201)
+        map.insert(Value::Integer(-80201), Value::Text(claims.scope));
         
         Ok(Value::Map(map))
     }
@@ -244,7 +244,7 @@ pub struct AuthConfig {
   3: "https://server.example.com", // aud: Audience (optional)
   4: 1444064944,                   // exp: Expiration (seconds)
   6: 1443944944,                   // iat: Issued At (seconds)
-  9: "prefix:org123-:rw"           // scope: Custom claim for permissions (NEW: prefix support)
+  -80201: "prefix:org123-:rw"     // scope: Custom claim for permissions (NEW: prefix support)
 }
 ```
 

@@ -513,16 +513,16 @@ impl CwtAuthenticator {
             ));
         }
 
-        // Custom scope claim (private claim 9)
+        // Custom scope claim (private use claim -80201)
         map.push((
-            ciborium::Value::Integer(9.into()),
+            ciborium::Value::Integer((-80201_i64).into()),
             ciborium::Value::Text(claims.scope),
         ));
 
-        // Custom channel claim (private claim 10)
+        // Custom channel claim (private use claim -80202)
         if let Some(channel) = claims.channel {
             map.push((
-                ciborium::Value::Integer(10.into()),
+                ciborium::Value::Integer((-80202_i64).into()),
                 ciborium::Value::Text(channel),
             ));
         }
@@ -550,12 +550,12 @@ impl CwtAuthenticator {
         for (key, value) in map {
             match (key, value) {
                 (ciborium::Value::Integer(k), ciborium::Value::Text(s)) => {
-                    match TryInto::<u64>::try_into(k) {
+                    match TryInto::<i64>::try_into(k) {
                         Ok(1) => issuer = Some(s),
                         Ok(2) => subject = Some(s),
                         Ok(3) => audience = Some(s),
-                        Ok(9) => scope = Some(s),
-                        Ok(10) => channel = Some(s),
+                        Ok(-80201) => scope = Some(s),
+                        Ok(-80202) => channel = Some(s),
                         _ => {} // Ignore unknown claims
                     }
                 }
