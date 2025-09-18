@@ -43,8 +43,9 @@ use y_sweet_core::{
     doc_connection::DocConnection,
     doc_sync::DocWithSyncKv,
     event::{
-        DocumentUpdatedEvent, EventDispatcher, EventEnvelope, EventSender, ServerMessage,
-        SyncProtocolEventSender, UnifiedEventDispatcher, WebSocketSender, WebhookSender,
+        DebouncedSyncProtocolEventSender, DocumentUpdatedEvent, EventDispatcher, EventEnvelope,
+        EventSender, ServerMessage, SyncProtocolEventSender, UnifiedEventDispatcher,
+        WebSocketSender, WebhookSender,
     },
     store::Store,
     sync::awareness::Awareness,
@@ -126,6 +127,9 @@ impl Server {
     ) -> Result<Self> {
         let websocket_sender = Arc::new(WebSocketSender::new());
         let sync_protocol_event_sender = Arc::new(SyncProtocolEventSender::new());
+        let debounced_sync_sender = Arc::new(DebouncedSyncProtocolEventSender::new(
+            sync_protocol_event_sender.clone(),
+        ));
 
         let event_dispatcher = if let Some(configs) = webhook_configs {
             let metrics = WebhookMetrics::new()
@@ -139,14 +143,14 @@ impl Server {
             let senders: Vec<Arc<dyn EventSender>> = vec![
                 webhook_sender,
                 websocket_sender.clone(),
-                sync_protocol_event_sender.clone(),
+                debounced_sync_sender.clone(),
             ];
 
             Some(Arc::new(UnifiedEventDispatcher::new(senders)) as Arc<dyn EventDispatcher>)
         } else {
             tracing::info!("No webhook configs provided, creating WebSocket-only event dispatcher");
             let senders: Vec<Arc<dyn EventSender>> =
-                vec![websocket_sender.clone(), sync_protocol_event_sender.clone()];
+                vec![websocket_sender.clone(), debounced_sync_sender.clone()];
             Some(Arc::new(UnifiedEventDispatcher::new(senders)) as Arc<dyn EventDispatcher>)
         };
 

@@ -595,6 +595,210 @@ impl EventSender for WebSocketSender {
     }
 }
 
+/// Debounced sync protocol event sender that batches events per user per document
+pub struct DebouncedSyncProtocolEventSender {
+    inner_sender: Arc<SyncProtocolEventSender>,
+    user_queues: Arc<tokio::sync::RwLock<HashMap<String, Arc<UserEventQueue>>>>,
+    cleanup_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+struct UserEventQueue {
+    last_event: Arc<tokio::sync::Mutex<Option<EventEnvelope>>>,
+    last_sent: Arc<tokio::sync::Mutex<Option<tokio::time::Instant>>>,
+    debounce_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+}
+
+impl UserEventQueue {
+    fn new() -> Self {
+        Self {
+            last_event: Arc::new(tokio::sync::Mutex::new(None)),
+            last_sent: Arc::new(tokio::sync::Mutex::new(None)),
+            debounce_handle: Arc::new(tokio::sync::Mutex::new(None)),
+        }
+    }
+
+    async fn should_send_immediately(&self) -> bool {
+        let last_sent = self.last_sent.lock().await;
+        match *last_sent {
+            Some(last) => last.elapsed() >= tokio::time::Duration::from_secs(1),
+            None => true,
+        }
+    }
+
+    async fn mark_sent(&self) {
+        let mut last_sent = self.last_sent.lock().await;
+        *last_sent = Some(tokio::time::Instant::now());
+    }
+
+    async fn cancel_pending_task(&self) {
+        let mut handle = self.debounce_handle.lock().await;
+        if let Some(task) = handle.take() {
+            task.abort();
+        }
+    }
+}
+
+impl DebouncedSyncProtocolEventSender {
+    pub fn new(inner_sender: Arc<SyncProtocolEventSender>) -> Self {
+        let user_queues = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let cleanup_interval = tokio::time::Duration::from_secs(60);
+
+        // Start cleanup task
+        let queues_for_cleanup = user_queues.clone();
+        let cleanup_handle = Some(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(cleanup_interval);
+            loop {
+                interval.tick().await;
+                Self::cleanup_idle_queues(&queues_for_cleanup).await;
+            }
+        }));
+
+        Self {
+            inner_sender,
+            user_queues,
+            cleanup_handle,
+        }
+    }
+
+    /// Create a unique key for the user-document combination
+    fn create_queue_key(doc_id: &str, user: Option<&str>) -> String {
+        match user {
+            Some(u) => format!("{}:{}", doc_id, u),
+            None => format!("{}:__anonymous__", doc_id),
+        }
+    }
+
+    async fn get_or_create_queue(&self, doc_id: &str, user: Option<&str>) -> Arc<UserEventQueue> {
+        let key = Self::create_queue_key(doc_id, user);
+        let mut queues = self.user_queues.write().await;
+        queues
+            .entry(key)
+            .or_insert_with(|| Arc::new(UserEventQueue::new()))
+            .clone()
+    }
+
+    async fn cleanup_idle_queues(
+        queues: &Arc<tokio::sync::RwLock<HashMap<String, Arc<UserEventQueue>>>>,
+    ) {
+        let idle_threshold = tokio::time::Duration::from_secs(300); // 5 minutes
+        let mut to_remove = Vec::new();
+
+        let queues_guard = queues.read().await;
+        for (queue_key, queue) in queues_guard.iter() {
+            if let Some(last_sent) = *queue.last_sent.lock().await {
+                if last_sent.elapsed() > idle_threshold {
+                    to_remove.push(queue_key.clone());
+                }
+            }
+        }
+        drop(queues_guard);
+
+        if !to_remove.is_empty() {
+            let mut queues_guard = queues.write().await;
+            for queue_key in to_remove {
+                queues_guard.remove(&queue_key);
+                tracing::debug!("Cleaned up idle event queue for {}", queue_key);
+            }
+        }
+    }
+
+    pub async fn queue_event(&self, envelope: EventEnvelope) {
+        let doc_id = &envelope.channel;
+
+        // Extract user from payload
+        let user = envelope.payload.get("user").and_then(|v| v.as_str());
+
+        // Get the queue for this specific user-document combination
+        let queue = self.get_or_create_queue(doc_id, user).await;
+
+        // Cancel any existing debounce timer for this user
+        queue.cancel_pending_task().await;
+
+        // Store the latest event for this user
+        {
+            let mut last_event = queue.last_event.lock().await;
+            *last_event = Some(envelope.clone());
+        }
+
+        // Check if we can send immediately (rate limit allows it)
+        if queue.should_send_immediately().await {
+            // Send immediately
+            let event_to_send = {
+                let mut last_event = queue.last_event.lock().await;
+                last_event.take()
+            };
+            if let Some(event) = event_to_send {
+                self.inner_sender.send_event(event);
+                queue.mark_sent().await;
+            }
+        } else {
+            // Schedule debounced send
+            let delay = {
+                let last_sent = queue.last_sent.lock().await;
+                match *last_sent {
+                    Some(last) => {
+                        let elapsed = last.elapsed();
+                        if elapsed < tokio::time::Duration::from_secs(1) {
+                            tokio::time::Duration::from_secs(1) - elapsed
+                        } else {
+                            tokio::time::Duration::from_millis(0)
+                        }
+                    }
+                    None => tokio::time::Duration::from_millis(0),
+                }
+            };
+
+            let inner_sender = self.inner_sender.clone();
+            let queue_clone = queue.clone();
+
+            let task = tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+
+                // Send the most recent event for this user
+                let event_opt = {
+                    let mut last_event = queue_clone.last_event.lock().await;
+                    last_event.take()
+                };
+                if let Some(event) = event_opt {
+                    inner_sender.send_event(event);
+                    queue_clone.mark_sent().await;
+                }
+            });
+
+            // Store the task handle
+            let mut handle = queue.debounce_handle.lock().await;
+            *handle = Some(task);
+        }
+    }
+}
+
+impl EventSender for DebouncedSyncProtocolEventSender {
+    fn send_event(&self, envelope: EventEnvelope) {
+        // Clone necessary fields for the async task
+        let inner_sender = self.inner_sender.clone();
+        let user_queues = self.user_queues.clone();
+
+        tokio::spawn(async move {
+            let temp_sender = DebouncedSyncProtocolEventSender {
+                inner_sender,
+                user_queues,
+                cleanup_handle: None, // Don't clone the cleanup handle
+            };
+            temp_sender.queue_event(envelope).await;
+        });
+    }
+
+    fn shutdown(&self) {
+        // Cancel cleanup task
+        if let Some(handle) = &self.cleanup_handle {
+            handle.abort();
+        }
+
+        // Shutdown inner sender
+        self.inner_sender.shutdown();
+    }
+}
+
 /// Sync protocol event sender using weak references to avoid circular dependencies
 pub struct SyncProtocolEventSender {
     // Map from document ID to list of weak references to DocConnections
@@ -729,6 +933,46 @@ impl EventSender for SyncProtocolEventSender {
         if let Ok(mut connections) = self.doc_connections.write() {
             connections.clear();
         }
+    }
+}
+
+#[cfg(test)]
+mod debounced_sync_tests {
+    use super::*;
+
+    #[test]
+    fn test_create_queue_key_with_user() {
+        let key = DebouncedSyncProtocolEventSender::create_queue_key("doc123", Some("alice"));
+        assert_eq!(key, "doc123:alice");
+    }
+
+    #[test]
+    fn test_create_queue_key_without_user() {
+        let key = DebouncedSyncProtocolEventSender::create_queue_key("doc123", None);
+        assert_eq!(key, "doc123:__anonymous__");
+    }
+
+    #[tokio::test]
+    async fn test_per_user_queuing() {
+        let sender = DebouncedSyncProtocolEventSender {
+            inner_sender: Arc::new(SyncProtocolEventSender::new()),
+            user_queues: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            cleanup_handle: None,
+        };
+
+        // Get queues for different users on same document
+        let alice_queue = sender.get_or_create_queue("doc1", Some("alice")).await;
+        let bob_queue = sender.get_or_create_queue("doc1", Some("bob")).await;
+        let anon_queue = sender.get_or_create_queue("doc1", None).await;
+
+        // Should be different queues
+        assert!(!Arc::ptr_eq(&alice_queue, &bob_queue));
+        assert!(!Arc::ptr_eq(&alice_queue, &anon_queue));
+        assert!(!Arc::ptr_eq(&bob_queue, &anon_queue));
+
+        // Same user should get same queue
+        let alice_queue2 = sender.get_or_create_queue("doc1", Some("alice")).await;
+        assert!(Arc::ptr_eq(&alice_queue, &alice_queue2));
     }
 }
 
