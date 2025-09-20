@@ -83,6 +83,8 @@ pub struct DocumentUpdatedEvent {
     pub doc_id: String,
     pub user: Option<String>,
     pub metadata: BTreeMap<String, serde_json::Value>,
+    #[serde(skip)] // Don't serialize the raw update data to JSON
+    pub update: Option<Vec<u8>>,
 }
 
 impl DocumentUpdatedEvent {
@@ -92,12 +94,19 @@ impl DocumentUpdatedEvent {
             doc_id,
             user: None,
             metadata: BTreeMap::new(),
+            update: None,
         }
     }
 
     /// Builder method to add user
     pub fn with_user(mut self, user: String) -> Self {
         self.user = Some(user);
+        self
+    }
+
+    /// Builder method to add Yjs update data
+    pub fn with_update(mut self, update: Vec<u8>) -> Self {
+        self.update = Some(update);
         self
     }
 
@@ -123,38 +132,32 @@ impl DocumentUpdatedEvent {
 }
 
 /// The envelope contains only routing and transport metadata
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug)]
 pub struct EventEnvelope {
-    #[serde(rename = "eventId")]
     pub event_id: String,
-
-    #[serde(rename = "eventType")]
     pub event_type: String,
-
     pub channel: String, // Routing channel
     pub timestamp: chrono::DateTime<chrono::Utc>,
-
-    pub payload: serde_json::Value, // Serialized payload
+    pub event: DocumentUpdatedEvent, // Raw event data - serialize at dispatch time
 }
 
 impl EventEnvelope {
     /// Create an envelope for a document updated event
-    /// Channel and payload are provided separately
-    pub fn new(channel: String, payload: DocumentUpdatedEvent) -> Self {
+    /// Channel and event are provided separately  
+    pub fn new(channel: String, event: DocumentUpdatedEvent) -> Self {
         Self {
             event_id: format!("evt_{}", nanoid::nanoid!(21, NANOID_ALPHABET)),
             event_type: DocumentUpdatedEvent::event_type().to_string(),
             channel,
             timestamp: chrono::Utc::now(),
-            payload: serde_json::to_value(payload)
-                .expect("DocumentUpdatedEvent should always serialize"),
+            event,
         }
     }
 
     /// Create an envelope with explicit timestamp (for testing)
     pub fn new_with_timestamp(
         channel: String,
-        payload: DocumentUpdatedEvent,
+        event: DocumentUpdatedEvent,
         timestamp: chrono::DateTime<chrono::Utc>,
     ) -> Self {
         Self {
@@ -162,8 +165,7 @@ impl EventEnvelope {
             event_type: DocumentUpdatedEvent::event_type().to_string(),
             channel,
             timestamp,
-            payload: serde_json::to_value(payload)
-                .expect("DocumentUpdatedEvent should always serialize"),
+            event,
         }
     }
 }
@@ -178,7 +180,7 @@ pub trait EventDispatcher: Send + Sync {
 }
 
 /// Transport-specific event senders
-pub trait EventSender: Send + Sync {
+pub trait EventSender: Send + Sync + std::any::Any {
     /// Send an event envelope using this transport
     fn send_event(&self, envelope: EventEnvelope);
 
@@ -226,7 +228,8 @@ impl From<EventEnvelope> for ServerMessage {
             event_type: envelope.event_type,
             channel: envelope.channel,
             timestamp: envelope.timestamp.to_rfc3339(),
-            payload: envelope.payload,
+            payload: serde_json::to_value(envelope.event)
+                .expect("DocumentUpdatedEvent should always serialize"),
         }
     }
 }
@@ -234,16 +237,17 @@ impl From<EventEnvelope> for ServerMessage {
 /// Unified event dispatcher that fans out events to all transport-specific senders
 pub struct UnifiedEventDispatcher {
     senders: Vec<Arc<dyn EventSender>>,
+    metrics: Arc<WebhookMetrics>,
 }
 
 impl UnifiedEventDispatcher {
     /// Create a new unified dispatcher with the given senders
-    pub fn new(senders: Vec<Arc<dyn EventSender>>) -> Self {
+    pub fn new(senders: Vec<Arc<dyn EventSender>>, metrics: Arc<WebhookMetrics>) -> Self {
         debug!(
             "Created UnifiedEventDispatcher with {} senders",
             senders.len()
         );
-        Self { senders }
+        Self { senders, metrics }
     }
 }
 
@@ -255,6 +259,25 @@ impl EventDispatcher for UnifiedEventDispatcher {
             envelope.channel,
             self.senders.len()
         );
+
+        // Record event dispatch metrics
+        for sender in &self.senders {
+            let sender_type = if sender.type_id() == std::any::TypeId::of::<WebhookSender>() {
+                "webhook"
+            } else if sender.type_id() == std::any::TypeId::of::<WebSocketSender>() {
+                "websocket"
+            } else if sender.type_id() == std::any::TypeId::of::<SyncProtocolEventSender>() {
+                "sync_protocol"
+            } else if sender.type_id() == std::any::TypeId::of::<DebouncedSyncProtocolEventSender>()
+            {
+                "debounced_sync_protocol"
+            } else {
+                "unknown"
+            };
+
+            self.metrics
+                .record_event_dispatched(&envelope.event_type, sender_type);
+        }
 
         // Fanout to all delivery mechanisms
         for sender in &self.senders {
@@ -288,7 +311,8 @@ impl From<EventEnvelope> for WebhookPayload {
         WebhookPayload {
             event_type: envelope.event_type,
             event_id: envelope.event_id,
-            payload: envelope.payload,
+            payload: serde_json::to_value(envelope.event)
+                .expect("DocumentUpdatedEvent should always serialize"),
         }
     }
 }
@@ -436,17 +460,13 @@ impl WebhookSender {
 
         let duration = start_time.elapsed().as_secs_f64();
 
-        // Extract doc_id from payload for metrics
-        let doc_id = envelope
-            .payload
-            .get("doc_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or(&envelope.channel);
+        // Extract doc_id from event for metrics
+        let _doc_id = &envelope.event.doc_id;
 
         match result {
             Ok(response) => {
                 if response.status().is_success() {
-                    metrics.record_webhook_request(&config.prefix, doc_id, "success", duration);
+                    metrics.record_webhook_request(&config.prefix, "success", duration);
                     info!(
                         "Webhook sent successfully for event {} (channel {}) to prefix '{}'",
                         envelope.event_id, envelope.channel, config.prefix
@@ -454,7 +474,7 @@ impl WebhookSender {
                     Ok(())
                 } else {
                     let status_code = response.status().as_u16().to_string();
-                    metrics.record_webhook_request(&config.prefix, doc_id, &status_code, duration);
+                    metrics.record_webhook_request(&config.prefix, &status_code, duration);
                     let error_msg = format!("Webhook failed with status {}", response.status());
                     error!(
                         "Webhook failed for event {} (channel {}) to prefix '{}': {}",
@@ -464,7 +484,7 @@ impl WebhookSender {
                 }
             }
             Err(e) => {
-                metrics.record_webhook_request(&config.prefix, doc_id, "error", duration);
+                metrics.record_webhook_request(&config.prefix, "error", duration);
                 Err(e.into())
             }
         }
@@ -600,10 +620,12 @@ pub struct DebouncedSyncProtocolEventSender {
     inner_sender: Arc<SyncProtocolEventSender>,
     user_queues: Arc<tokio::sync::RwLock<HashMap<String, Arc<UserEventQueue>>>>,
     cleanup_handle: Option<tokio::task::JoinHandle<()>>,
+    metrics: Arc<WebhookMetrics>,
 }
 
 struct UserEventQueue {
-    last_event: Arc<tokio::sync::Mutex<Option<EventEnvelope>>>,
+    pending_updates: Arc<tokio::sync::Mutex<Vec<Vec<u8>>>>,
+    base_event: Arc<tokio::sync::Mutex<Option<EventEnvelope>>>,
     last_sent: Arc<tokio::sync::Mutex<Option<tokio::time::Instant>>>,
     debounce_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
@@ -611,7 +633,8 @@ struct UserEventQueue {
 impl UserEventQueue {
     fn new() -> Self {
         Self {
-            last_event: Arc::new(tokio::sync::Mutex::new(None)),
+            pending_updates: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            base_event: Arc::new(tokio::sync::Mutex::new(None)),
             last_sent: Arc::new(tokio::sync::Mutex::new(None)),
             debounce_handle: Arc::new(tokio::sync::Mutex::new(None)),
         }
@@ -639,7 +662,7 @@ impl UserEventQueue {
 }
 
 impl DebouncedSyncProtocolEventSender {
-    pub fn new(inner_sender: Arc<SyncProtocolEventSender>) -> Self {
+    pub fn new(inner_sender: Arc<SyncProtocolEventSender>, metrics: Arc<WebhookMetrics>) -> Self {
         let user_queues = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         let cleanup_interval = tokio::time::Duration::from_secs(60);
 
@@ -657,6 +680,7 @@ impl DebouncedSyncProtocolEventSender {
             inner_sender,
             user_queues,
             cleanup_handle,
+            metrics,
         }
     }
 
@@ -705,32 +729,36 @@ impl DebouncedSyncProtocolEventSender {
     pub async fn queue_event(&self, envelope: EventEnvelope) {
         let doc_id = &envelope.channel;
 
-        // Extract user from payload
-        let user = envelope.payload.get("user").and_then(|v| v.as_str());
+        // Extract user from event
+        let user = envelope.event.user.as_deref();
 
         // Get the queue for this specific user-document combination
         let queue = self.get_or_create_queue(doc_id, user).await;
 
+        // Extract update data directly from the event
+        let update_data = envelope.event.update.clone();
+
         // Cancel any existing debounce timer for this user
         queue.cancel_pending_task().await;
 
-        // Store the latest event for this user
+        // Store the base event template and add the update to pending updates
         {
-            let mut last_event = queue.last_event.lock().await;
-            *last_event = Some(envelope.clone());
+            let mut base_event = queue.base_event.lock().await;
+            if base_event.is_none() {
+                *base_event = Some(envelope.clone());
+            }
+
+            if let Some(update) = update_data {
+                let mut pending_updates = queue.pending_updates.lock().await;
+                pending_updates.push(update);
+            }
         }
 
         // Check if we can send immediately (rate limit allows it)
         if queue.should_send_immediately().await {
-            // Send immediately
-            let event_to_send = {
-                let mut last_event = queue.last_event.lock().await;
-                last_event.take()
-            };
-            if let Some(event) = event_to_send {
-                self.inner_sender.send_event(event);
-                queue.mark_sent().await;
-            }
+            // Merge all pending updates and send immediately
+            self.send_merged_event(&queue).await;
+            queue.mark_sent().await;
         } else {
             // Schedule debounced send
             let delay = {
@@ -750,24 +778,64 @@ impl DebouncedSyncProtocolEventSender {
 
             let inner_sender = self.inner_sender.clone();
             let queue_clone = queue.clone();
+            let metrics = self.metrics.clone();
 
             let task = tokio::spawn(async move {
                 tokio::time::sleep(delay).await;
 
-                // Send the most recent event for this user
-                let event_opt = {
-                    let mut last_event = queue_clone.last_event.lock().await;
-                    last_event.take()
+                // Create a temporary sender to call send_merged_event
+                let temp_sender = DebouncedSyncProtocolEventSender {
+                    inner_sender,
+                    user_queues: Default::default(), // Not used in send_merged_event
+                    cleanup_handle: None,
+                    metrics,
                 };
-                if let Some(event) = event_opt {
-                    inner_sender.send_event(event);
-                    queue_clone.mark_sent().await;
-                }
+
+                temp_sender.send_merged_event(&queue_clone).await;
+                queue_clone.mark_sent().await;
             });
 
             // Store the task handle
             let mut handle = queue.debounce_handle.lock().await;
             *handle = Some(task);
+        }
+    }
+
+    async fn send_merged_event(&self, queue: &UserEventQueue) {
+        let (base_event, updates) = {
+            let mut base_event = queue.base_event.lock().await;
+            let mut pending_updates = queue.pending_updates.lock().await;
+
+            let event = base_event.take();
+            let updates = std::mem::take(&mut *pending_updates);
+            (event, updates)
+        };
+
+        if let Some(event) = base_event {
+            if !updates.is_empty() {
+                // Merge all updates using yrs::merge_updates_v1
+                match yrs::merge_updates_v1(&updates) {
+                    Ok(merged_update) => {
+                        // Create a new event with the merged update data
+                        let mut new_event = event.clone();
+                        new_event.event.update = Some(merged_update);
+
+                        // Record metrics for update merging
+                        let _user = new_event.event.user.as_deref().unwrap_or("__anonymous__");
+                        self.metrics.record_updates_merged(updates.len());
+
+                        tracing::debug!("Merged {} updates for user-document", updates.len());
+                        self.inner_sender.send_event(new_event);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to merge updates: {}, sending latest event", e);
+                        self.inner_sender.send_event(event);
+                    }
+                }
+            } else {
+                // No updates to merge, send the base event
+                self.inner_sender.send_event(event);
+            }
         }
     }
 }
@@ -778,11 +846,14 @@ impl EventSender for DebouncedSyncProtocolEventSender {
         let inner_sender = self.inner_sender.clone();
         let user_queues = self.user_queues.clone();
 
+        let metrics = self.metrics.clone();
+
         tokio::spawn(async move {
             let temp_sender = DebouncedSyncProtocolEventSender {
                 inner_sender,
                 user_queues,
                 cleanup_handle: None, // Don't clone the cleanup handle
+                metrics,
             };
             temp_sender.queue_event(envelope).await;
         });
@@ -804,13 +875,20 @@ pub struct SyncProtocolEventSender {
     // Map from document ID to list of weak references to DocConnections
     doc_connections:
         Arc<RwLock<HashMap<String, Vec<std::sync::Weak<crate::doc_connection::DocConnection>>>>>,
+    metrics: Option<Arc<WebhookMetrics>>,
 }
 
 impl SyncProtocolEventSender {
     pub fn new() -> Self {
         Self {
             doc_connections: Arc::new(RwLock::new(HashMap::new())),
+            metrics: None,
         }
+    }
+
+    pub fn with_metrics(mut self, metrics: Arc<WebhookMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Register a DocConnection for a document
@@ -826,6 +904,11 @@ impl SyncProtocolEventSender {
             // Clean up any dead weak references while we're here
             doc_connections.retain(|weak_conn| weak_conn.strong_count() > 0);
 
+            // Update metrics
+            if let Some(ref metrics) = self.metrics {
+                metrics.set_sync_protocol_connections(doc_connections.len());
+            }
+
             tracing::debug!(
                 "Registered DocConnection for document {}. Total connections: {}",
                 doc_id,
@@ -838,6 +921,12 @@ impl SyncProtocolEventSender {
     pub fn unregister_document(&self, doc_id: &str) {
         if let Ok(mut connections) = self.doc_connections.write() {
             connections.remove(doc_id);
+
+            // Update metrics
+            if let Some(ref metrics) = self.metrics {
+                metrics.set_sync_protocol_connections(0);
+            }
+
             tracing::debug!("Unregistered all DocConnections for document {}", doc_id);
         }
     }
@@ -846,41 +935,41 @@ impl SyncProtocolEventSender {
     fn convert_to_event_message(
         &self,
         envelope: &EventEnvelope,
-        doc_id: &str,
     ) -> Result<EventMessage, Box<dyn std::error::Error>> {
         let timestamp = envelope.timestamp.timestamp_millis() as u64;
 
-        // Extract user from payload if present
-        let user = envelope
-            .payload
-            .get("user")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+        // Extract user from event
+        let user = envelope.event.user.clone();
 
-        // Convert metadata
-        let metadata = envelope.payload.get("metadata").cloned();
+        // Convert metadata to JSON value
+        let metadata = if envelope.event.metadata.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_value(&envelope.event.metadata)?)
+        };
 
         Ok(EventMessage {
             event_id: envelope.event_id.clone(),
             event_type: envelope.event_type.clone(),
-            doc_id: doc_id.to_string(),
+            doc_id: envelope.event.doc_id.clone(),
             timestamp,
             user,
             metadata,
+            update: envelope.event.update.clone(),
         })
     }
 }
 
 impl EventSender for SyncProtocolEventSender {
     fn send_event(&self, envelope: EventEnvelope) {
-        // For sync protocol events, the document ID should be extracted from the channel
-        // or from the payload. For now, let's use the channel as the document ID
-        let doc_id = &envelope.channel;
+        // Use the channel for routing (where connections are registered)
+        // but the EventMessage will contain the correct doc_id from the event
+        let routing_key = &envelope.channel;
 
         if let Ok(connections) = self.doc_connections.read() {
-            if let Some(doc_connections) = connections.get(doc_id) {
+            if let Some(doc_connections) = connections.get(routing_key) {
                 // Convert EventEnvelope to EventMessage
-                match self.convert_to_event_message(&envelope, doc_id) {
+                match self.convert_to_event_message(&envelope) {
                     Ok(event_message) => {
                         let mut sent_count = 0;
                         let mut failed_count = 0;
@@ -888,7 +977,16 @@ impl EventSender for SyncProtocolEventSender {
                         for weak_conn in doc_connections {
                             if let Some(connection) = weak_conn.upgrade() {
                                 match connection.send_event(&event_message) {
-                                    Ok(()) => sent_count += 1,
+                                    Ok(()) => {
+                                        sent_count += 1;
+                                        // Record successful delivery
+                                        if let Some(ref metrics) = self.metrics {
+                                            metrics.record_event_delivered(
+                                                &envelope.event_type,
+                                                "sync_protocol",
+                                            );
+                                        }
+                                    }
                                     Err(e) => {
                                         tracing::warn!(
                                             "Failed to send event to DocConnection: {}",
@@ -901,10 +999,10 @@ impl EventSender for SyncProtocolEventSender {
                         }
 
                         tracing::debug!(
-                            "Sent event {} to {} DocConnections for document {} ({} failed)",
+                            "Sent event {} to {} DocConnections for routing_key {} ({} failed)",
                             event_message.event_id,
                             sent_count,
-                            doc_id,
+                            routing_key,
                             failed_count
                         );
                     }
@@ -913,7 +1011,10 @@ impl EventSender for SyncProtocolEventSender {
                     }
                 }
             } else {
-                tracing::debug!("No DocConnections registered for document {}", doc_id);
+                tracing::debug!(
+                    "No DocConnections registered for routing_key {}",
+                    routing_key
+                );
             }
         } else {
             tracing::warn!("Failed to acquire DocConnections read lock");
@@ -954,10 +1055,12 @@ mod debounced_sync_tests {
 
     #[tokio::test]
     async fn test_per_user_queuing() {
+        let metrics = crate::webhook_metrics::WebhookMetrics::new_for_test().unwrap();
         let sender = DebouncedSyncProtocolEventSender {
             inner_sender: Arc::new(SyncProtocolEventSender::new()),
             user_queues: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             cleanup_handle: None,
+            metrics,
         };
 
         // Get queues for different users on same document
@@ -1015,14 +1118,10 @@ mod tests {
         assert!(envelope.event_id.starts_with("evt_"));
         assert_eq!(envelope.event_id.len(), 25); // "evt_" + 21 chars
 
-        // Check payload structure
-        let payload_obj = envelope.payload.as_object().unwrap();
-        assert_eq!(payload_obj["doc_id"], doc_id);
-        assert_eq!(payload_obj["user"], serde_json::Value::Null);
-        assert_eq!(
-            payload_obj["metadata"],
-            serde_json::Value::Object(serde_json::Map::new())
-        );
+        // Check event structure
+        assert_eq!(envelope.event.doc_id, doc_id);
+        assert_eq!(envelope.event.user, None);
+        assert!(envelope.event.metadata.is_empty());
     }
 
     #[test]
@@ -1099,7 +1198,8 @@ mod tests {
             envelopes: sender2_envelopes.clone(),
         });
 
-        let dispatcher = UnifiedEventDispatcher::new(vec![sender1, sender2]);
+        let metrics = crate::webhook_metrics::WebhookMetrics::new_for_test().unwrap();
+        let dispatcher = UnifiedEventDispatcher::new(vec![sender1, sender2], metrics);
 
         let event = DocumentUpdatedEvent::new("test_doc".to_string());
         let envelope = EventEnvelope::new("test_doc".to_string(), event);

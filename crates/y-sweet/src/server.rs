@@ -125,18 +125,22 @@ impl Server {
         doc_gc: bool,
         webhook_configs: Option<Vec<WebhookConfig>>,
     ) -> Result<Self> {
+        // Initialize metrics early so all senders can use them
+        let metrics = WebhookMetrics::new()
+            .map_err(|e| anyhow!("Failed to initialize webhook metrics: {}", e))?;
+
         let websocket_sender = Arc::new(WebSocketSender::new());
-        let sync_protocol_event_sender = Arc::new(SyncProtocolEventSender::new());
+        let sync_protocol_event_sender =
+            Arc::new(SyncProtocolEventSender::new().with_metrics(metrics.clone()));
+
         let debounced_sync_sender = Arc::new(DebouncedSyncProtocolEventSender::new(
             sync_protocol_event_sender.clone(),
+            metrics.clone(),
         ));
 
         let event_dispatcher = if let Some(configs) = webhook_configs {
-            let metrics = WebhookMetrics::new()
-                .map_err(|e| anyhow!("Failed to initialize webhook metrics: {}", e))?;
-
             let webhook_sender = Arc::new(
-                WebhookSender::new(configs.clone(), metrics)
+                WebhookSender::new(configs.clone(), metrics.clone())
                     .map_err(|e| anyhow!("Failed to create webhook sender: {}", e))?,
             );
 
@@ -146,12 +150,15 @@ impl Server {
                 debounced_sync_sender.clone(),
             ];
 
-            Some(Arc::new(UnifiedEventDispatcher::new(senders)) as Arc<dyn EventDispatcher>)
+            Some(Arc::new(UnifiedEventDispatcher::new(senders, metrics)) as Arc<dyn EventDispatcher>)
         } else {
             tracing::info!("No webhook configs provided, creating WebSocket-only event dispatcher");
             let senders: Vec<Arc<dyn EventSender>> =
                 vec![websocket_sender.clone(), debounced_sync_sender.clone()];
-            Some(Arc::new(UnifiedEventDispatcher::new(senders)) as Arc<dyn EventDispatcher>)
+            Some(
+                Arc::new(UnifiedEventDispatcher::new(senders, metrics.clone()))
+                    as Arc<dyn EventDispatcher>,
+            )
         };
 
         tracing::info!("Event dispatcher created successfully");

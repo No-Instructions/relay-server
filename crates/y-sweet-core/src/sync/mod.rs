@@ -22,6 +22,9 @@ pub struct EventMessage {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>, // Event-specific metadata
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub update: Option<Vec<u8>>, // Yjs update data for document.updated events
 }
 
 impl EventMessage {
@@ -590,6 +593,7 @@ mod test {
                 "version": 2,
                 "changes": ["text", "formatting"]
             })),
+            update: None,
         };
 
         // Test serialization
@@ -610,6 +614,7 @@ mod test {
             timestamp: 1640995200000,
             user: None,
             metadata: None,
+            update: None,
         };
 
         let cbor_bytes = event.to_cbor().unwrap();
@@ -665,6 +670,7 @@ mod test {
             timestamp: 1640995200000,
             user: Some("test@example.com".to_string()),
             metadata: Some(serde_json::json!({"test": true})),
+            update: None,
         };
 
         let cbor_data = event.to_cbor().unwrap();
@@ -744,6 +750,7 @@ mod test {
             timestamp: 1640995200000,
             user: None,
             metadata: None,
+            update: None,
         };
         let cbor_data = event.to_cbor().unwrap();
         let result = protocol.handle_event(&awareness, cbor_data);
@@ -779,6 +786,7 @@ mod test {
             timestamp: 1640995200000,
             user: Some("test@example.com".to_string()),
             metadata: Some(serde_json::json!({"test": "data"})),
+            update: None,
         };
         let cbor_data = event.to_cbor().unwrap();
 
