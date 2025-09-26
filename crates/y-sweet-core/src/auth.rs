@@ -242,6 +242,56 @@ fn b64_decode(input: &str) -> Result<Vec<u8>, AuthError> {
         .map_err(|_| AuthError::InvalidToken)
 }
 
+fn detect_key_type(key_bytes: &[u8]) -> &'static str {
+    match key_bytes.len() {
+        32 => "HMAC-SHA-256 (32 bytes)",
+        33 => "ES256 compressed public key (33 bytes)",
+        65 => "ES256 uncompressed public key (65 bytes)",
+        _ => "Unknown key type",
+    }
+}
+
+fn parse_key_format(input: &str) -> Result<Vec<u8>, AuthError> {
+    let trimmed = input.trim();
+
+    let key_bytes = if trimmed.starts_with("-----BEGIN") && trimmed.contains("-----END") {
+        // Extract base64 content between PEM headers
+        let lines: Vec<&str> = trimmed.lines().collect();
+        let mut base64_content = String::new();
+
+        let mut in_content = false;
+        for line in lines {
+            let line = line.trim();
+            if line.starts_with("-----BEGIN") {
+                in_content = true;
+                continue;
+            }
+            if line.starts_with("-----END") {
+                break;
+            }
+            if in_content && !line.is_empty() {
+                base64_content.push_str(line);
+            }
+        }
+
+        if base64_content.is_empty() {
+            return Err(AuthError::InvalidToken);
+        }
+
+        tracing::info!("Parsed PEM format key");
+        b64_decode(&base64_content)?
+    } else {
+        // Treat as raw base64
+        tracing::info!("Parsed raw base64 key");
+        b64_decode(trimmed)?
+    };
+
+    let key_type = detect_key_type(&key_bytes);
+    tracing::info!("Detected key type: {}", key_type);
+
+    Ok(key_bytes)
+}
+
 mod b64 {
     use super::*;
     use serde::{de, Deserialize, Deserializer, Serializer};
@@ -413,8 +463,8 @@ fn is_cose_message(data: &[u8]) -> bool {
 }
 
 impl Authenticator {
-    pub fn new(private_key: &str) -> Result<Self, AuthError> {
-        let private_key = b64_decode(private_key)?;
+    pub fn new(key: &str) -> Result<Self, AuthError> {
+        let private_key = parse_key_format(key)?;
 
         Ok(Self {
             private_key,
