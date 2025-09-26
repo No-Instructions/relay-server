@@ -22,8 +22,7 @@ pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
 
-    #[serde(default)]
-    pub auth: AuthConfig,
+    pub auth: Option<AuthConfig>,
 
     #[serde(default)]
     pub store: StoreConfig,
@@ -74,10 +73,9 @@ pub struct MetricsConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AuthConfig {
-    #[serde(default)]
-    pub enabled: bool,
-
     pub private_key: Option<String>,
+
+    pub public_key: Option<String>,
 
     pub key_id: Option<String>,
 
@@ -276,8 +274,8 @@ impl Default for ServerConfig {
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             private_key: None,
+            public_key: None,
             key_id: None,
             default_expiration_seconds: default_expiration_seconds(),
         }
@@ -493,28 +491,41 @@ impl Config {
 
         // Override auth configuration
         if let Ok(auth_key) = env::var("RELAY_SERVER_AUTH") {
-            tracing::info!("Config override: auth.enabled = true, auth.private_key set (from RELAY_SERVER_AUTH)");
-            self.auth.enabled = true;
-            self.auth.private_key = Some(auth_key);
-        }
-
-        if let Ok(key_id) = env::var("RELAY_SERVER_KEY_ID") {
             tracing::info!(
-                "Config override: auth.key_id = {} (from RELAY_SERVER_KEY_ID)",
-                key_id
+                "Config override: auth enabled with private_key set (from RELAY_SERVER_AUTH)"
             );
-            self.auth.key_id = Some(key_id);
+            if self.auth.is_none() {
+                self.auth = Some(AuthConfig::default());
+            }
+            if let Some(ref mut auth) = self.auth {
+                auth.private_key = Some(auth_key);
+            }
         }
 
-        if let Ok(expiration) = env::var("RELAY_SERVER_DEFAULT_EXPIRATION_SECONDS") {
-            let exp: u64 = expiration.parse().map_err(|_| {
-                ConfigError::InvalidConfiguration(format!(
-                    "Invalid expiration seconds: {}",
-                    expiration
-                ))
-            })?;
-            tracing::info!("Config override: auth.default_expiration_seconds = {} (from RELAY_SERVER_DEFAULT_EXPIRATION_SECONDS)", exp);
-            self.auth.default_expiration_seconds = exp;
+        // Handle other auth environment variables only if auth section exists
+        if self.auth.is_some() {
+            if let Ok(key_id) = env::var("RELAY_SERVER_KEY_ID") {
+                tracing::info!(
+                    "Config override: auth.key_id = {} (from RELAY_SERVER_KEY_ID)",
+                    key_id
+                );
+                if let Some(ref mut auth) = self.auth {
+                    auth.key_id = Some(key_id);
+                }
+            }
+
+            if let Ok(expiration) = env::var("RELAY_SERVER_DEFAULT_EXPIRATION_SECONDS") {
+                let exp: u64 = expiration.parse().map_err(|_| {
+                    ConfigError::InvalidConfiguration(format!(
+                        "Invalid expiration seconds: {}",
+                        expiration
+                    ))
+                })?;
+                tracing::info!("Config override: auth.default_expiration_seconds = {} (from RELAY_SERVER_DEFAULT_EXPIRATION_SECONDS)", exp);
+                if let Some(ref mut auth) = self.auth {
+                    auth.default_expiration_seconds = exp;
+                }
+            }
         }
 
         // Override store configuration
@@ -675,6 +686,27 @@ impl Config {
             _ => {}
         }
 
+        // Validate auth configuration
+        if let Some(ref auth) = self.auth {
+            match (&auth.private_key, &auth.public_key) {
+                (Some(_), Some(_)) => {
+                    return Err(ConfigError::InvalidConfiguration(
+                        "Cannot specify both private_key and public_key in auth configuration"
+                            .to_string(),
+                    ));
+                }
+                (None, None) => {
+                    return Err(ConfigError::InvalidConfiguration(
+                        "Auth section present but no private_key or public_key specified"
+                            .to_string(),
+                    ));
+                }
+                _ => {
+                    // Exactly one key is present, which is valid
+                }
+            }
+        }
+
         // Validate webhook configurations
         for (i, webhook) in self.webhooks.iter().enumerate() {
             if webhook.url.is_empty() {
@@ -744,7 +776,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             server: ServerConfig::default(),
-            auth: AuthConfig::default(),
+            auth: None,
             store: StoreConfig::default(),
             webhooks: Vec::new(),
             logging: LoggingConfig::default(),

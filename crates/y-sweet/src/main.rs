@@ -237,8 +237,12 @@ fn load_config_for_serve_args(
     }
 
     if let Some(auth_key) = auth {
-        config.auth.enabled = true;
-        config.auth.private_key = Some(auth_key.clone());
+        if config.auth.is_none() {
+            config.auth = Some(y_sweet_core::config::AuthConfig::default());
+        }
+        if let Some(ref mut auth_config) = config.auth {
+            auth_config.private_key = Some(auth_key.clone());
+        }
     }
 
     if let Some(url_prefix) = url_prefix {
@@ -459,12 +463,14 @@ async fn main() -> Result<()> {
             tracing::info!("Using log level: {}", log_level);
 
             // Create authenticator from config
-            let auth = if config.auth.enabled {
-                if let Some(private_key) = &config.auth.private_key {
+            let auth = if let Some(ref auth_config) = config.auth {
+                if let Some(private_key) = &auth_config.private_key {
                     Some(Authenticator::new(private_key)?)
+                } else if let Some(public_key) = &auth_config.public_key {
+                    Some(Authenticator::new(public_key)?)
                 } else {
                     return Err(anyhow::anyhow!(
-                        "Auth is enabled but no private key provided"
+                        "Auth section present but no private_key or public_key provided"
                     ));
                 }
             } else {
@@ -697,7 +703,7 @@ async fn main() -> Result<()> {
                             }
                             println!(
                                 "  Auth: {}",
-                                if config.auth.enabled {
+                                if config.auth.is_some() {
                                     "enabled"
                                 } else {
                                     "disabled"
