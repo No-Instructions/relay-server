@@ -1207,7 +1207,14 @@ async fn auth_doc(
         ExpirationTimeEpochMillis(current_time_epoch_millis() + valid_for_seconds * 1000);
 
     let token = if let Some(auth) = &server_state.authenticator {
-        let token = auth.gen_doc_token(&doc_id, authorization, expiration_time, None);
+        let token = auth
+            .gen_doc_token(&doc_id, authorization, expiration_time, None)
+            .map_err(|e| {
+                AppError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    anyhow!("Failed to generate token: {}", e),
+                )
+            })?;
         Some(token)
     } else {
         None
@@ -2314,15 +2321,18 @@ mod test {
         let file_hash = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
 
         // Generate a file token
-        let token = authenticator.gen_file_token(
-            file_hash,
-            doc_id,
-            Authorization::Full,
-            ExpirationTimeEpochMillis(u64::MAX), // Never expires for test
-            None,
-            None,
-            None,
-        );
+        let token = authenticator
+            .gen_file_token_cwt(
+                file_hash,
+                doc_id,
+                Authorization::Full,
+                ExpirationTimeEpochMillis(u64::MAX), // Never expires for test
+                None,
+                None,
+                None,
+                None, // channel
+            )
+            .unwrap();
 
         // Set up the mock store with the test file
         let mut mock_files = HashMap::new();
@@ -2368,15 +2378,18 @@ mod test {
         // Test a file that doesn't exist
         let nonexistent_file_hash =
             "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
-        let nonexistent_token = authenticator.gen_file_token(
-            nonexistent_file_hash,
-            doc_id,
-            Authorization::Full,
-            ExpirationTimeEpochMillis(u64::MAX),
-            None,
-            None,
-            None,
-        );
+        let nonexistent_token = authenticator
+            .gen_file_token_cwt(
+                nonexistent_file_hash,
+                doc_id,
+                Authorization::Full,
+                ExpirationTimeEpochMillis(u64::MAX),
+                None,
+                None,
+                None,
+                None, // channel
+            )
+            .unwrap();
 
         let nonexistent_headers =
             TypedHeader(headers::Authorization::bearer(&nonexistent_token).unwrap());

@@ -43,8 +43,10 @@ fn generate_public_key_from_private(private_key_b64: &str) -> Result<String, any
 
 #[derive(Clone, ValueEnum)]
 enum KeyType {
-    #[value(name = "HMAC-SHA-256")]
-    HmacSha256,
+    #[value(name = "legacy")]
+    Legacy,
+    #[value(name = "HMAC256")]
+    Hmac256,
     #[value(name = "ES256")]
     Es256,
 }
@@ -96,7 +98,7 @@ enum ServSubcommand {
         #[clap(long)]
         json: bool,
 
-        #[clap(long, default_value = "HMAC-SHA-256")]
+        #[clap(long, default_value = "legacy")]
         key_type: KeyType,
     },
 
@@ -635,37 +637,81 @@ async fn main() -> Result<()> {
         }
         ServSubcommand::GenAuth { json, key_type } => {
             let auth = match key_type {
-                KeyType::HmacSha256 => Authenticator::gen_key_hmac()?,
+                KeyType::Legacy => Authenticator::gen_key_legacy()?,
+                KeyType::Hmac256 => Authenticator::gen_key_hmac()?,
                 KeyType::Es256 => Authenticator::gen_key_ecdsa()?,
             };
 
             if *json {
-                let mut result = json!({
-                    "private_key": auth.private_key(),
-                    "server_token": auth.server_token(),
-                });
+                let mut result = serde_json::Map::new();
 
-                // For ES256, also include public key
-                if matches!(key_type, KeyType::Es256) {
-                    if let Ok(public_key) = generate_public_key_from_private(&auth.private_key()) {
-                        result
-                            .as_object_mut()
-                            .unwrap()
-                            .insert("public_key".to_string(), json!(public_key));
+                // Generate appropriate server token based on key type
+                match auth.key_material() {
+                    y_sweet_core::auth::AuthKeyMaterial::Legacy(_) => {
+                        // Generate legacy format server token
+                        let server_token = auth.server_token_legacy()?;
+                        result.insert("server_token".to_string(), json!(server_token));
+                    }
+                    _ => {
+                        // Generate CWT server token for modern keys
+                        let server_token = auth.server_token()?;
+                        result.insert("server_token".to_string(), json!(server_token));
+                    }
+                };
+
+                match auth.key_material() {
+                    y_sweet_core::auth::AuthKeyMaterial::Legacy(key_bytes) => {
+                        result.insert(
+                            "private_key".to_string(),
+                            json!(y_sweet_core::auth::b64_encode(key_bytes)),
+                        );
+                    }
+                    y_sweet_core::auth::AuthKeyMaterial::Hmac256(key_bytes) => {
+                        result.insert(
+                            "private_key".to_string(),
+                            json!(y_sweet_core::auth::b64_encode(key_bytes)),
+                        );
+                    }
+                    y_sweet_core::auth::AuthKeyMaterial::EcdsaP256Private(key_bytes) => {
+                        let private_key_b64 = y_sweet_core::auth::b64_encode(key_bytes);
+                        result.insert("private_key".to_string(), json!(private_key_b64));
+
+                        // Also generate and include public key
+                        if let Ok(public_key) = generate_public_key_from_private(&private_key_b64) {
+                            result.insert("public_key".to_string(), json!(public_key));
+                        }
+                    }
+                    y_sweet_core::auth::AuthKeyMaterial::EcdsaP256Public(key_bytes) => {
+                        result.insert(
+                            "public_key".to_string(),
+                            json!(y_sweet_core::auth::b64_encode(key_bytes)),
+                        );
+                        // No private_key field for public keys!
                     }
                 }
 
-                println!("{}", serde_json::to_string_pretty(&result)?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::Value::Object(result))?
+                );
             } else {
                 print_auth_message(&auth);
 
-                // For ES256, also print public key
-                if matches!(key_type, KeyType::Es256) {
-                    if let Ok(public_key) = generate_public_key_from_private(&auth.private_key()) {
-                        println!("Public key for ES256:");
-                        println!("   {}", public_key);
+                // Print additional info based on key type
+                match auth.key_material() {
+                    y_sweet_core::auth::AuthKeyMaterial::EcdsaP256Private(key_bytes) => {
+                        let private_key_b64 = y_sweet_core::auth::b64_encode(key_bytes);
+                        if let Ok(public_key) = generate_public_key_from_private(&private_key_b64) {
+                            println!("Public key for ES256:");
+                            println!("   {}", public_key);
+                            println!();
+                        }
+                    }
+                    y_sweet_core::auth::AuthKeyMaterial::EcdsaP256Public(_) => {
+                        println!("Note: This is a public key - it can only verify tokens, not create them.");
                         println!();
                     }
+                    _ => {}
                 }
             }
         }

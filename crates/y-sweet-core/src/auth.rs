@@ -92,12 +92,41 @@ pub enum AuthError {
     InvalidClaims,
     #[error("HMAC signature verification failed")]
     HmacVerificationFailed,
+    #[error("Cannot sign tokens with public key - signing requires private key")]
+    CannotSignWithPublicKey,
 }
 
-#[derive(Serialize, Deserialize, PartialEq, PartialOrd, Debug, Clone)]
+#[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
+pub enum AuthKeyMaterial {
+    Hmac256(Vec<u8>), // 32-byte keys for HMAC-SHA256 (CWT tokens)
+    Legacy(Vec<u8>),  // 30-byte keys for legacy token system
+    EcdsaP256Private(Vec<u8>),
+    EcdsaP256Public(Vec<u8>),
+}
+
+impl AuthKeyMaterial {
+    /// Get the base64 representation of the key material
+    pub fn to_base64(&self) -> String {
+        match self {
+            AuthKeyMaterial::Hmac256(key_bytes) => b64_encode(key_bytes),
+            AuthKeyMaterial::Legacy(key_bytes) => b64_encode(key_bytes),
+            AuthKeyMaterial::EcdsaP256Private(key_bytes) => b64_encode(key_bytes),
+            AuthKeyMaterial::EcdsaP256Public(key_bytes) => b64_encode(key_bytes),
+        }
+    }
+
+    /// Get the ECDSA private key base64 for public key generation (only works with ECDSA private keys)
+    pub fn ecdsa_private_key_base64(&self) -> Option<String> {
+        match self {
+            AuthKeyMaterial::EcdsaP256Private(key_bytes) => Some(b64_encode(key_bytes)),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
 pub struct Authenticator {
-    #[serde(with = "b64")]
-    private_key: Vec<u8>,
+    key_material: AuthKeyMaterial,
     key_id: Option<String>,
 }
 
@@ -232,11 +261,11 @@ fn bincode_decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, bincode:
     bincode::DefaultOptions::new().deserialize(bytes)
 }
 
-fn b64_encode(bytes: &[u8]) -> String {
+pub fn b64_encode(bytes: &[u8]) -> String {
     BASE64_CUSTOM.encode(bytes)
 }
 
-fn b64_decode(input: &str) -> Result<Vec<u8>, AuthError> {
+pub(crate) fn b64_decode(input: &str) -> Result<Vec<u8>, AuthError> {
     BASE64_CUSTOM
         .decode(input.as_bytes())
         .map_err(|_| AuthError::InvalidToken)
@@ -251,65 +280,77 @@ fn detect_key_type(key_bytes: &[u8]) -> &'static str {
     }
 }
 
-fn parse_key_format(input: &str) -> Result<Vec<u8>, AuthError> {
+fn parse_key_format(input: &str) -> Result<AuthKeyMaterial, AuthError> {
     let trimmed = input.trim();
 
-    let key_bytes = if trimmed.starts_with("-----BEGIN") && trimmed.contains("-----END") {
-        // Extract base64 content between PEM headers
-        let lines: Vec<&str> = trimmed.lines().collect();
-        let mut base64_content = String::new();
-
-        let mut in_content = false;
-        for line in lines {
-            let line = line.trim();
-            if line.starts_with("-----BEGIN") {
-                in_content = true;
-                continue;
-            }
-            if line.starts_with("-----END") {
-                break;
-            }
-            if in_content && !line.is_empty() {
-                base64_content.push_str(line);
-            }
+    if trimmed.starts_with("-----BEGIN") && trimmed.contains("-----END") {
+        // PEM format - determine key type from header
+        if trimmed.contains("-----BEGIN PUBLIC KEY-----") {
+            // ECDSA public key in PEM format
+            let key_bytes = extract_pem_content(trimmed)?;
+            tracing::info!("Parsed PEM ECDSA P-256 public key");
+            Ok(AuthKeyMaterial::EcdsaP256Public(key_bytes))
+        } else if trimmed.contains("-----BEGIN PRIVATE KEY-----")
+            || trimmed.contains("-----BEGIN EC PRIVATE KEY-----")
+        {
+            // ECDSA private key in PEM format
+            let key_bytes = extract_pem_content(trimmed)?;
+            tracing::info!("Parsed PEM ECDSA P-256 private key");
+            Ok(AuthKeyMaterial::EcdsaP256Private(key_bytes))
+        } else {
+            tracing::error!("Unsupported PEM key type");
+            Err(AuthError::InvalidToken)
         }
-
-        if base64_content.is_empty() {
-            return Err(AuthError::InvalidToken);
-        }
-
-        tracing::info!("Parsed PEM format key");
-        b64_decode(&base64_content)?
     } else {
-        // Treat as raw base64
-        tracing::info!("Parsed raw base64 key");
-        b64_decode(trimmed)?
-    };
+        // Raw base64 - distinguish between legacy (30 bytes) and HMAC256 (32 bytes)
+        let key_bytes = b64_decode(trimmed)?;
+        let key_type = detect_key_type(&key_bytes);
+        tracing::info!("Detected key type: {}", key_type);
 
-    let key_type = detect_key_type(&key_bytes);
-    tracing::info!("Detected key type: {}", key_type);
-
-    Ok(key_bytes)
+        match key_bytes.len() {
+            30 => {
+                tracing::info!("Using 30-byte key for legacy token system");
+                Ok(AuthKeyMaterial::Legacy(key_bytes))
+            }
+            32 => {
+                tracing::info!("Using 32-byte key for HMAC-SHA256 (CWT tokens)");
+                Ok(AuthKeyMaterial::Hmac256(key_bytes))
+            }
+            _ => {
+                tracing::warn!(
+                    "Unexpected key length: {} bytes, defaulting to HMAC256",
+                    key_bytes.len()
+                );
+                Ok(AuthKeyMaterial::Hmac256(key_bytes))
+            }
+        }
+    }
 }
 
-mod b64 {
-    use super::*;
-    use serde::{de, Deserialize, Deserializer, Serializer};
+fn extract_pem_content(pem_str: &str) -> Result<Vec<u8>, AuthError> {
+    let lines: Vec<&str> = pem_str.lines().collect();
+    let mut base64_content = String::new();
 
-    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&b64_encode(bytes))
+    let mut in_content = false;
+    for line in lines {
+        let line = line.trim();
+        if line.starts_with("-----BEGIN") {
+            in_content = true;
+            continue;
+        }
+        if line.starts_with("-----END") {
+            break;
+        }
+        if in_content && !line.is_empty() {
+            base64_content.push_str(line);
+        }
     }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        b64_decode(&s).map_err(de::Error::custom)
+    if base64_content.is_empty() {
+        return Err(AuthError::InvalidToken);
     }
+
+    b64_decode(&base64_content)
 }
 
 impl Payload {
@@ -464,22 +505,55 @@ fn is_cose_message(data: &[u8]) -> bool {
 
 impl Authenticator {
     pub fn new(key: &str) -> Result<Self, AuthError> {
-        let private_key = parse_key_format(key)?;
+        let key_material = parse_key_format(key)?;
 
         Ok(Self {
-            private_key,
+            key_material,
             key_id: None,
         })
     }
 
-    pub fn server_token(&self) -> String {
+    /// Create a CWT authenticator from the stored key material
+    fn create_cwt_authenticator(
+        &self,
+    ) -> Result<crate::cwt::CwtAuthenticator, crate::cwt::CwtError> {
+        match &self.key_material {
+            AuthKeyMaterial::Hmac256(key_bytes) => {
+                crate::cwt::CwtAuthenticator::new_symmetric(key_bytes, self.key_id.clone())
+            }
+            AuthKeyMaterial::Legacy(_) => {
+                // Legacy keys cannot be used for CWT tokens
+                tracing::error!("Legacy 30-byte keys cannot be used for CWT token operations");
+                Err(crate::cwt::CwtError::InvalidCose)
+            }
+            AuthKeyMaterial::EcdsaP256Private(key_bytes) => {
+                crate::cwt::CwtAuthenticator::new_ecdsa_p256(key_bytes, self.key_id.clone())
+            }
+            AuthKeyMaterial::EcdsaP256Public(key_bytes) => {
+                crate::cwt::CwtAuthenticator::new_ecdsa_p256_public(key_bytes, self.key_id.clone())
+            }
+        }
+    }
+
+    /// Get the key material for direct access by callers
+    pub fn key_material(&self) -> &AuthKeyMaterial {
+        &self.key_material
+    }
+
+    pub fn server_token(&self) -> Result<String, AuthError> {
         self.server_token_cwt()
     }
 
-    fn sign(&self, payload: Payload) -> String {
+    fn sign(&self, payload: Payload) -> Result<String, AuthError> {
         let mut hash_payload =
             bincode_encode(&payload).expect("Bincode serialization should not fail.");
-        hash_payload.extend_from_slice(&self.private_key);
+
+        let key_bytes = match &self.key_material {
+            AuthKeyMaterial::Legacy(key_bytes) => key_bytes,
+            AuthKeyMaterial::EcdsaP256Public(_) => return Err(AuthError::CannotSignWithPublicKey),
+            _ => return Err(AuthError::InvalidToken), // Only legacy keys supported for legacy tokens
+        };
+        hash_payload.extend_from_slice(key_bytes);
 
         let token = hash(&hash_payload);
 
@@ -487,11 +561,11 @@ impl Authenticator {
 
         let auth_enc = bincode_encode(&auth_req).expect("Bincode serialization should not fail.");
         let result = b64_encode(&auth_enc);
-        if let Some(key_id) = &self.key_id {
+        Ok(if let Some(key_id) = &self.key_id {
             format!("{}.{}", key_id, result)
         } else {
             result
-        }
+        })
     }
 
     fn verify(&self, token: &str, current_time: u64) -> Result<Payload, AuthError> {
@@ -516,7 +590,11 @@ impl Authenticator {
         if let Ok(auth_req) = bincode_decode::<AuthenticatedRequest>(&decoded_bytes) {
             let mut payload =
                 bincode_encode(&auth_req.payload).expect("Bincode serialization should not fail.");
-            payload.extend_from_slice(&self.private_key);
+            let key_bytes = match &self.key_material {
+                AuthKeyMaterial::Legacy(key_bytes) => key_bytes,
+                _ => panic!("Legacy token verification requires legacy keys"),
+            };
+            payload.extend_from_slice(key_bytes);
             let expected_token = hash(&payload);
 
             if expected_token != auth_req.token {
@@ -539,7 +617,11 @@ impl Authenticator {
             // For legacy tokens, we need to verify using the legacy payload structure
             let mut payload = bincode_encode(&legacy_req.payload)
                 .expect("Bincode serialization should not fail.");
-            payload.extend_from_slice(&self.private_key);
+            let key_bytes = match &self.key_material {
+                AuthKeyMaterial::Legacy(key_bytes) => key_bytes,
+                _ => panic!("Legacy token verification requires legacy keys"),
+            };
+            payload.extend_from_slice(key_bytes);
             let expected_token = hash(&payload);
 
             if expected_token != legacy_req.token {
@@ -584,17 +666,13 @@ impl Authenticator {
         }
     }
 
-    pub fn private_key(&self) -> String {
-        b64_encode(&self.private_key)
-    }
-
     pub fn gen_doc_token(
         &self,
         doc_id: &str,
         authorization: Authorization,
         expiration_time: ExpirationTimeEpochMillis,
         user: Option<&str>,
-    ) -> String {
+    ) -> Result<String, AuthError> {
         let payload = Payload::new_with_expiration(
             Permission::Doc(DocPermission {
                 doc_id: doc_id.to_string(),
@@ -615,7 +693,7 @@ impl Authenticator {
         content_type: Option<&str>,
         content_length: Option<u64>,
         user: Option<&str>,
-    ) -> String {
+    ) -> Result<String, AuthError> {
         let payload = Payload::new_with_expiration(
             Permission::File(FilePermission {
                 file_hash: file_hash.to_string(),
@@ -631,8 +709,13 @@ impl Authenticator {
     }
 
     /// Generate a CWT server token
-    pub fn server_token_cwt(&self) -> String {
+    pub fn server_token_cwt(&self) -> Result<String, AuthError> {
         self.gen_cwt_token(Permission::Server, None)
+    }
+
+    /// Generate a legacy format server token
+    pub fn server_token_legacy(&self) -> Result<String, AuthError> {
+        self.sign(Payload::new(Permission::Server))
     }
 
     /// Generate a CWT document token
@@ -643,7 +726,7 @@ impl Authenticator {
         expiration_time: ExpirationTimeEpochMillis,
         user: Option<&str>,
         channel: Option<String>,
-    ) -> String {
+    ) -> Result<String, AuthError> {
         // Validate channel if provided
         if let Some(ref channel_name) = channel {
             if !crate::api_types::validate_key(channel_name) {
@@ -670,7 +753,7 @@ impl Authenticator {
         content_length: Option<u64>,
         user: Option<&str>,
         channel: Option<String>,
-    ) -> String {
+    ) -> Result<String, AuthError> {
         // Validate channel if provided
         if let Some(ref channel_name) = channel {
             if !crate::api_types::validate_key(channel_name) {
@@ -696,7 +779,7 @@ impl Authenticator {
         authorization: Authorization,
         expiration_time: ExpirationTimeEpochMillis,
         user: Option<&str>,
-    ) -> String {
+    ) -> Result<String, AuthError> {
         let payload = Payload::new_with_expiration(
             Permission::Prefix(PrefixPermission {
                 prefix: prefix.to_string(),
@@ -715,7 +798,7 @@ impl Authenticator {
         authorization: Authorization,
         expiration_time: ExpirationTimeEpochMillis,
         user: Option<&str>,
-    ) -> String {
+    ) -> Result<String, AuthError> {
         let permission = Permission::Prefix(PrefixPermission {
             prefix: prefix.to_string(),
             authorization,
@@ -729,7 +812,7 @@ impl Authenticator {
         &self,
         permission: Permission,
         expiration_time: Option<ExpirationTimeEpochMillis>,
-    ) -> String {
+    ) -> Result<String, AuthError> {
         self.gen_cwt_token_with_channel(permission, expiration_time, None)
     }
 
@@ -738,11 +821,12 @@ impl Authenticator {
         permission: Permission,
         expiration_time: Option<ExpirationTimeEpochMillis>,
         channel: Option<String>,
-    ) -> String {
-        use crate::cwt::{permission_to_scope, CwtAuthenticator, CwtClaims};
+    ) -> Result<String, AuthError> {
+        use crate::cwt::{permission_to_scope, CwtClaims};
 
-        let cwt_auth = CwtAuthenticator::new(&self.private_key, self.key_id.clone())
-            .expect("CWT authenticator creation should not fail");
+        let cwt_auth = self
+            .create_cwt_authenticator()
+            .map_err(|_| AuthError::CannotSignWithPublicKey)?;
 
         // Extract user information from permission
         let subject = match &permission {
@@ -769,15 +853,15 @@ impl Authenticator {
 
         let token_bytes = cwt_auth
             .create_cwt(claims)
-            .expect("CWT creation should not fail");
+            .map_err(|_| AuthError::CannotSignWithPublicKey)?;
 
         let token = b64_encode(&token_bytes);
 
-        if let Some(key_id) = &self.key_id {
+        Ok(if let Some(key_id) = &self.key_id {
             format!("{}.{}", key_id, token)
         } else {
             token
-        }
+        })
     }
 
     pub fn verify_doc_token(
@@ -908,7 +992,16 @@ impl Authenticator {
         let private_key_bytes = secret_key.to_bytes();
 
         Ok(Authenticator {
-            private_key: private_key_bytes.to_vec(),
+            key_material: AuthKeyMaterial::EcdsaP256Private(private_key_bytes.to_vec()),
+            key_id: None,
+        })
+    }
+
+    pub fn gen_key_legacy() -> Result<Authenticator, AuthError> {
+        let key = rand::thread_rng().gen::<[u8; 30]>(); // 30-byte legacy keys
+
+        Ok(Authenticator {
+            key_material: AuthKeyMaterial::Legacy(key.to_vec()),
             key_id: None,
         })
     }
@@ -964,7 +1057,7 @@ impl Authenticator {
         token: &str,
         current_time: u64,
     ) -> Result<(Permission, Option<String>), AuthError> {
-        use crate::cwt::{scope_to_permission, CwtAuthenticator};
+        use crate::cwt::scope_to_permission;
 
         tracing::debug!("Starting CWT token verification");
 
@@ -995,11 +1088,10 @@ impl Authenticator {
             e
         })?;
 
-        let cwt_auth =
-            CwtAuthenticator::new(&self.private_key, self.key_id.clone()).map_err(|e| {
-                tracing::error!("Failed to create CWT authenticator: {:?}", e);
-                AuthError::InvalidToken
-            })?;
+        let cwt_auth = self.create_cwt_authenticator().map_err(|e| {
+            tracing::error!("Failed to create CWT authenticator: {:?}", e);
+            AuthError::InvalidToken
+        })?;
 
         let claims = cwt_auth.verify_cwt(&token_bytes).map_err(|e| match e {
             crate::cwt::CwtError::InvalidCbor => {
@@ -1085,8 +1177,6 @@ impl Authenticator {
                 }
             }
             TokenFormat::Cwt => {
-                use crate::cwt::CwtAuthenticator;
-
                 // Remove key_id prefix if present
                 let token_data = if let Some((prefix, token_part)) = token.split_once('.') {
                     if Some(prefix) != self.key_id.as_deref() {
@@ -1101,7 +1191,8 @@ impl Authenticator {
                 };
 
                 let token_bytes = b64_decode(token_data)?;
-                let cwt_auth = CwtAuthenticator::new(&self.private_key, self.key_id.clone())
+                let cwt_auth = self
+                    .create_cwt_authenticator()
                     .map_err(|_| AuthError::InvalidToken)?;
 
                 let claims = cwt_auth
@@ -1190,22 +1281,24 @@ mod tests {
 
     #[test]
     fn test_file_token_with_metadata() {
-        let authenticator = Authenticator::gen_key().unwrap();
+        let authenticator = Authenticator::gen_key_legacy().unwrap();
         let file_hash = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
         let doc_id = "doc123";
         let content_type = "application/json";
         let content_length = 12345;
 
         // Generate token with content-type and length
-        let token = authenticator.gen_file_token(
-            file_hash,
-            doc_id,
-            Authorization::Full,
-            ExpirationTimeEpochMillis(0),
-            Some(content_type),
-            Some(content_length),
-            None,
-        );
+        let token = authenticator
+            .gen_file_token(
+                file_hash,
+                doc_id,
+                Authorization::Full,
+                ExpirationTimeEpochMillis(0),
+                Some(content_type),
+                Some(content_length),
+                None,
+            )
+            .unwrap();
 
         // Verify the token works for file hash authentication
         assert!(matches!(
@@ -1239,20 +1332,22 @@ mod tests {
 
     #[test]
     fn test_file_token_without_metadata() {
-        let authenticator = Authenticator::gen_key().unwrap();
+        let authenticator = Authenticator::gen_key_legacy().unwrap();
         let file_hash = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
         let doc_id = "doc123";
 
         // Generate token without content-type and length
-        let token = authenticator.gen_file_token(
-            file_hash,
-            doc_id,
-            Authorization::Full,
-            ExpirationTimeEpochMillis(0),
-            None,
-            None,
-            None,
-        );
+        let token = authenticator
+            .gen_file_token(
+                file_hash,
+                doc_id,
+                Authorization::Full,
+                ExpirationTimeEpochMillis(0),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
 
         // Verify the token with file hash
         assert!(matches!(
@@ -1298,13 +1393,15 @@ mod tests {
 
     #[test]
     fn test_simple_auth() {
-        let authenticator = Authenticator::gen_key().unwrap();
-        let token = authenticator.gen_doc_token(
-            "doc123",
-            Authorization::Full,
-            ExpirationTimeEpochMillis(0),
-            None,
-        );
+        let authenticator = Authenticator::gen_key_legacy().unwrap();
+        let token = authenticator
+            .gen_doc_token(
+                "doc123",
+                Authorization::Full,
+                ExpirationTimeEpochMillis(0),
+                None,
+            )
+            .unwrap();
         assert!(matches!(
             authenticator.verify_doc_token(&token, "doc123", 0),
             Ok(Authorization::Full)
@@ -1321,13 +1418,15 @@ mod tests {
 
     #[test]
     fn test_read_only_auth() {
-        let authenticator = Authenticator::gen_key().unwrap();
-        let token = authenticator.gen_doc_token(
-            "doc123",
-            Authorization::ReadOnly,
-            ExpirationTimeEpochMillis(0),
-            None,
-        );
+        let authenticator = Authenticator::gen_key_legacy().unwrap();
+        let token = authenticator
+            .gen_doc_token(
+                "doc123",
+                Authorization::ReadOnly,
+                ExpirationTimeEpochMillis(0),
+                None,
+            )
+            .unwrap();
         assert!(matches!(
             authenticator.verify_doc_token(&token, "doc123", 0),
             Ok(Authorization::ReadOnly)
@@ -1337,7 +1436,7 @@ mod tests {
     #[test]
     fn test_server_token_for_doc_auth() {
         let authenticator = Authenticator::gen_key().unwrap();
-        let server_token = authenticator.server_token();
+        let server_token = authenticator.server_token().unwrap();
         assert!(matches!(
             authenticator.verify_doc_token(&server_token, "doc123", 0),
             Ok(Authorization::Full)
@@ -1346,32 +1445,42 @@ mod tests {
 
     #[test]
     fn test_key_id() {
-        let authenticator = Authenticator::gen_key()
+        // Test legacy tokens with key ID
+        let legacy_authenticator = Authenticator::gen_key_legacy()
             .unwrap()
             .with_key_id("myKeyId".try_into().unwrap());
-        let token = authenticator.gen_doc_token(
-            "doc123",
-            Authorization::Full,
-            ExpirationTimeEpochMillis(0),
-            None,
-        );
+        let legacy_token = legacy_authenticator
+            .gen_doc_token(
+                "doc123",
+                Authorization::Full,
+                ExpirationTimeEpochMillis(0),
+                None,
+            )
+            .unwrap();
         assert!(
-            token.starts_with("myKeyId."),
+            legacy_token.starts_with("myKeyId."),
             "Token {} does not start with myKeyId.",
-            token
+            legacy_token
         );
         assert!(matches!(
-            authenticator.verify_doc_token(&token, "doc123", 0),
+            legacy_authenticator.verify_doc_token(&legacy_token, "doc123", 0),
             Ok(Authorization::Full)
         ));
 
-        let token = authenticator.server_token();
+        // Test CWT tokens with key ID
+        let cwt_authenticator = Authenticator::gen_key()
+            .unwrap()
+            .with_key_id("myKeyId".try_into().unwrap());
+        let server_token = cwt_authenticator.server_token().unwrap();
         assert!(
-            token.starts_with("myKeyId."),
+            server_token.starts_with("myKeyId."),
             "Token {} does not start with myKeyId.",
-            token
+            server_token
         );
-        assert_eq!(authenticator.verify_server_token(&token, 0), Ok(()));
+        assert_eq!(
+            cwt_authenticator.verify_server_token(&server_token, 0),
+            Ok(())
+        );
     }
 
     #[test]
@@ -1389,15 +1498,17 @@ mod tests {
 
     #[test]
     fn test_key_id_mismatch() {
-        let authenticator = Authenticator::gen_key()
+        let authenticator = Authenticator::gen_key_legacy()
             .unwrap()
             .with_key_id("myKeyId".try_into().unwrap());
-        let token = authenticator.gen_doc_token(
-            "doc123",
-            Authorization::Full,
-            ExpirationTimeEpochMillis(0),
-            None,
-        );
+        let token = authenticator
+            .gen_doc_token(
+                "doc123",
+                Authorization::Full,
+                ExpirationTimeEpochMillis(0),
+                None,
+            )
+            .unwrap();
         let token = token.replace("myKeyId.", "aDifferentKeyId.");
         assert!(token.starts_with("aDifferentKeyId."));
         assert!(matches!(
@@ -1408,15 +1519,17 @@ mod tests {
 
     #[test]
     fn test_missing_key_id() {
-        let authenticator = Authenticator::gen_key()
+        let authenticator = Authenticator::gen_key_legacy()
             .unwrap()
             .with_key_id("myKeyId".try_into().unwrap());
-        let token = authenticator.gen_doc_token(
-            "doc123",
-            Authorization::Full,
-            ExpirationTimeEpochMillis(0),
-            None,
-        );
+        let token = authenticator
+            .gen_doc_token(
+                "doc123",
+                Authorization::Full,
+                ExpirationTimeEpochMillis(0),
+                None,
+            )
+            .unwrap();
         let token = token.replace("myKeyId.", "");
         assert!(matches!(
             authenticator.verify_doc_token(&token, "doc123", 0),
@@ -1426,13 +1539,15 @@ mod tests {
 
     #[test]
     fn test_unexpected_key_id() {
-        let authenticator = Authenticator::gen_key().unwrap();
-        let token = authenticator.gen_doc_token(
-            "doc123",
-            Authorization::Full,
-            ExpirationTimeEpochMillis(0),
-            None,
-        );
+        let authenticator = Authenticator::gen_key_legacy().unwrap();
+        let token = authenticator
+            .gen_doc_token(
+                "doc123",
+                Authorization::Full,
+                ExpirationTimeEpochMillis(0),
+                None,
+            )
+            .unwrap();
         let token = format!("unexpectedKeyId.{}", token);
         assert!(matches!(
             authenticator.verify_doc_token(&token, "doc123", 0),
@@ -1442,7 +1557,7 @@ mod tests {
 
     #[test]
     fn test_invalid_signature() {
-        let authenticator = Authenticator::gen_key().unwrap();
+        let authenticator = Authenticator::gen_key_legacy().unwrap();
         let actual_payload = Payload::new(Permission::Doc(DocPermission {
             doc_id: "doc123".to_string(),
             authorization: Authorization::Full,
@@ -1450,7 +1565,11 @@ mod tests {
         }));
         let mut encoded_payload =
             bincode_encode(&actual_payload).expect("Bincode serialization should not fail.");
-        encoded_payload.extend_from_slice(&authenticator.private_key);
+        let key_bytes = match &authenticator.key_material {
+            AuthKeyMaterial::Legacy(key_bytes) => key_bytes,
+            _ => panic!("Expected legacy key for this test"),
+        };
+        encoded_payload.extend_from_slice(key_bytes);
 
         let token = hash(&encoded_payload);
 
@@ -1488,7 +1607,7 @@ mod tests {
     #[test]
     fn test_cwt_server_token() {
         let authenticator = Authenticator::gen_key().unwrap();
-        let token = authenticator.server_token_cwt();
+        let token = authenticator.server_token_cwt().unwrap();
 
         assert_eq!(detect_token_format(&token), TokenFormat::Cwt);
 
@@ -1499,13 +1618,15 @@ mod tests {
     #[test]
     fn test_cwt_doc_token() {
         let authenticator = Authenticator::gen_key().unwrap();
-        let token = authenticator.gen_doc_token_cwt(
-            "doc123",
-            Authorization::Full,
-            ExpirationTimeEpochMillis(u64::MAX),
-            None,
-            None,
-        );
+        let token = authenticator
+            .gen_doc_token_cwt(
+                "doc123",
+                Authorization::Full,
+                ExpirationTimeEpochMillis(u64::MAX),
+                None,
+                None,
+            )
+            .unwrap();
 
         assert_eq!(detect_token_format(&token), TokenFormat::Cwt);
 
@@ -1528,16 +1649,18 @@ mod tests {
         let file_hash = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
         let doc_id = "doc123";
 
-        let token = authenticator.gen_file_token_cwt(
-            file_hash,
-            doc_id,
-            Authorization::ReadOnly,
-            ExpirationTimeEpochMillis(u64::MAX),
-            Some("application/json"),
-            Some(12345),
-            None,
-            None,
-        );
+        let token = authenticator
+            .gen_file_token_cwt(
+                file_hash,
+                doc_id,
+                Authorization::ReadOnly,
+                ExpirationTimeEpochMillis(u64::MAX),
+                Some("application/json"),
+                Some(12345),
+                None,
+                None,
+            )
+            .unwrap();
 
         assert_eq!(detect_token_format(&token), TokenFormat::Cwt);
 
@@ -1556,54 +1679,64 @@ mod tests {
 
     #[test]
     fn test_token_format_detection() {
-        let authenticator = Authenticator::gen_key().unwrap();
+        let legacy_authenticator = Authenticator::gen_key_legacy().unwrap();
+        let cwt_authenticator = Authenticator::gen_key().unwrap();
 
         // Custom token
-        let custom_token = authenticator.gen_doc_token(
-            "doc123",
-            Authorization::Full,
-            ExpirationTimeEpochMillis(0),
-            None,
-        );
+        let custom_token = legacy_authenticator
+            .gen_doc_token(
+                "doc123",
+                Authorization::Full,
+                ExpirationTimeEpochMillis(0),
+                None,
+            )
+            .unwrap();
         assert_eq!(detect_token_format(&custom_token), TokenFormat::Custom);
 
         // CWT token
-        let cwt_token = authenticator.gen_doc_token_cwt(
-            "doc123",
-            Authorization::Full,
-            ExpirationTimeEpochMillis(u64::MAX),
-            None,
-            None,
-        );
+        let cwt_token = cwt_authenticator
+            .gen_doc_token_cwt(
+                "doc123",
+                Authorization::Full,
+                ExpirationTimeEpochMillis(u64::MAX),
+                None,
+                None,
+            )
+            .unwrap();
         assert_eq!(detect_token_format(&cwt_token), TokenFormat::Cwt);
     }
 
     #[test]
     fn test_mixed_token_verification() {
-        let authenticator = Authenticator::gen_key().unwrap();
+        let legacy_authenticator = Authenticator::gen_key_legacy().unwrap();
+        let cwt_authenticator = Authenticator::gen_key().unwrap();
 
         // Custom tokens should work with auto verification
-        let custom_token = authenticator.gen_doc_token(
-            "doc123",
-            Authorization::Full,
-            ExpirationTimeEpochMillis(u64::MAX),
-            None,
-        );
+        let custom_token = legacy_authenticator
+            .gen_doc_token(
+                "doc123",
+                Authorization::Full,
+                ExpirationTimeEpochMillis(u64::MAX),
+                None,
+            )
+            .unwrap();
         assert!(matches!(
-            authenticator.verify_doc_token(&custom_token, "doc123", 0),
+            legacy_authenticator.verify_doc_token(&custom_token, "doc123", 0),
             Ok(Authorization::Full)
         ));
 
         // CWT tokens should work with auto verification
-        let cwt_token = authenticator.gen_doc_token_cwt(
-            "doc123",
-            Authorization::ReadOnly,
-            ExpirationTimeEpochMillis(u64::MAX),
-            None,
-            None,
-        );
+        let cwt_token = cwt_authenticator
+            .gen_doc_token_cwt(
+                "doc123",
+                Authorization::ReadOnly,
+                ExpirationTimeEpochMillis(u64::MAX),
+                None,
+                None,
+            )
+            .unwrap();
         assert!(matches!(
-            authenticator.verify_doc_token(&cwt_token, "doc123", 0),
+            cwt_authenticator.verify_doc_token(&cwt_token, "doc123", 0),
             Ok(Authorization::ReadOnly)
         ));
     }
@@ -1614,13 +1747,15 @@ mod tests {
             .unwrap()
             .with_key_id("test_key".try_into().unwrap());
 
-        let token = authenticator.gen_doc_token_cwt(
-            "doc123",
-            Authorization::Full,
-            ExpirationTimeEpochMillis(u64::MAX),
-            None,
-            None,
-        );
+        let token = authenticator
+            .gen_doc_token_cwt(
+                "doc123",
+                Authorization::Full,
+                ExpirationTimeEpochMillis(u64::MAX),
+                None,
+                None,
+            )
+            .unwrap();
 
         assert!(token.starts_with("test_key."));
         assert_eq!(detect_token_format(&token), TokenFormat::Cwt);
@@ -1637,13 +1772,9 @@ mod tests {
         let authenticator = Authenticator::gen_key().unwrap();
         let short_expiration = ExpirationTimeEpochMillis(1000); // 1 second after epoch
 
-        let token = authenticator.gen_doc_token_cwt(
-            "doc123",
-            Authorization::Full,
-            short_expiration,
-            None,
-            None,
-        );
+        let token = authenticator
+            .gen_doc_token_cwt("doc123", Authorization::Full, short_expiration, None, None)
+            .unwrap();
 
         // Should fail with expired error
         assert!(matches!(
@@ -1657,13 +1788,15 @@ mod tests {
         let authenticator1 = Authenticator::gen_key().unwrap();
         let authenticator2 = Authenticator::gen_key().unwrap();
 
-        let token = authenticator1.gen_doc_token_cwt(
-            "doc123",
-            Authorization::Full,
-            ExpirationTimeEpochMillis(u64::MAX),
-            None,
-            None,
-        );
+        let token = authenticator1
+            .gen_doc_token_cwt(
+                "doc123",
+                Authorization::Full,
+                ExpirationTimeEpochMillis(u64::MAX),
+                None,
+                None,
+            )
+            .unwrap();
 
         // Should fail with signature verification error
         assert!(matches!(
@@ -1674,15 +1807,17 @@ mod tests {
 
     #[test]
     fn test_user_identification_custom_tokens() {
-        let authenticator = Authenticator::gen_key().unwrap();
+        let authenticator = Authenticator::gen_key_legacy().unwrap();
 
         // Test doc token with user
-        let doc_token = authenticator.gen_doc_token(
-            "doc123",
-            Authorization::Full,
-            ExpirationTimeEpochMillis(u64::MAX),
-            Some("user123"),
-        );
+        let doc_token = authenticator
+            .gen_doc_token(
+                "doc123",
+                Authorization::Full,
+                ExpirationTimeEpochMillis(u64::MAX),
+                Some("user123"),
+            )
+            .unwrap();
 
         let user = authenticator.extract_user_from_token(&doc_token).unwrap();
         assert_eq!(user, Some("user123".to_string()));
@@ -1694,15 +1829,17 @@ mod tests {
         assert_eq!(user, Some("user123".to_string()));
 
         // Test file token with user
-        let file_token = authenticator.gen_file_token(
-            "hash123",
-            "doc456",
-            Authorization::ReadOnly,
-            ExpirationTimeEpochMillis(u64::MAX),
-            None,
-            None,
-            Some("user456"),
-        );
+        let file_token = authenticator
+            .gen_file_token(
+                "hash123",
+                "doc456",
+                Authorization::ReadOnly,
+                ExpirationTimeEpochMillis(u64::MAX),
+                None,
+                None,
+                Some("user456"),
+            )
+            .unwrap();
 
         let user = authenticator.extract_user_from_token(&file_token).unwrap();
         assert_eq!(user, Some("user456".to_string()));
@@ -1714,12 +1851,14 @@ mod tests {
         assert_eq!(user, Some("user456".to_string()));
 
         // Test token without user
-        let no_user_token = authenticator.gen_doc_token(
-            "doc789",
-            Authorization::Full,
-            ExpirationTimeEpochMillis(u64::MAX),
-            None,
-        );
+        let no_user_token = authenticator
+            .gen_doc_token(
+                "doc789",
+                Authorization::Full,
+                ExpirationTimeEpochMillis(u64::MAX),
+                None,
+            )
+            .unwrap();
 
         let user = authenticator
             .extract_user_from_token(&no_user_token)
@@ -1732,13 +1871,15 @@ mod tests {
         let authenticator = Authenticator::gen_key().unwrap();
 
         // Test doc token with user
-        let doc_token = authenticator.gen_doc_token_cwt(
-            "doc123",
-            Authorization::Full,
-            ExpirationTimeEpochMillis(u64::MAX),
-            Some("user123"),
-            None,
-        );
+        let doc_token = authenticator
+            .gen_doc_token_cwt(
+                "doc123",
+                Authorization::Full,
+                ExpirationTimeEpochMillis(u64::MAX),
+                Some("user123"),
+                None,
+            )
+            .unwrap();
 
         let user = authenticator.extract_user_from_token(&doc_token).unwrap();
         assert_eq!(user, Some("user123".to_string()));
@@ -1750,16 +1891,18 @@ mod tests {
         assert_eq!(user, Some("user123".to_string()));
 
         // Test file token with user
-        let file_token = authenticator.gen_file_token_cwt(
-            "hash123",
-            "doc456",
-            Authorization::ReadOnly,
-            ExpirationTimeEpochMillis(u64::MAX),
-            Some("application/json"),
-            Some(1024),
-            Some("user456"),
-            None,
-        );
+        let file_token = authenticator
+            .gen_file_token_cwt(
+                "hash123",
+                "doc456",
+                Authorization::ReadOnly,
+                ExpirationTimeEpochMillis(u64::MAX),
+                Some("application/json"),
+                Some(1024),
+                Some("user456"),
+                None,
+            )
+            .unwrap();
 
         let user = authenticator.extract_user_from_token(&file_token).unwrap();
         assert_eq!(user, Some("user456".to_string()));
@@ -1771,13 +1914,15 @@ mod tests {
         assert_eq!(user, Some("user456".to_string()));
 
         // Test token without user
-        let no_user_token = authenticator.gen_doc_token_cwt(
-            "doc789",
-            Authorization::Full,
-            ExpirationTimeEpochMillis(u64::MAX),
-            None,
-            None,
-        );
+        let no_user_token = authenticator
+            .gen_doc_token_cwt(
+                "doc789",
+                Authorization::Full,
+                ExpirationTimeEpochMillis(u64::MAX),
+                None,
+                None,
+            )
+            .unwrap();
 
         let user = authenticator
             .extract_user_from_token(&no_user_token)
@@ -1788,7 +1933,7 @@ mod tests {
     #[test]
     fn test_backward_compatibility_old_tokens() {
         // This test simulates old tokens that were created before the user field was added
-        let authenticator = Authenticator::gen_key().unwrap();
+        let authenticator = Authenticator::gen_key_legacy().unwrap();
 
         // Create an old-style payload manually (without user field)
         let old_payload = LegacyPayload {
@@ -1802,7 +1947,11 @@ mod tests {
         // Encode it the old way
         let mut hash_payload =
             bincode_encode(&old_payload).expect("Bincode serialization should not fail.");
-        hash_payload.extend_from_slice(&authenticator.private_key);
+        let key_bytes = match &authenticator.key_material {
+            AuthKeyMaterial::Legacy(key_bytes) => key_bytes,
+            _ => panic!("Expected legacy key for this test"),
+        };
+        hash_payload.extend_from_slice(key_bytes);
         let token_hash = hash(&hash_payload);
 
         let old_auth_req = LegacyAuthenticatedRequest {
@@ -1839,22 +1988,26 @@ mod tests {
         let channel = "team-updates";
 
         // Test document token with channel claim
-        let token_with_channel = authenticator.gen_doc_token_cwt(
-            doc_id,
-            Authorization::Full,
-            ExpirationTimeEpochMillis(u64::MAX),
-            Some("user123"),
-            Some(channel.to_string()),
-        );
+        let token_with_channel = authenticator
+            .gen_doc_token_cwt(
+                doc_id,
+                Authorization::Full,
+                ExpirationTimeEpochMillis(u64::MAX),
+                Some("user123"),
+                Some(channel.to_string()),
+            )
+            .unwrap();
 
         // Test document token without channel claim
-        let token_without_channel = authenticator.gen_doc_token_cwt(
-            doc_id,
-            Authorization::Full,
-            ExpirationTimeEpochMillis(u64::MAX),
-            Some("user123"),
-            None,
-        );
+        let token_without_channel = authenticator
+            .gen_doc_token_cwt(
+                doc_id,
+                Authorization::Full,
+                ExpirationTimeEpochMillis(u64::MAX),
+                Some("user123"),
+                None,
+            )
+            .unwrap();
 
         // Verify token with channel returns the channel
         let (permission, extracted_channel) = authenticator
@@ -1887,16 +2040,18 @@ mod tests {
         assert_eq!(extracted_channel, None);
 
         // Test file token with channel claim
-        let file_token_with_channel = authenticator.gen_file_token_cwt(
-            "file_hash_123",
-            doc_id,
-            Authorization::ReadOnly,
-            ExpirationTimeEpochMillis(u64::MAX),
-            Some("application/json"),
-            Some(1024),
-            Some("user456"),
-            Some(channel.to_string()),
-        );
+        let file_token_with_channel = authenticator
+            .gen_file_token_cwt(
+                "file_hash_123",
+                doc_id,
+                Authorization::ReadOnly,
+                ExpirationTimeEpochMillis(u64::MAX),
+                Some("application/json"),
+                Some(1024),
+                Some("user456"),
+                Some(channel.to_string()),
+            )
+            .unwrap();
 
         let (permission, extracted_channel) = authenticator
             .verify_token_with_channel(&file_token_with_channel, 0)
@@ -1915,38 +2070,45 @@ mod tests {
 
     #[test]
     fn test_user_identification_mixed_tokens() {
-        let authenticator = Authenticator::gen_key().unwrap();
+        let legacy_authenticator = Authenticator::gen_key_legacy().unwrap();
+        let cwt_authenticator = Authenticator::gen_key().unwrap();
 
         // Create custom and CWT tokens for the same resource but different users
-        let custom_token = authenticator.gen_doc_token(
-            "doc123",
-            Authorization::Full,
-            ExpirationTimeEpochMillis(u64::MAX),
-            Some("custom_user"),
-        );
+        let custom_token = legacy_authenticator
+            .gen_doc_token(
+                "doc123",
+                Authorization::Full,
+                ExpirationTimeEpochMillis(u64::MAX),
+                Some("custom_user"),
+            )
+            .unwrap();
 
-        let cwt_token = authenticator.gen_doc_token_cwt(
-            "doc123",
-            Authorization::ReadOnly,
-            ExpirationTimeEpochMillis(u64::MAX),
-            Some("cwt_user"),
-            None,
-        );
+        let cwt_token = cwt_authenticator
+            .gen_doc_token_cwt(
+                "doc123",
+                Authorization::ReadOnly,
+                ExpirationTimeEpochMillis(u64::MAX),
+                Some("cwt_user"),
+                None,
+            )
+            .unwrap();
 
         // Verify both can extract users correctly
-        let custom_user = authenticator
+        let custom_user = legacy_authenticator
             .extract_user_from_token(&custom_token)
             .unwrap();
-        let cwt_user = authenticator.extract_user_from_token(&cwt_token).unwrap();
+        let cwt_user = cwt_authenticator
+            .extract_user_from_token(&cwt_token)
+            .unwrap();
 
         assert_eq!(custom_user, Some("custom_user".to_string()));
         assert_eq!(cwt_user, Some("cwt_user".to_string()));
 
         // Verify authorization and user extraction work together
-        let (auth1, user1) = authenticator
+        let (auth1, user1) = legacy_authenticator
             .verify_doc_token_with_user(&custom_token, "doc123", 0)
             .unwrap();
-        let (auth2, user2) = authenticator
+        let (auth2, user2) = cwt_authenticator
             .verify_doc_token_with_user(&cwt_token, "doc123", 0)
             .unwrap();
 
@@ -2004,32 +2166,37 @@ mod tests {
 
     #[test]
     fn test_prefix_token_generation_and_verification() {
-        let authenticator = Authenticator::gen_key().unwrap();
+        let legacy_authenticator = Authenticator::gen_key_legacy().unwrap();
+        let cwt_authenticator = Authenticator::gen_key().unwrap();
 
         // Test custom format prefix tokens
-        let custom_token = authenticator.gen_prefix_token(
-            "org123-",
-            Authorization::Full,
-            ExpirationTimeEpochMillis(u64::MAX),
-            Some("admin@org123.com"),
-        );
+        let custom_token = legacy_authenticator
+            .gen_prefix_token(
+                "org123-",
+                Authorization::Full,
+                ExpirationTimeEpochMillis(u64::MAX),
+                Some("admin@org123.com"),
+            )
+            .unwrap();
 
         // Test CWT format prefix tokens
-        let cwt_token = authenticator.gen_prefix_token_cwt(
-            "user456-",
-            Authorization::ReadOnly,
-            ExpirationTimeEpochMillis(u64::MAX),
-            Some("user456"),
-        );
+        let cwt_token = cwt_authenticator
+            .gen_prefix_token_cwt(
+                "user456-",
+                Authorization::ReadOnly,
+                ExpirationTimeEpochMillis(u64::MAX),
+                Some("user456"),
+            )
+            .unwrap();
 
         // Verify that prefix tokens work with matching document IDs
-        let (auth1, user1) = authenticator
+        let (auth1, user1) = legacy_authenticator
             .verify_doc_token_with_prefix(&custom_token, "org123-project-alpha", 0)
             .unwrap();
         assert_eq!(auth1, Authorization::Full);
         assert_eq!(user1, Some("admin@org123.com".to_string()));
 
-        let (auth2, user2) = authenticator
+        let (auth2, user2) = cwt_authenticator
             .verify_doc_token_with_prefix(&cwt_token, "user456-personal-doc", 0)
             .unwrap();
         assert_eq!(auth2, Authorization::ReadOnly);
@@ -2038,14 +2205,16 @@ mod tests {
 
     #[test]
     fn test_prefix_token_matching_logic() {
-        let authenticator = Authenticator::gen_key().unwrap();
+        let authenticator = Authenticator::gen_key_legacy().unwrap();
 
-        let prefix_token = authenticator.gen_prefix_token(
-            "org123-",
-            Authorization::Full,
-            ExpirationTimeEpochMillis(u64::MAX),
-            None,
-        );
+        let prefix_token = authenticator
+            .gen_prefix_token(
+                "org123-",
+                Authorization::Full,
+                ExpirationTimeEpochMillis(u64::MAX),
+                None,
+            )
+            .unwrap();
 
         // Should match documents with the prefix
         assert!(authenticator
@@ -2075,12 +2244,14 @@ mod tests {
         let authenticator = Authenticator::gen_key().unwrap();
 
         // Empty prefix should match any document (server-like behavior but with user tracking)
-        let empty_prefix_token = authenticator.gen_prefix_token_cwt(
-            "",
-            Authorization::Full,
-            ExpirationTimeEpochMillis(u64::MAX),
-            Some("superuser"),
-        );
+        let empty_prefix_token = authenticator
+            .gen_prefix_token_cwt(
+                "",
+                Authorization::Full,
+                ExpirationTimeEpochMillis(u64::MAX),
+                Some("superuser"),
+            )
+            .unwrap();
 
         let (auth, user) = authenticator
             .verify_doc_token_with_prefix(&empty_prefix_token, "any-doc-id", 0)
@@ -2097,41 +2268,50 @@ mod tests {
 
     #[test]
     fn test_prefix_token_user_extraction() {
-        let authenticator = Authenticator::gen_key().unwrap();
+        let legacy_authenticator = Authenticator::gen_key_legacy().unwrap();
+        let cwt_authenticator = Authenticator::gen_key().unwrap();
 
         // Test custom format prefix token user extraction
-        let custom_token = authenticator.gen_prefix_token(
-            "test-",
-            Authorization::ReadOnly,
-            ExpirationTimeEpochMillis(u64::MAX),
-            Some("test_user"),
-        );
+        let custom_token = legacy_authenticator
+            .gen_prefix_token(
+                "test-",
+                Authorization::ReadOnly,
+                ExpirationTimeEpochMillis(u64::MAX),
+                Some("test_user"),
+            )
+            .unwrap();
 
-        let user = authenticator
+        let user = legacy_authenticator
             .extract_user_from_token(&custom_token)
             .unwrap();
         assert_eq!(user, Some("test_user".to_string()));
 
         // Test CWT format prefix token user extraction
-        let cwt_token = authenticator.gen_prefix_token_cwt(
-            "cwt-",
-            Authorization::Full,
-            ExpirationTimeEpochMillis(u64::MAX),
-            Some("cwt_user"),
-        );
+        let cwt_token = cwt_authenticator
+            .gen_prefix_token_cwt(
+                "cwt-",
+                Authorization::Full,
+                ExpirationTimeEpochMillis(u64::MAX),
+                Some("cwt_user"),
+            )
+            .unwrap();
 
-        let cwt_user = authenticator.extract_user_from_token(&cwt_token).unwrap();
+        let cwt_user = cwt_authenticator
+            .extract_user_from_token(&cwt_token)
+            .unwrap();
         assert_eq!(cwt_user, Some("cwt_user".to_string()));
 
         // Test token without user
-        let no_user_token = authenticator.gen_prefix_token(
-            "public-",
-            Authorization::ReadOnly,
-            ExpirationTimeEpochMillis(u64::MAX),
-            None,
-        );
+        let no_user_token = legacy_authenticator
+            .gen_prefix_token(
+                "public-",
+                Authorization::ReadOnly,
+                ExpirationTimeEpochMillis(u64::MAX),
+                None,
+            )
+            .unwrap();
 
-        let no_user = authenticator
+        let no_user = legacy_authenticator
             .extract_user_from_token(&no_user_token)
             .unwrap();
         assert_eq!(no_user, None);
@@ -2139,15 +2319,17 @@ mod tests {
 
     #[test]
     fn test_prefix_token_with_direct_doc_token_fallback() {
-        let authenticator = Authenticator::gen_key().unwrap();
+        let authenticator = Authenticator::gen_key_legacy().unwrap();
 
         // Create a direct document token
-        let doc_token = authenticator.gen_doc_token(
-            "org123-project-alpha",
-            Authorization::Full,
-            ExpirationTimeEpochMillis(u64::MAX),
-            Some("doc_user"),
-        );
+        let doc_token = authenticator
+            .gen_doc_token(
+                "org123-project-alpha",
+                Authorization::Full,
+                ExpirationTimeEpochMillis(u64::MAX),
+                Some("doc_user"),
+            )
+            .unwrap();
 
         // verify_doc_token_with_prefix should work with direct tokens too
         let (auth, user) = authenticator
@@ -2166,12 +2348,14 @@ mod tests {
     fn test_prefix_token_file_operations() {
         let authenticator = Authenticator::gen_key().unwrap();
 
-        let prefix_token = authenticator.gen_prefix_token_cwt(
-            "project-",
-            Authorization::Full,
-            ExpirationTimeEpochMillis(u64::MAX),
-            Some("project_admin"),
-        );
+        let prefix_token = authenticator
+            .gen_prefix_token_cwt(
+                "project-",
+                Authorization::Full,
+                ExpirationTimeEpochMillis(u64::MAX),
+                Some("project_admin"),
+            )
+            .unwrap();
 
         // Prefix tokens should work for file operations within their prefix
         let auth = authenticator
@@ -2187,15 +2371,17 @@ mod tests {
 
     #[test]
     fn test_prefix_token_expiration() {
-        let authenticator = Authenticator::gen_key().unwrap();
+        let authenticator = Authenticator::gen_key_legacy().unwrap();
 
         // Create an expired prefix token
-        let expired_token = authenticator.gen_prefix_token(
-            "temp-",
-            Authorization::ReadOnly,
-            ExpirationTimeEpochMillis(1000), // Very old timestamp
-            Some("temp_user"),
-        );
+        let expired_token = authenticator
+            .gen_prefix_token(
+                "temp-",
+                Authorization::ReadOnly,
+                ExpirationTimeEpochMillis(1000), // Very old timestamp
+                Some("temp_user"),
+            )
+            .unwrap();
 
         // Should fail due to expiration
         let current_time = std::time::SystemTime::now()

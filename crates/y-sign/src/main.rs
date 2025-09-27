@@ -64,7 +64,7 @@ async fn sign_stdin(auth: &Authenticator) -> Result<()> {
             let doc_id =
                 doc_id.ok_or_else(|| anyhow::anyhow!("docId is required for document tokens"))?;
 
-            let token = auth.gen_doc_token(doc_id, authorization, expiration, None);
+            let token = auth.gen_doc_token(doc_id, authorization, expiration, None)?;
 
             output.insert(
                 "docId".to_string(),
@@ -100,7 +100,7 @@ async fn sign_stdin(auth: &Authenticator) -> Result<()> {
                 content_type,
                 content_length,
                 None,
-            );
+            )?;
 
             output.insert(
                 "fileHash".to_string(),
@@ -143,7 +143,7 @@ async fn sign_stdin(auth: &Authenticator) -> Result<()> {
             // For server tokens, we don't need doc_id or file_hash
             // We also don't use the authorization parameter since server tokens always have full access
 
-            let token = auth.server_token();
+            let token = auth.server_token()?;
 
             output.insert("token".to_string(), serde_json::Value::String(token));
             output.insert(
@@ -166,7 +166,7 @@ async fn sign_stdin(auth: &Authenticator) -> Result<()> {
             let user = input.get("user").and_then(|v| v.as_str());
 
             // Generate CWT prefix token
-            let token = auth.gen_prefix_token_cwt(prefix, authorization, expiration, user);
+            let token = auth.gen_prefix_token_cwt(prefix, authorization, expiration, user)?;
 
             output.insert("token".to_string(), serde_json::Value::String(token));
             output.insert(
@@ -811,7 +811,7 @@ mod tests {
         let authenticator = Authenticator::new("dGVzdGtleXRlc3RrZXk=").unwrap();
 
         // Generate a server token
-        let token = authenticator.server_token();
+        let token = authenticator.server_token().unwrap();
 
         // Create a mock context that simulates the sign_stdin and verify_stdin functions
         // without actually redirecting stdin/stdout
@@ -891,22 +891,25 @@ mod tests {
     // Test file token verification with hash
     #[tokio::test]
     async fn test_verify_file_token_with_hash() {
-        let authenticator = Authenticator::new("dGVzdGtleXRlc3RrZXk=").unwrap();
+        let authenticator = Authenticator::gen_key_ecdsa().unwrap();
         let file_hash = "test123";
         let doc_id = "doc123";
         let content_type = "text/plain";
         let content_length = 1024;
 
         // Generate a file token
-        let token = authenticator.gen_file_token(
-            file_hash,
-            doc_id,
-            Authorization::Full,
-            ExpirationTimeEpochMillis(u64::MAX), // Never expires for testing
-            Some(content_type),
-            Some(content_length),
-            None,
-        );
+        let token = authenticator
+            .gen_file_token_cwt(
+                file_hash,
+                doc_id,
+                Authorization::Full,
+                ExpirationTimeEpochMillis(u64::MAX), // Never expires for testing
+                Some(content_type),
+                Some(content_length),
+                None,
+                None, // channel
+            )
+            .unwrap();
 
         // Create a mock context that simulates the verify_stdin function's behavior
         // without actually redirecting stdin/stdout
@@ -965,22 +968,25 @@ mod tests {
     // Test file token verification without hash
     #[tokio::test]
     async fn test_verify_file_token_without_hash() {
-        let authenticator = Authenticator::new("dGVzdGtleXRlc3RrZXk=").unwrap();
+        let authenticator = Authenticator::gen_key_ecdsa().unwrap();
         let file_hash = "test123";
         let doc_id = "doc123";
         let content_type = "text/plain";
         let content_length = 1024;
 
         // Generate a file token
-        let token = authenticator.gen_file_token(
-            file_hash,
-            doc_id,
-            Authorization::Full,
-            ExpirationTimeEpochMillis(u64::MAX), // Never expires for testing
-            Some(content_type),
-            Some(content_length),
-            None,
-        );
+        let token = authenticator
+            .gen_file_token_cwt(
+                file_hash,
+                doc_id,
+                Authorization::Full,
+                ExpirationTimeEpochMillis(u64::MAX), // Never expires for testing
+                Some(content_type),
+                Some(content_length),
+                None,
+                None, // channel
+            )
+            .unwrap();
 
         // Simulate the verification JSON output without providing a file hash
         let verify_result = {
@@ -1053,7 +1059,7 @@ mod tests {
         let authenticator = Authenticator::new("dGVzdGtleXRlc3RrZXk=").unwrap();
 
         // Generate a server token
-        let token = authenticator.server_token();
+        let token = authenticator.server_token().unwrap();
 
         // Simulate verification output
         let verify_result = {
