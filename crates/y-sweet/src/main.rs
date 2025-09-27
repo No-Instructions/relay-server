@@ -615,18 +615,45 @@ async fn main() -> Result<()> {
             };
 
             if *json {
+                let server_token = auth.server_token()?;
                 let mut result = json!({
-                    "private_key": auth.private_key(),
-                    "server_token": auth.server_token(),
+                    "server_token": server_token,
                 });
 
-                // For ES256, also include public key
-                if matches!(key_type, KeyType::Es256) {
-                    if let Ok(public_key) = generate_public_key_from_private(&auth.private_key()) {
+                match auth.key_material() {
+                    y_sweet_core::auth::AuthKeyMaterial::Legacy(key_bytes) => {
+                        result.as_object_mut().unwrap().insert(
+                            "private_key".to_string(),
+                            json!(y_sweet_core::auth::b64_encode(key_bytes)),
+                        );
+                    }
+                    y_sweet_core::auth::AuthKeyMaterial::Hmac256(key_bytes) => {
+                        result.as_object_mut().unwrap().insert(
+                            "private_key".to_string(),
+                            json!(y_sweet_core::auth::b64_encode(key_bytes)),
+                        );
+                    }
+                    y_sweet_core::auth::AuthKeyMaterial::EcdsaP256Private(key_bytes) => {
+                        let private_key_b64 = y_sweet_core::auth::b64_encode(key_bytes);
                         result
                             .as_object_mut()
                             .unwrap()
-                            .insert("public_key".to_string(), json!(public_key));
+                            .insert("private_key".to_string(), json!(private_key_b64));
+
+                        // Also generate and include public key
+                        if let Ok(public_key) = generate_public_key_from_private(&private_key_b64) {
+                            result
+                                .as_object_mut()
+                                .unwrap()
+                                .insert("public_key".to_string(), json!(public_key));
+                        }
+                    }
+                    y_sweet_core::auth::AuthKeyMaterial::EcdsaP256Public(key_bytes) => {
+                        result.as_object_mut().unwrap().insert(
+                            "public_key".to_string(),
+                            json!(y_sweet_core::auth::b64_encode(key_bytes)),
+                        );
+                        // No private_key field for public keys!
                     }
                 }
 
@@ -634,13 +661,21 @@ async fn main() -> Result<()> {
             } else {
                 print_auth_message(&auth);
 
-                // For ES256, also print public key
-                if matches!(key_type, KeyType::Es256) {
-                    if let Ok(public_key) = generate_public_key_from_private(&auth.private_key()) {
-                        println!("Public key for ES256:");
-                        println!("   {}", public_key);
+                // Print additional info based on key type
+                match auth.key_material() {
+                    y_sweet_core::auth::AuthKeyMaterial::EcdsaP256Private(key_bytes) => {
+                        let private_key_b64 = y_sweet_core::auth::b64_encode(key_bytes);
+                        if let Ok(public_key) = generate_public_key_from_private(&private_key_b64) {
+                            println!("Public key for ES256:");
+                            println!("   {}", public_key);
+                            println!();
+                        }
+                    }
+                    y_sweet_core::auth::AuthKeyMaterial::EcdsaP256Public(_) => {
+                        println!("Note: This is a public key - it can only verify tokens, not create them.");
                         println!();
                     }
+                    _ => {}
                 }
             }
         }

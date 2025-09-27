@@ -2,8 +2,8 @@ use crate::api_types::Authorization;
 use crate::auth::{DocPermission, FilePermission, Permission, PrefixPermission};
 use ciborium;
 use coset::{CborSerializable, CoseMac0Builder, CoseSign1Builder, HeaderBuilder};
-use ecdsa::{Signature, SigningKey};
-use p256::SecretKey;
+use ecdsa::{Signature, SigningKey, VerifyingKey};
+use p256::{PublicKey, SecretKey};
 use thiserror::Error;
 
 #[derive(Error, Debug, PartialEq, Eq)]
@@ -40,12 +40,22 @@ pub struct CwtAuthenticator {
 
 enum KeyMaterial {
     Symmetric(Vec<u8>),
-    EcdsaP256(SigningKey<p256::NistP256>),
+    EcdsaP256Private(SigningKey<p256::NistP256>),
+    EcdsaP256Public(VerifyingKey<p256::NistP256>),
 }
 
 impl CwtAuthenticator {
     pub fn new(private_key: &[u8], key_id: Option<String>) -> Result<Self, CwtError> {
         let key_material = Self::parse_key_material(private_key)?;
+        Ok(Self {
+            key_material,
+            key_id,
+        })
+    }
+
+    /// Creates a new CwtAuthenticator from a key string (supports PEM and base64)
+    pub fn new_from_string(key_str: &str, key_id: Option<String>) -> Result<Self, CwtError> {
+        let key_material = Self::parse_key_from_string(key_str)?;
         Ok(Self {
             key_material,
             key_id,
@@ -69,7 +79,21 @@ impl CwtAuthenticator {
             SecretKey::from_slice(private_key_bytes).map_err(|_| CwtError::InvalidCose)?; // TODO: Add proper error type
         let signing_key = SigningKey::from(secret_key);
         Ok(Self {
-            key_material: KeyMaterial::EcdsaP256(signing_key),
+            key_material: KeyMaterial::EcdsaP256Private(signing_key),
+            key_id,
+        })
+    }
+
+    /// Creates a new CwtAuthenticator with an ECDSA P-256 public key
+    pub fn new_ecdsa_p256_public(
+        public_key_bytes: &[u8],
+        key_id: Option<String>,
+    ) -> Result<Self, CwtError> {
+        let public_key =
+            PublicKey::from_sec1_bytes(public_key_bytes).map_err(|_| CwtError::InvalidCose)?;
+        let verifying_key = VerifyingKey::from(public_key);
+        Ok(Self {
+            key_material: KeyMaterial::EcdsaP256Public(verifying_key),
             key_id,
         })
     }
@@ -87,15 +111,93 @@ impl CwtAuthenticator {
         Ok(KeyMaterial::Symmetric(key_bytes.to_vec()))
     }
 
+    /// Parse key material from a string (supports PEM and base64)
+    fn parse_key_from_string(key_str: &str) -> Result<KeyMaterial, CwtError> {
+        let trimmed = key_str.trim();
+
+        if trimmed.starts_with("-----BEGIN") && trimmed.contains("-----END") {
+            // PEM format - determine key type from header
+            if trimmed.contains("-----BEGIN PUBLIC KEY-----") {
+                // ECDSA public key in PEM format
+                let key_bytes = Self::extract_pem_content(trimmed)?;
+                let public_key = PublicKey::from_sec1_bytes(&key_bytes).map_err(|e| {
+                    tracing::error!("Failed to parse ECDSA public key: {}", e);
+                    CwtError::InvalidCose
+                })?;
+                let verifying_key = VerifyingKey::from(public_key);
+                tracing::info!("Parsed PEM ECDSA P-256 public key");
+                Ok(KeyMaterial::EcdsaP256Public(verifying_key))
+            } else if trimmed.contains("-----BEGIN PRIVATE KEY-----")
+                || trimmed.contains("-----BEGIN EC PRIVATE KEY-----")
+            {
+                // ECDSA private key in PEM format
+                let key_bytes = Self::extract_pem_content(trimmed)?;
+                let secret_key = SecretKey::from_slice(&key_bytes).map_err(|e| {
+                    tracing::error!("Failed to parse ECDSA private key: {}", e);
+                    CwtError::InvalidCose
+                })?;
+                let signing_key = SigningKey::from(secret_key);
+                tracing::info!("Parsed PEM ECDSA P-256 private key");
+                Ok(KeyMaterial::EcdsaP256Private(signing_key))
+            } else {
+                tracing::error!("Unsupported PEM key type");
+                Err(CwtError::InvalidCose)
+            }
+        } else {
+            // Assume raw base64 - default to symmetric
+            use crate::auth::b64_decode;
+            let key_bytes = b64_decode(trimmed).map_err(|_| CwtError::InvalidCose)?;
+            tracing::debug!(
+                "Using {}-byte base64 key as symmetric (default for auto-detection)",
+                key_bytes.len()
+            );
+            Ok(KeyMaterial::Symmetric(key_bytes))
+        }
+    }
+
+    /// Extract base64 content from PEM format
+    fn extract_pem_content(pem_str: &str) -> Result<Vec<u8>, CwtError> {
+        let lines: Vec<&str> = pem_str.lines().collect();
+        let mut base64_content = String::new();
+
+        let mut in_content = false;
+        for line in lines {
+            let line = line.trim();
+            if line.starts_with("-----BEGIN") {
+                in_content = true;
+                continue;
+            }
+            if line.starts_with("-----END") {
+                break;
+            }
+            if in_content && !line.is_empty() {
+                base64_content.push_str(line);
+            }
+        }
+
+        if base64_content.is_empty() {
+            return Err(CwtError::InvalidCose);
+        }
+
+        use crate::auth::b64_decode;
+        b64_decode(&base64_content).map_err(|_| CwtError::InvalidCose)
+    }
+
     pub fn create_cwt(&self, claims: CwtClaims) -> Result<Vec<u8>, CwtError> {
         let cose_bytes = match &self.key_material {
             KeyMaterial::Symmetric(_) => {
                 tracing::debug!("Creating COSE_Mac0 token with symmetric key");
                 self.create_cwt_mac0(claims)?
             }
-            KeyMaterial::EcdsaP256(_) => {
-                tracing::debug!("Creating COSE_Sign1 token with ECDSA P-256 key");
+            KeyMaterial::EcdsaP256Private(_) => {
+                tracing::debug!("Creating COSE_Sign1 token with ECDSA P-256 private key");
                 self.create_cwt_sign1(claims)?
+            }
+            KeyMaterial::EcdsaP256Public(_) => {
+                tracing::error!(
+                    "Cannot create tokens with public key - need private key for signing"
+                );
+                return Err(CwtError::InvalidCose);
             }
         };
 
@@ -121,7 +223,8 @@ impl CwtAuthenticator {
 
         let algorithm = match &self.key_material {
             KeyMaterial::Symmetric(_) => coset::iana::Algorithm::HMAC_256_256, // Fallback for symmetric
-            KeyMaterial::EcdsaP256(_) => coset::iana::Algorithm::ES256, // ES256 for ECDSA P-256
+            KeyMaterial::EcdsaP256Private(_) => coset::iana::Algorithm::ES256, // ES256 for ECDSA P-256
+            KeyMaterial::EcdsaP256Public(_) => coset::iana::Algorithm::ES256, // ES256 for ECDSA P-256
         };
 
         let mut protected = HeaderBuilder::new().algorithm(algorithm);
@@ -292,7 +395,7 @@ impl CwtAuthenticator {
                                     return Err(CwtError::InvalidCose);
                                 }
                             }
-                            KeyMaterial::EcdsaP256(_) => {
+                            KeyMaterial::EcdsaP256Private(_) | KeyMaterial::EcdsaP256Public(_) => {
                                 tracing::error!(
                                     "COSE_Mac0 requires symmetric key, but ECDSA key provided"
                                 );
@@ -304,7 +407,7 @@ impl CwtAuthenticator {
                         // COSE_Sign1
                         tracing::debug!("Found COSE_Sign1 tag (18)");
                         match &self.key_material {
-                            KeyMaterial::EcdsaP256(_) => {
+                            KeyMaterial::EcdsaP256Private(_) | KeyMaterial::EcdsaP256Public(_) => {
                                 tracing::debug!("Using ECDSA key for COSE_Sign1 verification");
 
                                 // Extract the inner array from the tag and re-encode it
@@ -348,7 +451,9 @@ impl CwtAuthenticator {
 
                 match &self.key_material {
                     KeyMaterial::Symmetric(_) => self.verify_cwt_mac0(&cose_bytes),
-                    KeyMaterial::EcdsaP256(_) => self.verify_cwt_sign1(&cose_bytes),
+                    KeyMaterial::EcdsaP256Private(_) | KeyMaterial::EcdsaP256Public(_) => {
+                        self.verify_cwt_sign1(&cose_bytes)
+                    }
                 }
             }
             _ => {
@@ -377,11 +482,27 @@ impl CwtAuthenticator {
                         Err(CwtError::HmacVerificationFailed)
                     }
                 }
-                KeyMaterial::EcdsaP256(signing_key) => {
-                    // ECDSA verification for EC keys
+                KeyMaterial::EcdsaP256Private(signing_key) => {
+                    // ECDSA verification using private key's verifying key
                     use ecdsa::signature::Verifier;
 
                     let verifying_key = signing_key.verifying_key();
+                    let signature_obj = match Signature::<p256::NistP256>::from_slice(signature) {
+                        Ok(sig) => sig,
+                        Err(_) => {
+                            return Err(CwtError::HmacVerificationFailed);
+                        }
+                    };
+
+                    match verifying_key.verify(data, &signature_obj) {
+                        Ok(()) => Ok(()),
+                        Err(_) => Err(CwtError::HmacVerificationFailed),
+                    }
+                }
+                KeyMaterial::EcdsaP256Public(verifying_key) => {
+                    // ECDSA verification using public key directly
+                    use ecdsa::signature::Verifier;
+
                     let signature_obj = match Signature::<p256::NistP256>::from_slice(signature) {
                         Ok(sig) => sig,
                         Err(_) => {
@@ -593,11 +714,15 @@ impl CwtAuthenticator {
                 hasher.update(private_key);
                 hasher.finalize().to_vec()
             }
-            KeyMaterial::EcdsaP256(signing_key) => {
+            KeyMaterial::EcdsaP256Private(signing_key) => {
                 // Real ECDSA signing
                 use ecdsa::signature::Signer;
                 let signature: Signature<p256::NistP256> = signing_key.sign(data);
                 signature.to_bytes().to_vec()
+            }
+            KeyMaterial::EcdsaP256Public(_) => {
+                // Cannot sign with public key
+                panic!("Cannot sign with public key - this should be caught earlier")
             }
         }
     }
@@ -606,7 +731,7 @@ impl CwtAuthenticator {
         // This method should only be called for symmetric keys
         let private_key = match &self.key_material {
             KeyMaterial::Symmetric(key) => key,
-            KeyMaterial::EcdsaP256(_) => {
+            KeyMaterial::EcdsaP256Private(_) | KeyMaterial::EcdsaP256Public(_) => {
                 tracing::error!(
                     "create_mac_tag_with_alg called with EC key - this should not happen"
                 );

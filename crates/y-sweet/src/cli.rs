@@ -14,7 +14,9 @@ pub fn print_server_url(auth: Option<&Authenticator>, url_prefix: Option<&Url>, 
     };
 
     if let Some(auth) = auth {
-        url.set_username(&auth.server_token()).unwrap();
+        if let Ok(server_token) = auth.server_token() {
+            url.set_username(&server_token).unwrap();
+        }
     }
 
     let token = url.to_string();
@@ -56,14 +58,34 @@ pub fn print_server_url(auth: Option<&Authenticator>, url_prefix: Option<&Url>, 
 }
 
 pub fn print_auth_message(auth: &Authenticator) {
-    println!("Run y-sweet with the following option to enable authentication:");
-    println!();
-    println!(
-        "   {} {} {}",
-        "y-sweet serve".bright_black(),
-        "--auth".bright_white().bold(),
-        auth.private_key().bright_blue().bold()
-    );
+    match auth.key_material() {
+        y_sweet_core::auth::AuthKeyMaterial::EcdsaP256Public(_) => {
+            println!("Run y-sweet with the following option to enable authentication (verification-only mode):");
+            println!();
+            println!(
+                "   {} {} {}",
+                "y-sweet serve".bright_black(),
+                "--auth".bright_white().bold(),
+                auth.key_material().to_base64().bright_blue().bold()
+            );
+            println!();
+            println!(
+                "   {}",
+                "Note: This is a public key - server will verify tokens but cannot create them."
+                    .bright_yellow()
+            );
+        }
+        _ => {
+            println!("Run y-sweet with the following option to enable authentication:");
+            println!();
+            println!(
+                "   {} {} {}",
+                "y-sweet serve".bright_black(),
+                "--auth".bright_white().bold(),
+                auth.key_material().to_base64().bright_blue().bold()
+            );
+        }
+    }
     println!();
 }
 #[derive(Deserialize)]
@@ -158,7 +180,7 @@ pub async fn sign_stdin(auth: &Authenticator) -> anyhow::Result<()> {
                 .doc_id
                 .ok_or_else(|| anyhow::anyhow!("docId is required for document tokens"))?;
 
-            let token = auth.gen_doc_token(&doc_id, authorization.clone(), expiration, None);
+            let token = auth.gen_doc_token(&doc_id, authorization.clone(), expiration, None)?;
 
             let (url, base_url) = if let Ok(prefix_url) = std::env::var("RELAY_SERVER_PREFIX_URL") {
                 let prefix_url = Url::parse(&prefix_url)?;
@@ -213,7 +235,7 @@ pub async fn sign_stdin(auth: &Authenticator) -> anyhow::Result<()> {
                 None,
                 None,
                 None,
-            );
+            )?;
 
             // For files, we don't generate URLs since they are accessed through the file endpoints
             let output = SignOutput {
