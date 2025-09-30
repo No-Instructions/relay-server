@@ -32,6 +32,8 @@ pub struct Config {
 
     #[serde(default)]
     pub logging: LoggingConfig,
+
+    pub metrics: Option<MetricsConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -41,9 +43,6 @@ pub struct ServerConfig {
 
     #[serde(default = "default_port")]
     pub port: u16,
-
-    #[serde(default = "default_metrics_port")]
-    pub metrics_port: u16,
 
     pub url_prefix: Option<String>,
 
@@ -64,6 +63,12 @@ pub struct ServerConfig {
 pub struct AllowedHost {
     pub host: String,
     pub scheme: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MetricsConfig {
+    #[serde(default = "default_metrics_port")]
+    pub port: u16,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -257,7 +262,6 @@ impl Default for ServerConfig {
         Self {
             host: default_host(),
             port: default_port(),
-            metrics_port: default_metrics_port(),
             url_prefix: None,
             allowed_hosts: Vec::new(),
             checkpoint_freq_seconds: default_checkpoint_freq_seconds(),
@@ -406,13 +410,18 @@ impl Config {
         }
 
         if let Ok(metrics_port) = env::var("METRICS_PORT") {
-            tracing::info!(
-                "Config override: server.metrics_port = {} (from METRICS_PORT)",
-                metrics_port
-            );
-            self.server.metrics_port = metrics_port
+            let port: u16 = metrics_port
                 .parse()
-                .map_err(|_| ConfigError::InvalidPort(metrics_port))?;
+                .map_err(|_| ConfigError::InvalidPort(metrics_port.clone()))?;
+            tracing::info!(
+                "Config override: metrics.port = {} (from METRICS_PORT)",
+                port
+            );
+            if self.metrics.is_none() {
+                self.metrics = Some(MetricsConfig { port });
+            } else if let Some(ref mut metrics) = self.metrics {
+                metrics.port = port;
+            }
         }
 
         if let Ok(url_prefix) = env::var("RELAY_SERVER_URL") {
@@ -606,16 +615,18 @@ impl Config {
             ));
         }
 
-        if self.server.metrics_port == 0 {
-            return Err(ConfigError::InvalidConfiguration(
-                "Metrics port cannot be 0".to_string(),
-            ));
-        }
+        if let Some(ref metrics_config) = self.metrics {
+            if metrics_config.port == 0 {
+                return Err(ConfigError::InvalidConfiguration(
+                    "Metrics port cannot be 0".to_string(),
+                ));
+            }
 
-        if self.server.port == self.server.metrics_port {
-            return Err(ConfigError::InvalidConfiguration(
-                "Server port and metrics port cannot be the same".to_string(),
-            ));
+            if self.server.port == metrics_config.port {
+                return Err(ConfigError::InvalidConfiguration(
+                    "Server port and metrics port cannot be the same".to_string(),
+                ));
+            }
         }
 
         // Validate URL prefix if present
@@ -769,6 +780,7 @@ impl Default for Config {
             store: StoreConfig::default(),
             webhooks: Vec::new(),
             logging: LoggingConfig::default(),
+            metrics: None,
         }
     }
 }

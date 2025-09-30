@@ -70,8 +70,8 @@ enum ServSubcommand {
         port: u16,
         #[clap(long, env = "RELAY_SERVER_HOST")]
         host: Option<IpAddr>,
-        #[clap(long, default_value = "9090", env = "METRICS_PORT")]
-        metrics_port: u16,
+        #[clap(long, env = "METRICS_PORT")]
+        metrics_port: Option<u16>,
         #[clap(
             long,
             default_value = "10",
@@ -171,7 +171,7 @@ fn load_config_for_serve_args(
     store: &Option<String>,
     port: u16,
     host: &Option<IpAddr>,
-    metrics_port: u16,
+    metrics_port: &Option<u16>,
     checkpoint_freq_seconds: u64,
     auth: &Option<String>,
     url_prefix: &Option<Url>,
@@ -218,8 +218,12 @@ fn load_config_for_serve_args(
     if port != 8080 {
         config.server.port = port;
     }
-    if metrics_port != 9090 {
-        config.server.metrics_port = metrics_port;
+    if let Some(port) = metrics_port {
+        if config.metrics.is_none() {
+            config.metrics = Some(y_sweet_core::config::MetricsConfig { port: *port });
+        } else if let Some(ref mut metrics_config) = config.metrics {
+            metrics_config.port = *port;
+        }
     }
     if checkpoint_freq_seconds != 10 {
         config.server.checkpoint_freq_seconds = checkpoint_freq_seconds;
@@ -443,7 +447,7 @@ async fn main() -> Result<()> {
                 store,
                 *port,
                 host,
-                *metrics_port,
+                metrics_port,
                 *checkpoint_freq_seconds,
                 auth,
                 url_prefix,
@@ -481,9 +485,15 @@ async fn main() -> Result<()> {
             let listener = TcpListener::bind(addr).await?;
             let addr = listener.local_addr()?;
 
-            let metrics_addr = SocketAddr::new(server_host, config.server.metrics_port);
-            let metrics_listener = TcpListener::bind(metrics_addr).await?;
-            let metrics_addr = metrics_listener.local_addr()?;
+            // Only bind metrics listener if metrics are enabled
+            let metrics_listener_and_addr = if let Some(ref metrics_config) = config.metrics {
+                let metrics_addr = SocketAddr::new(server_host, metrics_config.port);
+                let metrics_listener = TcpListener::bind(metrics_addr).await?;
+                let metrics_addr = metrics_listener.local_addr()?;
+                Some((metrics_listener, metrics_addr))
+            } else {
+                None
+            };
 
             // Create store from config
             let store = if let Some(store) = get_store_from_config(&config.store)? {
@@ -574,20 +584,31 @@ async fn main() -> Result<()> {
                 }
             });
 
-            let metrics_handle = tokio::spawn({
-                let server = server.clone();
-                let token = token.clone();
-                async move {
-                    let metrics_routes = server.metrics_routes();
-                    axum::serve(metrics_listener, metrics_routes.into_make_service())
-                        .with_graceful_shutdown(async move { token.cancelled().await })
-                        .await
-                        .unwrap();
-                }
-            });
+            let metrics_addr_for_logging =
+                metrics_listener_and_addr.as_ref().map(|(_, addr)| *addr);
+
+            let metrics_handle = if let Some((metrics_listener, _)) = metrics_listener_and_addr {
+                Some(tokio::spawn({
+                    let server = server.clone();
+                    let token = token.clone();
+                    async move {
+                        let metrics_routes = server.metrics_routes();
+                        axum::serve(metrics_listener, metrics_routes.into_make_service())
+                            .with_graceful_shutdown(async move { token.cancelled().await })
+                            .await
+                            .unwrap();
+                    }
+                }))
+            } else {
+                None
+            };
 
             tracing::info!("Listening on ws://{}", addr);
-            tracing::info!("Metrics listening on http://{}", metrics_addr);
+            if let Some(metrics_addr) = metrics_addr_for_logging {
+                tracing::info!("Metrics listening on http://{}", metrics_addr);
+            } else {
+                tracing::info!("Metrics disabled");
+            }
 
             tokio::signal::ctrl_c()
                 .await
@@ -596,7 +617,11 @@ async fn main() -> Result<()> {
             tracing::info!("Shutting down.");
             token.cancel();
 
-            let _ = tokio::join!(main_handle, metrics_handle);
+            if let Some(metrics_handle) = metrics_handle {
+                let _ = tokio::join!(main_handle, metrics_handle);
+            } else {
+                let _ = main_handle.await;
+            }
             tracing::info!("Server shut down.");
         }
         ServSubcommand::GenAuth { json, key_type } => {
@@ -694,10 +719,14 @@ async fn main() -> Result<()> {
                             println!();
                             println!("Configuration summary:");
                             println!("  Server: {}:{}", config.server.host, config.server.port);
-                            println!(
-                                "  Metrics: {}:{}",
-                                config.server.host, config.server.metrics_port
-                            );
+                            if let Some(ref metrics_config) = config.metrics {
+                                println!(
+                                    "  Metrics: {}:{}",
+                                    config.server.host, metrics_config.port
+                                );
+                            } else {
+                                println!("  Metrics: disabled");
+                            }
                             println!(
                                 "  Auth: {}",
                                 if config.auth.is_some() {
