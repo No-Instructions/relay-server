@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::metadata::LevelFilter;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use url::Url;
-use y_sweet::cli::{print_auth_message, print_server_url, sign_stdin, verify_stdin};
+use y_sweet::cli::{print_auth_message, sign_stdin, verify_stdin};
 use y_sweet::server::AllowedHost;
 use y_sweet::stores::filesystem::FileSystemStore;
 use y_sweet_core::{
@@ -89,9 +89,6 @@ enum ServSubcommand {
 
         #[clap(long, env = "RELAY_SERVER_ALLOWED_HOSTS", value_delimiter = ',')]
         allowed_hosts: Option<Vec<String>>,
-
-        #[clap(long)]
-        prod: bool,
     },
 
     GenAuth {
@@ -445,7 +442,6 @@ async fn main() -> Result<()> {
             auth,
             url_prefix,
             allowed_hosts,
-            prod,
         } => {
             // Load configuration
             let config = load_config_for_serve_args(
@@ -539,10 +535,6 @@ async fn main() -> Result<()> {
                 generate_allowed_hosts(url_prefix.as_ref(), Some(explicit_hosts))?
             };
 
-            if !prod {
-                print_server_url(auth.as_ref(), url_prefix.as_ref(), addr);
-            }
-
             let token = CancellationToken::new();
 
             // Use webhook configs from configuration (TOML file or env vars)
@@ -569,7 +561,6 @@ async fn main() -> Result<()> {
             )
             .await?;
 
-            let _prod = *prod;
             let redact_errors = config.server.redact_errors;
             let server = Arc::new(server);
 
