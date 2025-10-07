@@ -713,6 +713,11 @@ impl Authenticator {
         self.gen_cwt_token(Permission::Server, None)
     }
 
+    /// Generate a legacy format server token
+    pub fn server_token_legacy(&self) -> Result<String, AuthError> {
+        self.sign(Payload::new(Permission::Server))
+    }
+
     /// Generate a CWT document token
     pub fn gen_doc_token_cwt(
         &self,
