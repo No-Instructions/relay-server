@@ -15,6 +15,12 @@ use yrs::{
     ReadTxn, Subscription, Transact, Update,
 };
 
+fn current_time_epoch_millis() -> u64 {
+    let now = std::time::SystemTime::now();
+    let duration_since_epoch = now.duration_since(std::time::UNIX_EPOCH).unwrap();
+    duration_since_epoch.as_millis() as u64
+}
+
 // TODO: this is an implementation detail and should not be exposed.
 pub const DOC_NAME: &str = "doc";
 
@@ -42,6 +48,10 @@ pub struct DocConnection {
 
     /// Event types that this connection is subscribed to
     event_subscriptions: Arc<RwLock<HashSet<String>>>,
+
+    /// Expiration time for the authentication token in milliseconds since epoch.
+    /// If None, the token never expires.
+    expiration_time: Option<u64>,
 }
 
 impl DocConnection {
@@ -54,7 +64,7 @@ impl DocConnection {
     where
         F: Fn(&[u8]) + 'static,
     {
-        Self::new_inner(awareness, authorization, Arc::new(callback))
+        Self::new_inner(awareness, authorization, None, Arc::new(callback))
     }
 
     #[cfg(feature = "sync")]
@@ -66,12 +76,49 @@ impl DocConnection {
     where
         F: Fn(&[u8]) + 'static + Send + Sync,
     {
-        Self::new_inner(awareness, authorization, Arc::new(callback))
+        Self::new_inner(awareness, authorization, None, Arc::new(callback))
+    }
+
+    #[cfg(not(feature = "sync"))]
+    pub fn new_with_expiration<F>(
+        awareness: Arc<RwLock<Awareness>>,
+        authorization: Authorization,
+        expiration_time: Option<u64>,
+        callback: F,
+    ) -> Self
+    where
+        F: Fn(&[u8]) + 'static,
+    {
+        Self::new_inner(
+            awareness,
+            authorization,
+            expiration_time,
+            Arc::new(callback),
+        )
+    }
+
+    #[cfg(feature = "sync")]
+    pub fn new_with_expiration<F>(
+        awareness: Arc<RwLock<Awareness>>,
+        authorization: Authorization,
+        expiration_time: Option<u64>,
+        callback: F,
+    ) -> Self
+    where
+        F: Fn(&[u8]) + 'static + Send + Sync,
+    {
+        Self::new_inner(
+            awareness,
+            authorization,
+            expiration_time,
+            Arc::new(callback),
+        )
     }
 
     pub fn new_inner(
         awareness: Arc<RwLock<Awareness>>,
         authorization: Authorization,
+        expiration_time: Option<u64>,
         callback: Callback,
     ) -> Self {
         let closed = Arc::new(OnceLock::new());
@@ -150,10 +197,25 @@ impl DocConnection {
             client_id: OnceLock::new(),
             closed,
             event_subscriptions: Arc::new(RwLock::new(HashSet::new())),
+            expiration_time,
+        }
+    }
+
+    /// Check if the token associated with this connection has expired
+    fn is_expired(&self) -> bool {
+        if let Some(exp) = self.expiration_time {
+            current_time_epoch_millis() > exp
+        } else {
+            false // No expiration means token never expires
         }
     }
 
     pub async fn send(&self, update: &[u8]) -> Result<(), anyhow::Error> {
+        // Check expiration before processing
+        if self.is_expired() {
+            return Err(anyhow::Error::msg("Token expired"));
+        }
+
         let msg = Message::decode_v1(update)?;
         let result = self.handle_msg(&DefaultProtocol, msg)?;
 
@@ -172,6 +234,13 @@ impl DocConnection {
         protocol: &P,
         msg: Message,
     ) -> Result<Option<Message>, sync::Error> {
+        // Check expiration before processing
+        if self.is_expired() {
+            return Err(sync::Error::PermissionDenied {
+                reason: "Token expired".to_string(),
+            });
+        }
+
         let can_write = matches!(self.authorization, Authorization::Full);
         let a = &self.awareness;
         match msg {
@@ -481,5 +550,137 @@ mod tests {
         let result = connection.handle_msg(&DefaultProtocol, event_msg);
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_doc_connection_expiration_not_expired() {
+        let doc = yrs::Doc::new();
+        let awareness = Arc::new(RwLock::new(Awareness::new(doc)));
+
+        // Set expiration to far future (1 hour from now)
+        let future_time = current_time_epoch_millis() + 3_600_000;
+
+        let connection = DocConnection::new_with_expiration(
+            awareness,
+            Authorization::Full,
+            Some(future_time),
+            |_| {
+                // Mock callback
+            },
+        );
+
+        // Token should not be expired
+        assert!(!connection.is_expired());
+
+        // Should be able to handle messages
+        let subscribe_msg = Message::EventSubscribe(vec!["test".to_string()]);
+        let result = connection.handle_msg(&DefaultProtocol, subscribe_msg);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_doc_connection_expiration_expired() {
+        let doc = yrs::Doc::new();
+        let awareness = Arc::new(RwLock::new(Awareness::new(doc)));
+
+        // Set expiration to past time
+        let past_time = current_time_epoch_millis() - 1000;
+
+        let connection = DocConnection::new_with_expiration(
+            awareness,
+            Authorization::Full,
+            Some(past_time),
+            |_| {
+                // Mock callback
+            },
+        );
+
+        // Token should be expired
+        assert!(connection.is_expired());
+
+        // Should fail to handle messages
+        let subscribe_msg = Message::EventSubscribe(vec!["test".to_string()]);
+        let result = connection.handle_msg(&DefaultProtocol, subscribe_msg);
+        assert!(result.is_err());
+
+        if let Err(sync::Error::PermissionDenied { reason }) = result {
+            assert_eq!(reason, "Token expired");
+        } else {
+            panic!("Expected PermissionDenied error with 'Token expired' reason");
+        }
+    }
+
+    #[test]
+    fn test_doc_connection_no_expiration() {
+        let doc = yrs::Doc::new();
+        let awareness = Arc::new(RwLock::new(Awareness::new(doc)));
+
+        let connection = DocConnection::new_with_expiration(
+            awareness,
+            Authorization::Full,
+            None, // No expiration
+            |_| {
+                // Mock callback
+            },
+        );
+
+        // Token should never be expired
+        assert!(!connection.is_expired());
+
+        // Should be able to handle messages
+        let subscribe_msg = Message::EventSubscribe(vec!["test".to_string()]);
+        let result = connection.handle_msg(&DefaultProtocol, subscribe_msg);
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_doc_connection_send_expired() {
+        let doc = yrs::Doc::new();
+        let awareness = Arc::new(RwLock::new(Awareness::new(doc)));
+
+        // Set expiration to past time
+        let past_time = current_time_epoch_millis() - 1000;
+
+        let connection = DocConnection::new_with_expiration(
+            awareness,
+            Authorization::Full,
+            Some(past_time),
+            |_| {
+                // Mock callback
+            },
+        );
+
+        // Should fail to send messages when expired
+        let dummy_update = vec![1, 2, 3, 4]; // Dummy binary data
+        let result = connection.send(&dummy_update).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Token expired"));
+    }
+
+    #[tokio::test]
+    async fn test_doc_connection_send_not_expired() {
+        let doc = yrs::Doc::new();
+        let awareness = Arc::new(RwLock::new(Awareness::new(doc)));
+
+        // Set expiration to far future
+        let future_time = current_time_epoch_millis() + 3_600_000;
+
+        let connection = DocConnection::new_with_expiration(
+            awareness,
+            Authorization::Full,
+            Some(future_time),
+            |_| {
+                // Mock callback
+            },
+        );
+
+        // Create a valid sync message (SyncStep1 with empty state vector)
+        let sv = yrs::StateVector::default();
+        let msg = Message::Sync(crate::sync::SyncMessage::SyncStep1(sv));
+        let encoded = msg.encode_v1();
+
+        // Should succeed when not expired
+        let result = connection.send(&encoded).await;
+        assert!(result.is_ok());
     }
 }
