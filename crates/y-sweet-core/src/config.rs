@@ -22,7 +22,8 @@ pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
 
-    pub auth: Option<AuthConfig>,
+    #[serde(default)]
+    pub auth: Vec<AuthKeyConfig>,
 
     #[serde(default)]
     pub store: StoreConfig,
@@ -81,6 +82,13 @@ pub struct AuthConfig {
 
     #[serde(default = "default_expiration_seconds")]
     pub default_expiration_seconds: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AuthKeyConfig {
+    pub key_id: Option<String>,
+    pub private_key: Option<String>,
+    pub public_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -494,38 +502,16 @@ impl Config {
             tracing::info!(
                 "Config override: auth enabled with private_key set (from RELAY_SERVER_AUTH)"
             );
-            if self.auth.is_none() {
-                self.auth = Some(AuthConfig::default());
-            }
-            if let Some(ref mut auth) = self.auth {
-                auth.private_key = Some(auth_key);
-            }
-        }
 
-        // Handle other auth environment variables only if auth section exists
-        if self.auth.is_some() {
-            if let Ok(key_id) = env::var("RELAY_SERVER_KEY_ID") {
-                tracing::info!(
-                    "Config override: auth.key_id = {} (from RELAY_SERVER_KEY_ID)",
-                    key_id
-                );
-                if let Some(ref mut auth) = self.auth {
-                    auth.key_id = Some(key_id);
-                }
-            }
+            let key_id = env::var("RELAY_SERVER_KEY_ID").ok();
 
-            if let Ok(expiration) = env::var("RELAY_SERVER_DEFAULT_EXPIRATION_SECONDS") {
-                let exp: u64 = expiration.parse().map_err(|_| {
-                    ConfigError::InvalidConfiguration(format!(
-                        "Invalid expiration seconds: {}",
-                        expiration
-                    ))
-                })?;
-                tracing::info!("Config override: auth.default_expiration_seconds = {} (from RELAY_SERVER_DEFAULT_EXPIRATION_SECONDS)", exp);
-                if let Some(ref mut auth) = self.auth {
-                    auth.default_expiration_seconds = exp;
-                }
-            }
+            // Clear existing auth configs and add the environment variable config
+            self.auth.clear();
+            self.auth.push(AuthKeyConfig {
+                key_id,
+                private_key: Some(auth_key),
+                public_key: None,
+            });
         }
 
         // Override store configuration
@@ -686,25 +672,9 @@ impl Config {
             _ => {}
         }
 
-        // Validate auth configuration
-        if let Some(ref auth) = self.auth {
-            match (&auth.private_key, &auth.public_key) {
-                (Some(_), Some(_)) => {
-                    return Err(ConfigError::InvalidConfiguration(
-                        "Cannot specify both private_key and public_key in auth configuration"
-                            .to_string(),
-                    ));
-                }
-                (None, None) => {
-                    return Err(ConfigError::InvalidConfiguration(
-                        "Auth section present but no private_key or public_key specified"
-                            .to_string(),
-                    ));
-                }
-                _ => {
-                    // Exactly one key is present, which is valid
-                }
-            }
+        // Validate multi-key auth configuration
+        if !self.auth.is_empty() {
+            self.validate_multi_key_auth()?;
         }
 
         // Validate webhook configurations
@@ -734,6 +704,60 @@ impl Config {
                     self.logging.format
                 )))
             }
+        }
+
+        Ok(())
+    }
+
+    fn validate_multi_key_auth(&self) -> Result<(), ConfigError> {
+        use crate::auth::KeyId;
+
+        let mut private_key_count = 0;
+        let mut key_ids = std::collections::HashSet::new();
+
+        for auth_config in &self.auth {
+            // Validate key_id uniqueness (only for keys that have key_id)
+            if let Some(ref key_id) = auth_config.key_id {
+                if !key_ids.insert(key_id) {
+                    return Err(ConfigError::InvalidConfiguration(format!(
+                        "Duplicate key_id: {}",
+                        key_id
+                    )));
+                }
+
+                // Validate key_id format
+                KeyId::new(key_id.clone()).map_err(|e| {
+                    ConfigError::InvalidConfiguration(format!("Invalid key_id: {}", e))
+                })?;
+            }
+
+            // Count private keys and validate key configuration
+            match (&auth_config.private_key, &auth_config.public_key) {
+                (Some(_), None) => {
+                    private_key_count += 1;
+                }
+                (None, Some(_)) => {
+                    // Public key only - validation will happen in key parsing
+                }
+                (Some(_), Some(_)) => {
+                    return Err(ConfigError::InvalidConfiguration(
+                        "Cannot specify both private_key and public_key in same auth entry"
+                            .to_string(),
+                    ));
+                }
+                (None, None) => {
+                    return Err(ConfigError::InvalidConfiguration(
+                        "Must specify either private_key or public_key in auth entry".to_string(),
+                    ));
+                }
+            }
+        }
+
+        // Enforce single private key constraint
+        if private_key_count > 1 {
+            return Err(ConfigError::InvalidConfiguration(
+                "Only one private_key allowed across all auth entries".to_string(),
+            ));
         }
 
         Ok(())
@@ -776,7 +800,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             server: ServerConfig::default(),
-            auth: None,
+            auth: Vec::new(),
             store: StoreConfig::default(),
             webhooks: Vec::new(),
             logging: LoggingConfig::default(),
