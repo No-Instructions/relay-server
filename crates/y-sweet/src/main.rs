@@ -394,6 +394,7 @@ fn parse_allowed_hosts(hosts: Vec<String>) -> Result<Vec<AllowedHost>> {
 fn generate_allowed_hosts(
     url_prefix: Option<&Url>,
     explicit_hosts: Option<Vec<String>>,
+    fly_app_name: Option<&str>,
 ) -> Result<Vec<AllowedHost>> {
     if let Some(hosts) = explicit_hosts {
         // Parse explicit hosts with schemes
@@ -405,8 +406,8 @@ fn generate_allowed_hosts(
             scheme: prefix.scheme().to_string(),
         }];
 
-        // Add flycast if FLY_APP_NAME is set
-        if let Ok(app_name) = env::var("FLY_APP_NAME") {
+        // Add flycast if app name is provided
+        if let Some(app_name) = fly_app_name {
             hosts.push(AllowedHost {
                 host: format!("{}.flycast", app_name),
                 scheme: "http".to_string(),
@@ -514,10 +515,13 @@ async fn main() -> Result<()> {
                 .map(|s| Url::parse(s))
                 .transpose()?;
 
+            // Get FLY_APP_NAME once at configuration time to avoid race conditions
+            let fly_app_name = env::var("FLY_APP_NAME").ok();
+
             // Generate allowed hosts (use config + auto-generation from URL prefix)
             let allowed_hosts = if config.server.allowed_hosts.is_empty() {
                 // Auto-generate from url_prefix if no explicit hosts configured
-                generate_allowed_hosts(url_prefix.as_ref(), None)?
+                generate_allowed_hosts(url_prefix.as_ref(), None, fly_app_name.as_deref())?
             } else {
                 // Use configured hosts, but also add Fly.io auto-detection if applicable
                 let explicit_hosts: Vec<String> = config
@@ -532,7 +536,11 @@ async fn main() -> Result<()> {
                         }
                     })
                     .collect();
-                generate_allowed_hosts(url_prefix.as_ref(), Some(explicit_hosts))?
+                generate_allowed_hosts(
+                    url_prefix.as_ref(),
+                    Some(explicit_hosts),
+                    fly_app_name.as_deref(),
+                )?
             };
 
             let token = CancellationToken::new();
@@ -973,7 +981,7 @@ mod tests {
             "http://app.flycast".to_string(),
         ]);
 
-        let hosts = generate_allowed_hosts(None, explicit_hosts).unwrap();
+        let hosts = generate_allowed_hosts(None, explicit_hosts, None).unwrap();
 
         assert_eq!(hosts.len(), 2);
         assert_eq!(hosts[0].host, "api.example.com");
@@ -987,40 +995,34 @@ mod tests {
         let url_prefix: Url = "https://api.example.com".parse().unwrap();
 
         // Without FLY_APP_NAME
-        env::remove_var("FLY_APP_NAME");
-        let hosts = generate_allowed_hosts(Some(&url_prefix), None).unwrap();
+        let hosts = generate_allowed_hosts(Some(&url_prefix), None, None).unwrap();
 
         assert_eq!(hosts.len(), 1);
         assert_eq!(hosts[0].host, "api.example.com");
         assert_eq!(hosts[0].scheme, "https");
 
         // With FLY_APP_NAME
-        env::set_var("FLY_APP_NAME", "my-app");
-        let hosts = generate_allowed_hosts(Some(&url_prefix), None).unwrap();
+        let hosts = generate_allowed_hosts(Some(&url_prefix), None, Some("my-app")).unwrap();
 
         assert_eq!(hosts.len(), 2);
         assert_eq!(hosts[0].host, "api.example.com");
         assert_eq!(hosts[0].scheme, "https");
         assert_eq!(hosts[1].host, "my-app.flycast");
         assert_eq!(hosts[1].scheme, "http");
-
-        // Clean up
-        env::remove_var("FLY_APP_NAME");
     }
 
     #[test]
     fn test_generate_allowed_hosts_empty() {
-        let hosts = generate_allowed_hosts(None, None).unwrap();
+        let hosts = generate_allowed_hosts(None, None, None).unwrap();
         assert_eq!(hosts.len(), 0);
     }
 
     #[test]
     fn test_fly_io_scenario() {
         // Simulate a Fly.io deployment scenario
-        env::set_var("FLY_APP_NAME", "my-relay-server");
-
         let url_prefix: Url = "https://api.mycompany.com".parse().unwrap();
-        let hosts = generate_allowed_hosts(Some(&url_prefix), None).unwrap();
+        let hosts =
+            generate_allowed_hosts(Some(&url_prefix), None, Some("my-relay-server")).unwrap();
 
         // Should have both external and internal hosts
         assert_eq!(hosts.len(), 2);
@@ -1032,7 +1034,5 @@ mod tests {
         // Internal flycast host for internal access
         assert_eq!(hosts[1].host, "my-relay-server.flycast");
         assert_eq!(hosts[1].scheme, "http");
-
-        env::remove_var("FLY_APP_NAME");
     }
 }
