@@ -96,6 +96,25 @@ pub enum AuthError {
     CannotSignWithPublicKey,
 }
 
+impl AuthError {
+    /// Map AuthError to metric label for monitoring
+    pub fn to_metric_label(&self) -> &'static str {
+        match self {
+            AuthError::InvalidToken => "invalid_format",
+            AuthError::Expired => "expired",
+            AuthError::InvalidResource => "invalid_resource",
+            AuthError::InvalidSignature => "invalid_signature",
+            AuthError::KeyMismatch => "key_mismatch",
+            AuthError::InvalidCbor => "invalid_cbor",
+            AuthError::InvalidCose => "invalid_cose",
+            AuthError::UnsupportedAlgorithm => "unsupported_algorithm",
+            AuthError::InvalidClaims => "invalid_claims",
+            AuthError::HmacVerificationFailed => "signature_verification_failed",
+            AuthError::CannotSignWithPublicKey => "cannot_sign_with_public_key",
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
 pub enum AuthKeyMaterial {
     Hmac256(Vec<u8>), // 32-byte keys for HMAC-SHA256 (CWT tokens)

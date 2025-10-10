@@ -112,6 +112,7 @@ pub struct Server {
     event_dispatcher: Option<Arc<dyn EventDispatcher>>,
     websocket_sender: Arc<WebSocketSender>,
     sync_protocol_event_sender: Arc<SyncProtocolEventSender>,
+    metrics: Arc<WebhookMetrics>,
 }
 
 impl Server {
@@ -150,7 +151,10 @@ impl Server {
                 debounced_sync_sender.clone(),
             ];
 
-            Some(Arc::new(UnifiedEventDispatcher::new(senders, metrics)) as Arc<dyn EventDispatcher>)
+            Some(
+                Arc::new(UnifiedEventDispatcher::new(senders, metrics.clone()))
+                    as Arc<dyn EventDispatcher>,
+            )
         } else {
             tracing::info!("No webhook configs provided, creating WebSocket-only event dispatcher");
             let senders: Vec<Arc<dyn EventSender>> =
@@ -176,6 +180,7 @@ impl Server {
             event_dispatcher,
             websocket_sender,
             sync_protocol_event_sender,
+            metrics,
         })
     }
 
@@ -806,6 +811,7 @@ async fn handle_socket_upgrade_with_channel_and_user(
     let awareness = dwskv.awareness();
     let cancellation_token = server_state.cancellation_token.clone();
     let sync_protocol_event_sender = server_state.sync_protocol_event_sender.clone();
+    let metrics = server_state.metrics.clone();
     let doc_id_clone = doc_id.clone();
 
     Ok(ws.on_upgrade(move |socket| {
@@ -817,6 +823,7 @@ async fn handle_socket_upgrade_with_channel_and_user(
             cancellation_token,
             sync_protocol_event_sender,
             doc_id_clone,
+            metrics,
         )
     }))
 }
@@ -834,8 +841,20 @@ async fn handle_socket_upgrade_deprecated(
         if let Some(token) = params.token.as_deref() {
             authenticator
                 .verify_token_with_channel(token, current_time_epoch_millis())
-                .map_err(|e| (StatusCode::UNAUTHORIZED, e))?
+                .map_err(|e| {
+                    // Record authentication failure metric
+                    server_state.metrics.record_auth_failure(
+                        e.to_metric_label(),
+                        "websocket_upgrade_deprecated",
+                        "GET",
+                    );
+                    (StatusCode::UNAUTHORIZED, e)
+                })?
         } else {
+            // Record missing token when authenticator is present but no token provided
+            server_state
+                .metrics
+                .record_missing_token("websocket_upgrade_deprecated", "true");
             (y_sweet_core::auth::Permission::Server, None)
         }
     } else {
@@ -983,6 +1002,7 @@ async fn handle_socket(
     cancellation_token: CancellationToken,
     sync_protocol_event_sender: Arc<SyncProtocolEventSender>,
     doc_id: String,
+    metrics: Arc<WebhookMetrics>,
 ) {
     let (mut sink, mut stream) = socket.split();
     let (send, mut recv) = channel(1024);
@@ -1028,6 +1048,11 @@ async fn handle_socket(
                 match connection.send(&msg).await {
                     Ok(_) => {},
                     Err(e) if e.to_string().contains("Token expired") => {
+                        // Record token expiration metric
+                        metrics.record_token_expired(
+                            "websocket_connection",
+                            "websocket_message_handler"
+                        );
                         tracing::warn!(
                             doc_id = %doc_id,
                             "Closing connection due to token expiration"

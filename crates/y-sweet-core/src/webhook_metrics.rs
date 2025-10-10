@@ -21,6 +21,12 @@ pub struct WebhookMetrics {
     pub event_updates_merged_total: CounterVec,
     pub sync_protocol_connections: GaugeVec,
     pub debounced_queue_length: GaugeVec,
+
+    // Authentication & Security metrics
+    pub auth_failures_total: CounterVec,
+    pub token_expired_total: CounterVec,
+    pub permission_denied_total: CounterVec,
+    pub missing_token_total: CounterVec,
 }
 
 static WEBHOOK_METRICS: OnceLock<Result<Arc<WebhookMetrics>, prometheus::Error>> = OnceLock::new();
@@ -154,6 +160,43 @@ impl WebhookMetrics {
         )?;
         registry.register(Box::new(debounced_queue_length.clone()))?;
 
+        // Authentication & Security metrics
+        let auth_failures_total = CounterVec::new(
+            Opts::new(
+                "relay_server_auth_failures_total",
+                "Total number of authentication failures",
+            ),
+            &["error_type", "endpoint", "method"],
+        )?;
+        registry.register(Box::new(auth_failures_total.clone()))?;
+
+        let token_expired_total = CounterVec::new(
+            Opts::new(
+                "relay_server_token_expired_total",
+                "Total number of token expiration events",
+            ),
+            &["token_type", "endpoint"],
+        )?;
+        registry.register(Box::new(token_expired_total.clone()))?;
+
+        let permission_denied_total = CounterVec::new(
+            Opts::new(
+                "relay_server_permission_denied_total",
+                "Total number of authorization failures after successful token verification",
+            ),
+            &["resource_type", "action", "endpoint"],
+        )?;
+        registry.register(Box::new(permission_denied_total.clone()))?;
+
+        let missing_token_total = CounterVec::new(
+            Opts::new(
+                "relay_server_missing_token_total",
+                "Total number of requests with missing authentication tokens",
+            ),
+            &["endpoint", "auth_required"],
+        )?;
+        registry.register(Box::new(missing_token_total.clone()))?;
+
         Ok(Arc::new(Self {
             webhook_requests_total,
             webhook_request_duration_seconds,
@@ -168,6 +211,10 @@ impl WebhookMetrics {
             event_updates_merged_total,
             sync_protocol_connections,
             debounced_queue_length,
+            auth_failures_total,
+            token_expired_total,
+            permission_denied_total,
+            missing_token_total,
         }))
     }
 
@@ -253,6 +300,31 @@ impl WebhookMetrics {
             .with_label_values(&[queue_type])
             .set(length as f64);
     }
+
+    // Authentication & Security metrics methods
+    pub fn record_auth_failure(&self, error_type: &str, endpoint: &str, method: &str) {
+        self.auth_failures_total
+            .with_label_values(&[error_type, endpoint, method])
+            .inc();
+    }
+
+    pub fn record_token_expired(&self, token_type: &str, endpoint: &str) {
+        self.token_expired_total
+            .with_label_values(&[token_type, endpoint])
+            .inc();
+    }
+
+    pub fn record_permission_denied(&self, resource_type: &str, action: &str, endpoint: &str) {
+        self.permission_denied_total
+            .with_label_values(&[resource_type, action, endpoint])
+            .inc();
+    }
+
+    pub fn record_missing_token(&self, endpoint: &str, auth_required: &str) {
+        self.missing_token_total
+            .with_label_values(&[endpoint, auth_required])
+            .inc();
+    }
 }
 
 impl Default for WebhookMetrics {
@@ -261,5 +333,116 @@ impl Default for WebhookMetrics {
             .expect("Failed to create webhook metrics")
             .as_ref()
             .clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_auth_failure_metrics() {
+        let metrics = WebhookMetrics::new_for_test().unwrap();
+
+        // Record some auth failures
+        metrics.record_auth_failure("invalid_signature", "websocket_upgrade", "GET");
+        metrics.record_auth_failure("expired", "document_access", "POST");
+
+        // Verify metrics were recorded
+        let auth_failures = metrics
+            .auth_failures_total
+            .with_label_values(&["invalid_signature", "websocket_upgrade", "GET"])
+            .get();
+        assert_eq!(auth_failures, 1.0);
+
+        let expired_failures = metrics
+            .auth_failures_total
+            .with_label_values(&["expired", "document_access", "POST"])
+            .get();
+        assert_eq!(expired_failures, 1.0);
+    }
+
+    #[test]
+    fn test_token_expired_metrics() {
+        let metrics = WebhookMetrics::new_for_test().unwrap();
+
+        // Record token expiration
+        metrics.record_token_expired("websocket_connection", "websocket_upgrade");
+        metrics.record_token_expired("api_token", "file_download");
+
+        // Verify metrics were recorded
+        let websocket_expired = metrics
+            .token_expired_total
+            .with_label_values(&["websocket_connection", "websocket_upgrade"])
+            .get();
+        assert_eq!(websocket_expired, 1.0);
+
+        let api_expired = metrics
+            .token_expired_total
+            .with_label_values(&["api_token", "file_download"])
+            .get();
+        assert_eq!(api_expired, 1.0);
+    }
+
+    #[test]
+    fn test_permission_denied_metrics() {
+        let metrics = WebhookMetrics::new_for_test().unwrap();
+
+        // Record permission denied events
+        metrics.record_permission_denied("document", "write", "document_upload");
+        metrics.record_permission_denied("file", "read", "file_download");
+
+        // Verify metrics were recorded
+        let doc_denied = metrics
+            .permission_denied_total
+            .with_label_values(&["document", "write", "document_upload"])
+            .get();
+        assert_eq!(doc_denied, 1.0);
+
+        let file_denied = metrics
+            .permission_denied_total
+            .with_label_values(&["file", "read", "file_download"])
+            .get();
+        assert_eq!(file_denied, 1.0);
+    }
+
+    #[test]
+    fn test_missing_token_metrics() {
+        let metrics = WebhookMetrics::new_for_test().unwrap();
+
+        // Record missing token events
+        metrics.record_missing_token("websocket_upgrade", "true");
+        metrics.record_missing_token("document_access", "false");
+
+        // Verify metrics were recorded
+        let required_missing = metrics
+            .missing_token_total
+            .with_label_values(&["websocket_upgrade", "true"])
+            .get();
+        assert_eq!(required_missing, 1.0);
+
+        let optional_missing = metrics
+            .missing_token_total
+            .with_label_values(&["document_access", "false"])
+            .get();
+        assert_eq!(optional_missing, 1.0);
+    }
+
+    #[test]
+    fn test_auth_error_metric_labels() {
+        use crate::auth::AuthError;
+
+        // Test that AuthError to_metric_label method works correctly
+        assert_eq!(AuthError::InvalidToken.to_metric_label(), "invalid_format");
+        assert_eq!(AuthError::Expired.to_metric_label(), "expired");
+        assert_eq!(
+            AuthError::InvalidSignature.to_metric_label(),
+            "invalid_signature"
+        );
+        assert_eq!(AuthError::KeyMismatch.to_metric_label(), "key_mismatch");
+        assert_eq!(
+            AuthError::InvalidResource.to_metric_label(),
+            "invalid_resource"
+        );
     }
 }
