@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use axum::{
     body::Bytes,
     extract::{
-        ws::{Message, WebSocket},
+        ws::{CloseFrame, Message, WebSocket},
         Path, Query, Request, State, WebSocketUpgrade,
     },
     http::{
@@ -762,6 +762,7 @@ async fn handle_socket_upgrade_with_channel(
         authorization,
         routing_channel,
         None,
+        None, // No token available at this level
         State(server_state),
     )
     .await
@@ -773,6 +774,7 @@ async fn handle_socket_upgrade_with_channel_and_user(
     authorization: Authorization,
     routing_channel: Option<String>,
     user: Option<String>,
+    token: Option<String>,
     State(server_state): State<Arc<Server>>,
 ) -> Result<Response, AppError> {
     if !matches!(authorization, Authorization::Full) && !server_state.docs.contains_key(&doc_id) {
@@ -781,6 +783,21 @@ async fn handle_socket_upgrade_with_channel_and_user(
             anyhow!("Doc {} not found", doc_id),
         ));
     }
+
+    // Extract expiration time from token
+    let expiration_time = if let Some(authenticator) = &server_state.authenticator {
+        if let Some(token_str) = token.as_deref() {
+            authenticator
+                .decode_token(token_str)
+                .ok()
+                .and_then(|payload| payload.expiration_millis)
+                .map(|exp| exp.0)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     let dwskv = server_state
         .get_or_create_doc_with_channel_and_user(&doc_id, routing_channel, user)
@@ -796,6 +813,7 @@ async fn handle_socket_upgrade_with_channel_and_user(
             socket,
             awareness,
             authorization,
+            expiration_time,
             cancellation_token,
             sync_protocol_event_sender,
             doc_id_clone,
@@ -858,6 +876,7 @@ async fn handle_socket_upgrade_deprecated(
         authorization,
         channel,
         user,
+        params.token.clone(), // Pass the token from query params
         State(server_state),
     )
     .await
@@ -930,6 +949,7 @@ async fn handle_socket_upgrade_full_path(
         authorization,
         channel,
         user,
+        params.token.clone(), // Pass the token from query params
         State(server_state),
     )
     .await
@@ -959,6 +979,7 @@ async fn handle_socket(
     socket: WebSocket,
     awareness: Arc<RwLock<Awareness>>,
     authorization: Authorization,
+    expiration_time: Option<u64>,
     cancellation_token: CancellationToken,
     sync_protocol_event_sender: Arc<SyncProtocolEventSender>,
     doc_id: String,
@@ -968,15 +989,21 @@ async fn handle_socket(
 
     tokio::spawn(async move {
         while let Some(msg) = recv.recv().await {
-            let _ = sink.send(Message::Binary(msg)).await;
+            let _ = sink.send(msg).await;
         }
     });
 
-    let connection = Arc::new(DocConnection::new(awareness, authorization, move |bytes| {
-        if let Err(e) = send.try_send(bytes.to_vec()) {
-            tracing::warn!(?e, "Error sending message");
-        }
-    }));
+    let send_clone = send.clone();
+    let connection = Arc::new(DocConnection::new_with_expiration(
+        awareness,
+        authorization,
+        expiration_time,
+        move |bytes| {
+            if let Err(e) = send_clone.try_send(Message::Binary(bytes.to_vec())) {
+                tracing::warn!(?e, "Error sending message");
+            }
+        },
+    ));
 
     // Register the connection with the sync protocol event sender
     sync_protocol_event_sender.register_doc_connection(doc_id.clone(), Arc::downgrade(&connection));
@@ -998,8 +1025,22 @@ async fn handle_socket(
                     }
                 };
 
-                if let Err(e) = connection.send(&msg).await {
-                    tracing::warn!(?e, "Error handling message");
+                match connection.send(&msg).await {
+                    Ok(_) => {},
+                    Err(e) if e.to_string().contains("Token expired") => {
+                        tracing::warn!(
+                            doc_id = %doc_id,
+                            "Closing connection due to token expiration"
+                        );
+                        let _ = send.try_send(Message::Close(Some(CloseFrame {
+                            code: 1008, // Policy Violation - indicates a policy violation
+                            reason: "Token expired".into(),
+                        })));
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!(?e, "Error handling message");
+                    }
                 }
             }
             _ = cancellation_token.cancelled() => {
