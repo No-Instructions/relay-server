@@ -1415,7 +1415,7 @@ impl Authenticator {
         // Validate issuer - accept relay-server, auth.system3.dev, and auth.system3.md
         if let Some(ref issuer) = claims.issuer {
             const VALID_ISSUERS: &[&str] = &["relay-server", "auth.system3.dev", "auth.system3.md"];
-            if !VALID_ISSUERS.contains(&issuer.as_str()) {
+            if !VALID_ISSUERS.contains(&&**issuer) {
                 tracing::debug!("Invalid issuer: {}", issuer);
                 return Err(AuthError::InvalidClaims);
             }
@@ -1546,7 +1546,7 @@ impl Authenticator {
         // Validate issuer - accept relay-server, auth.system3.dev, and auth.system3.md
         if let Some(ref issuer) = claims.issuer {
             const VALID_ISSUERS: &[&str] = &["relay-server", "auth.system3.dev", "auth.system3.md"];
-            if !VALID_ISSUERS.contains(&issuer.as_str()) {
+            if !VALID_ISSUERS.contains(&&**issuer) {
                 tracing::debug!("Invalid issuer: {}", issuer);
                 return Err(AuthError::InvalidClaims);
             }

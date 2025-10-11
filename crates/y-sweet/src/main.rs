@@ -654,8 +654,14 @@ async fn main() -> Result<()> {
                 KeyType::EdDsa => Authenticator::gen_key_ed25519()?,
             };
 
+            // Generate a key-id using nanoid
+            let key_id = nanoid::nanoid!();
+
             if *json {
                 let mut result = serde_json::Map::new();
+
+                // Add key-id to output
+                result.insert("key_id".to_string(), json!(key_id));
 
                 // Generate appropriate server token based on key type
                 match auth.key_material() {
@@ -725,6 +731,8 @@ async fn main() -> Result<()> {
                     serde_json::to_string_pretty(&serde_json::Value::Object(result))?
                 );
             } else {
+                println!("Key ID: {}", key_id);
+                println!();
                 print_auth_message(&auth);
 
                 // Print additional info based on key type
