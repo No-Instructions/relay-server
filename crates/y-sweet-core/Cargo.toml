@@ -36,6 +36,7 @@ coset = "0.3.7"
 ciborium = "0.2.2"
 p256 = "0.13.2"
 ecdsa = "0.16.9"
+ed25519-dalek = { version = "2.1.1", features = ["pkcs8", "pem"] }
 time = { version = "0.3.25", features = ["wasm-bindgen", "parsing"] }
 tokio = { version = "1.29.1", features = ["time"] }
 urlencoding = "2.1.3"

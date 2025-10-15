@@ -90,8 +90,8 @@ pub enum AuthError {
     UnsupportedAlgorithm,
     #[error("Invalid CWT claims")]
     InvalidClaims,
-    #[error("HMAC signature verification failed")]
-    HmacVerificationFailed,
+    #[error("Signature verification failed")]
+    SignatureVerificationFailed,
     #[error("Cannot sign tokens with public key - signing requires private key")]
     CannotSignWithPublicKey,
     #[error("Multiple private keys not allowed")]
@@ -136,6 +136,8 @@ pub enum AuthKeyMaterial {
     Legacy(Vec<u8>),  // 30-byte keys for legacy token system
     EcdsaP256Private(Vec<u8>),
     EcdsaP256Public(Vec<u8>),
+    Ed25519Private(Vec<u8>), // 32-byte Ed25519 private keys
+    Ed25519Public(Vec<u8>),  // 32-byte Ed25519 public keys
 }
 
 impl AuthKeyMaterial {
@@ -146,6 +148,8 @@ impl AuthKeyMaterial {
             AuthKeyMaterial::Legacy(key_bytes) => b64_encode(key_bytes),
             AuthKeyMaterial::EcdsaP256Private(key_bytes) => b64_encode(key_bytes),
             AuthKeyMaterial::EcdsaP256Public(key_bytes) => b64_encode(key_bytes),
+            AuthKeyMaterial::Ed25519Private(key_bytes) => b64_encode(key_bytes),
+            AuthKeyMaterial::Ed25519Public(key_bytes) => b64_encode(key_bytes),
         }
     }
 
@@ -693,6 +697,15 @@ impl Authenticator {
                     key_entry.key_id.clone(),
                 )
             }
+            AuthKeyMaterial::Ed25519Private(key_bytes) => {
+                crate::cwt::CwtAuthenticator::new_ed25519(key_bytes, key_entry.key_id.clone())
+            }
+            AuthKeyMaterial::Ed25519Public(key_bytes) => {
+                crate::cwt::CwtAuthenticator::new_ed25519_public(
+                    key_bytes,
+                    key_entry.key_id.clone(),
+                )
+            }
         }
     }
 
@@ -731,7 +744,9 @@ impl Authenticator {
 
         let key_bytes = match &signing_key.key_material {
             AuthKeyMaterial::Legacy(key_bytes) => key_bytes,
-            AuthKeyMaterial::EcdsaP256Public(_) => return Err(AuthError::CannotSignWithPublicKey),
+            AuthKeyMaterial::EcdsaP256Public(_) | AuthKeyMaterial::Ed25519Public(_) => {
+                return Err(AuthError::CannotSignWithPublicKey)
+            }
             _ => return Err(AuthError::InvalidToken), // Only legacy keys supported for legacy tokens
         };
         hash_payload.extend_from_slice(key_bytes);
@@ -1133,6 +1148,23 @@ impl Authenticator {
         })
     }
 
+    pub fn gen_key_ed25519() -> Result<Authenticator, AuthError> {
+        use rand::{rngs::OsRng, RngCore};
+
+        let mut secret_bytes = [0u8; 32];
+        OsRng.fill_bytes(&mut secret_bytes);
+
+        Ok(Authenticator {
+            keys: vec![AuthKeyEntry {
+                key_id: None,
+                key_material: AuthKeyMaterial::Ed25519Private(secret_bytes.to_vec()),
+                can_sign: true,
+            }],
+            key_lookup: std::collections::HashMap::new(),
+            keys_without_id: vec![0],
+        })
+    }
+
     pub fn gen_key_legacy() -> Result<Authenticator, AuthError> {
         let key = rand::thread_rng().gen::<[u8; 30]>(); // 30-byte legacy keys
 
@@ -1476,9 +1508,9 @@ impl Authenticator {
                 tracing::debug!("Token has invalid claims structure");
                 AuthError::InvalidClaims
             }
-            crate::cwt::CwtError::HmacVerificationFailed => {
-                tracing::debug!("HMAC signature verification failed");
-                AuthError::HmacVerificationFailed
+            crate::cwt::CwtError::SignatureVerificationFailed => {
+                tracing::debug!("Signature verification failed");
+                AuthError::SignatureVerificationFailed
             }
             _ => {
                 tracing::debug!("Other CWT error: {:?}", e);
@@ -2156,7 +2188,7 @@ mod tests {
         // Should fail with signature verification error
         assert!(matches!(
             authenticator2.verify_doc_token(&token, "doc123", 0),
-            Err(AuthError::HmacVerificationFailed)
+            Err(AuthError::SignatureVerificationFailed)
         ));
     }
 
@@ -2495,8 +2527,8 @@ mod tests {
 
         // The verify_cwt_token method returns Permission
         // where Permission contains the doc_id and authorization
-        match auth.verify_cwt_token(token, test_time) {
-            Ok(permission) => {
+        match auth.verify_cwt_token_with_channel(token, test_time) {
+            Ok((permission, _channel)) => {
                 // Token verification succeeded
 
                 // Check if the permission matches our expected doc_id
