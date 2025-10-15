@@ -41,6 +41,20 @@ fn generate_public_key_from_private(private_key_b64: &str) -> Result<String, any
     Ok(BASE64_CUSTOM.encode(&public_key_bytes))
 }
 
+fn generate_ed25519_public_key_from_private(
+    private_key_b64: &str,
+) -> Result<String, anyhow::Error> {
+    use ed25519_dalek::{SecretKey as Ed25519SecretKey, SigningKey};
+    use y_sweet_core::auth::BASE64_CUSTOM;
+
+    let private_key_bytes = BASE64_CUSTOM.decode(private_key_b64.as_bytes())?;
+    let secret_key: Ed25519SecretKey = private_key_bytes.as_slice().try_into()?;
+    let signing_key = SigningKey::from(&secret_key);
+    let public_key_bytes = signing_key.verifying_key().to_bytes();
+
+    Ok(BASE64_CUSTOM.encode(&public_key_bytes))
+}
+
 #[derive(Clone, ValueEnum)]
 enum KeyType {
     #[value(name = "legacy")]
@@ -49,6 +63,8 @@ enum KeyType {
     Hmac256,
     #[value(name = "ES256")]
     Es256,
+    #[value(name = "EdDSA")]
+    EdDsa,
 }
 
 #[derive(Parser)]
@@ -635,6 +651,7 @@ async fn main() -> Result<()> {
                 KeyType::Legacy => Authenticator::gen_key_legacy()?,
                 KeyType::Hmac256 => Authenticator::gen_key_hmac()?,
                 KeyType::Es256 => Authenticator::gen_key_ecdsa()?,
+                KeyType::EdDsa => Authenticator::gen_key_ed25519()?,
             };
 
             if *json {
@@ -683,6 +700,24 @@ async fn main() -> Result<()> {
                         );
                         // No private_key field for public keys!
                     }
+                    y_sweet_core::auth::AuthKeyMaterial::Ed25519Private(key_bytes) => {
+                        let private_key_b64 = y_sweet_core::auth::b64_encode(key_bytes);
+                        result.insert("private_key".to_string(), json!(private_key_b64));
+
+                        // Also generate and include public key
+                        if let Ok(public_key) =
+                            generate_ed25519_public_key_from_private(&private_key_b64)
+                        {
+                            result.insert("public_key".to_string(), json!(public_key));
+                        }
+                    }
+                    y_sweet_core::auth::AuthKeyMaterial::Ed25519Public(key_bytes) => {
+                        result.insert(
+                            "public_key".to_string(),
+                            json!(y_sweet_core::auth::b64_encode(key_bytes)),
+                        );
+                        // No private_key field for public keys!
+                    }
                 }
 
                 println!(
@@ -703,6 +738,20 @@ async fn main() -> Result<()> {
                         }
                     }
                     y_sweet_core::auth::AuthKeyMaterial::EcdsaP256Public(_) => {
+                        println!("Note: This is a public key - it can only verify tokens, not create them.");
+                        println!();
+                    }
+                    y_sweet_core::auth::AuthKeyMaterial::Ed25519Private(key_bytes) => {
+                        let private_key_b64 = y_sweet_core::auth::b64_encode(key_bytes);
+                        if let Ok(public_key) =
+                            generate_ed25519_public_key_from_private(&private_key_b64)
+                        {
+                            println!("Public key for EdDSA:");
+                            println!("   {}", public_key);
+                            println!();
+                        }
+                    }
+                    y_sweet_core::auth::AuthKeyMaterial::Ed25519Public(_) => {
                         println!("Note: This is a public key - it can only verify tokens, not create them.");
                         println!();
                     }

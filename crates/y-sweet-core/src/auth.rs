@@ -90,8 +90,8 @@ pub enum AuthError {
     UnsupportedAlgorithm,
     #[error("Invalid CWT claims")]
     InvalidClaims,
-    #[error("HMAC signature verification failed")]
-    HmacVerificationFailed,
+    #[error("Signature verification failed")]
+    SignatureVerificationFailed,
     #[error("Cannot sign tokens with public key - signing requires private key")]
     CannotSignWithPublicKey,
     #[error("Multiple private keys not allowed")]
@@ -119,7 +119,7 @@ impl AuthError {
             AuthError::InvalidCose => "invalid_cose",
             AuthError::UnsupportedAlgorithm => "unsupported_algorithm",
             AuthError::InvalidClaims => "invalid_claims",
-            AuthError::HmacVerificationFailed => "signature_verification_failed",
+            AuthError::SignatureVerificationFailed => "signature_verification_failed",
             AuthError::CannotSignWithPublicKey => "cannot_sign_with_public_key",
             AuthError::MultiplePrivateKeys => "multiple_private_keys",
             AuthError::BothKeysProvided => "both_keys_provided",
@@ -136,6 +136,8 @@ pub enum AuthKeyMaterial {
     Legacy(Vec<u8>),  // 30-byte keys for legacy token system
     EcdsaP256Private(Vec<u8>),
     EcdsaP256Public(Vec<u8>),
+    Ed25519Private(Vec<u8>), // 32-byte Ed25519 private keys
+    Ed25519Public(Vec<u8>),  // 32-byte Ed25519 public keys
 }
 
 impl AuthKeyMaterial {
@@ -146,6 +148,8 @@ impl AuthKeyMaterial {
             AuthKeyMaterial::Legacy(key_bytes) => b64_encode(key_bytes),
             AuthKeyMaterial::EcdsaP256Private(key_bytes) => b64_encode(key_bytes),
             AuthKeyMaterial::EcdsaP256Public(key_bytes) => b64_encode(key_bytes),
+            AuthKeyMaterial::Ed25519Private(key_bytes) => b64_encode(key_bytes),
+            AuthKeyMaterial::Ed25519Public(key_bytes) => b64_encode(key_bytes),
         }
     }
 
@@ -159,17 +163,17 @@ impl AuthKeyMaterial {
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
-struct AuthKeyEntry {
-    key_id: Option<String>,
-    key_material: AuthKeyMaterial,
-    can_sign: bool,
+pub struct AuthKeyEntry {
+    pub key_id: Option<String>,
+    pub key_material: AuthKeyMaterial,
+    pub can_sign: bool,
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
 pub struct Authenticator {
-    keys: Vec<AuthKeyEntry>,
-    key_lookup: std::collections::HashMap<String, usize>,
-    keys_without_id: Vec<usize>,
+    pub keys: Vec<AuthKeyEntry>,
+    pub key_lookup: std::collections::HashMap<String, usize>,
+    pub keys_without_id: Vec<usize>,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -307,7 +311,7 @@ pub fn b64_encode(bytes: &[u8]) -> String {
     BASE64_CUSTOM.encode(bytes)
 }
 
-pub(crate) fn b64_decode(input: &str) -> Result<Vec<u8>, AuthError> {
+pub fn b64_decode(input: &str) -> Result<Vec<u8>, AuthError> {
     BASE64_CUSTOM
         .decode(input.as_bytes())
         .map_err(|_| AuthError::InvalidToken)
@@ -322,50 +326,78 @@ fn detect_key_type(key_bytes: &[u8]) -> &'static str {
     }
 }
 
-fn parse_key_format(input: &str) -> Result<AuthKeyMaterial, AuthError> {
+fn parse_private_key_format(input: &str) -> Result<AuthKeyMaterial, AuthError> {
+    let trimmed = input.trim();
+
+    // Raw base64 - for private keys, only Legacy and HMAC256 are supported
+    let key_bytes = b64_decode(trimmed)?;
+    let key_type = detect_key_type(&key_bytes);
+    tracing::info!("Detected key type: {}", key_type);
+
+    match key_bytes.len() {
+        30 => {
+            tracing::info!("Using 30-byte key for legacy token system");
+            Ok(AuthKeyMaterial::Legacy(key_bytes))
+        }
+        32 => {
+            tracing::info!("Using 32-byte key for HMAC-SHA256 (CWT tokens)");
+            Ok(AuthKeyMaterial::Hmac256(key_bytes))
+        }
+        _ => {
+            tracing::warn!(
+                "Unexpected key length: {} bytes, defaulting to HMAC256",
+                key_bytes.len()
+            );
+            Ok(AuthKeyMaterial::Hmac256(key_bytes))
+        }
+    }
+}
+
+fn parse_public_key_format(input: &str) -> Result<AuthKeyMaterial, AuthError> {
     let trimmed = input.trim();
 
     if trimmed.starts_with("-----BEGIN") && trimmed.contains("-----END") {
         // PEM format - determine key type from header
         if trimmed.contains("-----BEGIN PUBLIC KEY-----") {
-            // ECDSA public key in PEM format
+            // Try Ed25519 first, then fall back to ECDSA
             let key_bytes = extract_pem_content(trimmed)?;
+
+            // Try Ed25519 public key first (32 bytes)
+            if key_bytes.len() == 32 {
+                tracing::info!("Parsed PEM Ed25519 public key");
+                return Ok(AuthKeyMaterial::Ed25519Public(key_bytes));
+            }
+
+            // Fall back to ECDSA public key
             tracing::info!("Parsed PEM ECDSA P-256 public key");
             Ok(AuthKeyMaterial::EcdsaP256Public(key_bytes))
-        } else if trimmed.contains("-----BEGIN PRIVATE KEY-----")
-            || trimmed.contains("-----BEGIN EC PRIVATE KEY-----")
-        {
-            // ECDSA private key in PEM format
-            let key_bytes = extract_pem_content(trimmed)?;
-            tracing::info!("Parsed PEM ECDSA P-256 private key");
-            Ok(AuthKeyMaterial::EcdsaP256Private(key_bytes))
         } else {
-            tracing::error!("Unsupported PEM key type");
+            tracing::error!("Unsupported PEM key type for public key");
             Err(AuthError::InvalidToken)
         }
     } else {
-        // Raw base64 - distinguish between legacy (30 bytes) and HMAC256 (32 bytes)
+        // Raw base64 - try to parse as Ed25519 public key first, then fall back to ECDSA
         let key_bytes = b64_decode(trimmed)?;
-        let key_type = detect_key_type(&key_bytes);
-        tracing::info!("Detected key type: {}", key_type);
 
-        match key_bytes.len() {
-            30 => {
-                tracing::info!("Using 30-byte key for legacy token system");
-                Ok(AuthKeyMaterial::Legacy(key_bytes))
-            }
-            32 => {
-                tracing::info!("Using 32-byte key for HMAC-SHA256 (CWT tokens)");
-                Ok(AuthKeyMaterial::Hmac256(key_bytes))
-            }
-            _ => {
-                tracing::warn!(
-                    "Unexpected key length: {} bytes, defaulting to HMAC256",
-                    key_bytes.len()
-                );
-                Ok(AuthKeyMaterial::Hmac256(key_bytes))
+        // Try Ed25519 public key first (32 bytes)
+        if key_bytes.len() == 32 {
+            if let Ok(key_array) = key_bytes.as_slice().try_into() {
+                if ed25519_dalek::VerifyingKey::from_bytes(&key_array).is_ok() {
+                    tracing::info!("Parsed raw base64 Ed25519 public key");
+                    return Ok(AuthKeyMaterial::Ed25519Public(key_bytes));
+                }
             }
         }
+
+        // Try ECDSA public key (various lengths)
+        if p256::PublicKey::from_sec1_bytes(&key_bytes).is_ok() {
+            tracing::info!("Parsed raw base64 ECDSA P-256 public key");
+            return Ok(AuthKeyMaterial::EcdsaP256Public(key_bytes));
+        }
+
+        // If both parsing attempts failed, return error
+        tracing::error!("Failed to parse public key as either Ed25519 or ECDSA P-256");
+        Err(AuthError::InvalidToken)
     }
 }
 
@@ -547,12 +579,10 @@ fn is_cose_message(data: &[u8]) -> bool {
 
 impl Authenticator {
     pub fn new(key: &str) -> Result<Self, AuthError> {
-        let key_material = parse_key_format(key)?;
+        let key_material = parse_private_key_format(key)?;
         let can_sign = matches!(
             key_material,
-            AuthKeyMaterial::Hmac256(_)
-                | AuthKeyMaterial::Legacy(_)
-                | AuthKeyMaterial::EcdsaP256Private(_)
+            AuthKeyMaterial::Hmac256(_) | AuthKeyMaterial::Legacy(_)
         );
 
         Ok(Self {
@@ -582,17 +612,15 @@ impl Authenticator {
                     if private_key_count > 1 {
                         return Err(AuthError::MultiplePrivateKeys);
                     }
-                    let material = parse_key_format(private_key)?;
+                    let material = parse_private_key_format(private_key)?;
                     let can_sign = matches!(
                         material,
-                        AuthKeyMaterial::Hmac256(_)
-                            | AuthKeyMaterial::Legacy(_)
-                            | AuthKeyMaterial::EcdsaP256Private(_)
+                        AuthKeyMaterial::Hmac256(_) | AuthKeyMaterial::Legacy(_)
                     );
                     (material, can_sign)
                 }
                 (None, Some(public_key)) => {
-                    let material = parse_key_format(public_key)?;
+                    let material = parse_public_key_format(public_key)?;
                     (material, false)
                 }
                 (Some(_), Some(_)) => {
@@ -649,6 +677,15 @@ impl Authenticator {
                     key_entry.key_id.clone(),
                 )
             }
+            AuthKeyMaterial::Ed25519Private(key_bytes) => {
+                crate::cwt::CwtAuthenticator::new_ed25519(key_bytes, key_entry.key_id.clone())
+            }
+            AuthKeyMaterial::Ed25519Public(key_bytes) => {
+                crate::cwt::CwtAuthenticator::new_ed25519_public(
+                    key_bytes,
+                    key_entry.key_id.clone(),
+                )
+            }
         }
     }
 
@@ -675,6 +712,45 @@ impl Authenticator {
         &self.keys[0].key_material
     }
 
+    /// Extract the public key in PEM format for asymmetric keys
+    pub fn public_key_pem(&self) -> Result<String, AuthError> {
+        match &self.keys[0].key_material {
+            AuthKeyMaterial::EcdsaP256Private(private_bytes) => {
+                use p256::SecretKey;
+                let secret_key =
+                    SecretKey::from_slice(private_bytes).map_err(|_| AuthError::InvalidToken)?;
+                let public_key = secret_key.public_key();
+                let public_key_bytes = public_key.to_sec1_bytes();
+                let public_key_b64 = b64_encode(&public_key_bytes);
+                Ok(format!(
+                    "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----",
+                    public_key_b64
+                ))
+            }
+            AuthKeyMaterial::Ed25519Private(private_bytes) => {
+                use ed25519_dalek::SigningKey;
+                let key_array: [u8; 32] = private_bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| AuthError::InvalidToken)?;
+                let signing_key = SigningKey::from_bytes(&key_array);
+                let verifying_key = signing_key.verifying_key();
+                let public_key_bytes = verifying_key.to_bytes();
+                let public_key_b64 = b64_encode(&public_key_bytes);
+                Ok(format!(
+                    "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----",
+                    public_key_b64
+                ))
+            }
+            AuthKeyMaterial::Hmac256(_) | AuthKeyMaterial::Legacy(_) => {
+                Err(AuthError::InvalidToken) // Symmetric keys don't have public keys
+            }
+            AuthKeyMaterial::EcdsaP256Public(_) | AuthKeyMaterial::Ed25519Public(_) => {
+                Err(AuthError::InvalidToken) // Already public key, can't extract from public key
+            }
+        }
+    }
+
     pub fn server_token(&self) -> Result<String, AuthError> {
         self.server_token_cwt()
     }
@@ -687,7 +763,9 @@ impl Authenticator {
 
         let key_bytes = match &signing_key.key_material {
             AuthKeyMaterial::Legacy(key_bytes) => key_bytes,
-            AuthKeyMaterial::EcdsaP256Public(_) => return Err(AuthError::CannotSignWithPublicKey),
+            AuthKeyMaterial::EcdsaP256Public(_) | AuthKeyMaterial::Ed25519Public(_) => {
+                return Err(AuthError::CannotSignWithPublicKey)
+            }
             _ => return Err(AuthError::InvalidToken), // Only legacy keys supported for legacy tokens
         };
         hash_payload.extend_from_slice(key_bytes);
@@ -1089,6 +1167,23 @@ impl Authenticator {
         })
     }
 
+    pub fn gen_key_ed25519() -> Result<Authenticator, AuthError> {
+        use rand::{rngs::OsRng, RngCore};
+
+        let mut secret_bytes = [0u8; 32];
+        OsRng.fill_bytes(&mut secret_bytes);
+
+        Ok(Authenticator {
+            keys: vec![AuthKeyEntry {
+                key_id: None,
+                key_material: AuthKeyMaterial::Ed25519Private(secret_bytes.to_vec()),
+                can_sign: true,
+            }],
+            key_lookup: std::collections::HashMap::new(),
+            keys_without_id: vec![0],
+        })
+    }
+
     pub fn gen_key_legacy() -> Result<Authenticator, AuthError> {
         let key = rand::thread_rng().gen::<[u8; 30]>(); // 30-byte legacy keys
 
@@ -1166,7 +1261,7 @@ impl Authenticator {
                         (_, AuthError::InvalidToken) => last_error = err,
                         // Only replace KeyMismatch with signature errors
                         (AuthError::KeyMismatch, AuthError::InvalidSignature) => last_error = err,
-                        (AuthError::KeyMismatch, AuthError::HmacVerificationFailed) => {
+                        (AuthError::KeyMismatch, AuthError::SignatureVerificationFailed) => {
                             last_error = err
                         }
                         _ => {} // Keep the existing error
@@ -1301,9 +1396,9 @@ impl Authenticator {
                 tracing::debug!("Token has invalid claims structure");
                 AuthError::InvalidClaims
             }
-            crate::cwt::CwtError::HmacVerificationFailed => {
-                tracing::debug!("HMAC signature verification failed");
-                AuthError::HmacVerificationFailed
+            crate::cwt::CwtError::SignatureVerificationFailed => {
+                tracing::debug!("Signature verification failed");
+                AuthError::SignatureVerificationFailed
             }
             _ => {
                 tracing::debug!("Other CWT error: {:?}", e);
@@ -1432,9 +1527,9 @@ impl Authenticator {
                 tracing::debug!("Token has invalid claims structure");
                 AuthError::InvalidClaims
             }
-            crate::cwt::CwtError::HmacVerificationFailed => {
-                tracing::debug!("HMAC signature verification failed");
-                AuthError::HmacVerificationFailed
+            crate::cwt::CwtError::SignatureVerificationFailed => {
+                tracing::debug!("Signature verification failed");
+                AuthError::SignatureVerificationFailed
             }
             _ => {
                 tracing::debug!("Other CWT error: {:?}", e);
@@ -2112,7 +2207,7 @@ mod tests {
         // Should fail with signature verification error
         assert!(matches!(
             authenticator2.verify_doc_token(&token, "doc123", 0),
-            Err(AuthError::HmacVerificationFailed)
+            Err(AuthError::SignatureVerificationFailed)
         ));
     }
 
@@ -2764,9 +2859,9 @@ mod tests {
     fn test_multi_key_token_verification_with_key_id() {
         use crate::config::AuthKeyConfig;
 
-        // Create a multi-key authenticator with key IDs (one private, one public to avoid constraint violation)
+        // Create a multi-key authenticator with key IDs (one private HMAC, one ECDSA public key)
         let hmac_auth = Authenticator::gen_key_hmac().unwrap();
-        let legacy_auth = Authenticator::gen_key_legacy().unwrap();
+        let ecdsa_auth = Authenticator::gen_key_ecdsa().unwrap();
 
         let configs = vec![
             AuthKeyConfig {
@@ -2775,9 +2870,9 @@ mod tests {
                 public_key: None,
             },
             AuthKeyConfig {
-                key_id: Some("legacy-key".to_string()),
+                key_id: Some("ecdsa-key".to_string()),
                 private_key: None,
-                public_key: Some(legacy_auth.key_material().to_base64()), // Use as public key
+                public_key: Some(ecdsa_auth.public_key_pem().unwrap()),
             },
         ];
 
@@ -2787,26 +2882,19 @@ mod tests {
         let hmac_auth = Authenticator::gen_key_hmac()
             .unwrap()
             .with_key_id("hmac-key".try_into().unwrap());
-        let legacy_auth = Authenticator::gen_key_legacy()
+        let ecdsa_auth = Authenticator::gen_key_ecdsa()
             .unwrap()
-            .with_key_id("legacy-key".try_into().unwrap());
+            .with_key_id("ecdsa-key".try_into().unwrap());
 
         // Test tokens with correct key IDs
         let hmac_token = hmac_auth.server_token_cwt().unwrap();
-        let legacy_token = legacy_auth
-            .gen_doc_token(
-                "test-doc",
-                Authorization::Full,
-                ExpirationTimeEpochMillis(u64::MAX),
-                None,
-            )
-            .unwrap();
+        let ecdsa_token = ecdsa_auth.server_token_cwt().unwrap();
 
         // Multi-key authenticator should be able to verify both
         // Note: For this test to work properly, we'd need to ensure the same key material
         // For now, let's test the key ID extraction logic
         assert!(hmac_token.starts_with("hmac-key."));
-        assert!(legacy_token.starts_with("legacy-key."));
+        assert!(ecdsa_token.starts_with("ecdsa-key."));
     }
 
     #[test]
@@ -2816,6 +2904,7 @@ mod tests {
         // Create keys without key_id
         let legacy_key_material = Authenticator::gen_key_legacy().unwrap();
         let hmac_key_material = Authenticator::gen_key_hmac().unwrap();
+        let ecdsa_key_material = Authenticator::gen_key_ecdsa().unwrap();
 
         let configs = vec![
             AuthKeyConfig {
@@ -2846,7 +2935,7 @@ mod tests {
             AuthKeyConfig {
                 key_id: Some("readonly".to_string()),
                 private_key: None,
-                public_key: Some(hmac_key_material.key_material().to_base64()),
+                public_key: Some(ecdsa_key_material.public_key_pem().unwrap()),
             },
         ];
 
@@ -2888,10 +2977,10 @@ mod tests {
                 key_id: Some("key2".to_string()),
                 private_key: None,
                 public_key: Some(
-                    Authenticator::gen_key_hmac()
+                    Authenticator::gen_key_ecdsa()
                         .unwrap()
-                        .key_material()
-                        .to_base64(),
+                        .public_key_pem()
+                        .unwrap(),
                 ),
             },
         ];
@@ -2913,7 +3002,7 @@ mod tests {
 
         // Test that keys without key_id are tried in configuration order
         let legacy_auth1 = Authenticator::gen_key_legacy().unwrap();
-        let legacy_auth2 = Authenticator::gen_key_legacy().unwrap();
+        let ecdsa_auth2 = Authenticator::gen_key_ecdsa().unwrap();
 
         let configs = vec![
             AuthKeyConfig {
@@ -2924,7 +3013,7 @@ mod tests {
             AuthKeyConfig {
                 key_id: Some("with_id".to_string()),
                 private_key: None,
-                public_key: Some(legacy_auth2.key_material().to_base64()),
+                public_key: Some(ecdsa_auth2.public_key_pem().unwrap()),
             },
         ];
 
@@ -2978,35 +3067,9 @@ mod tests {
         let ecdsa_key2 = Authenticator::gen_key_ecdsa().unwrap();
 
         // Extract public keys from the private keys and format as PEM
-        let public_key1_pem = match ecdsa_key1.key_material() {
-            AuthKeyMaterial::EcdsaP256Private(private_bytes) => {
-                use p256::SecretKey;
-                let secret_key = SecretKey::from_slice(private_bytes).unwrap();
-                let public_key = secret_key.public_key();
-                let public_key_bytes = public_key.to_sec1_bytes();
-                let public_key_b64 = b64_encode(&public_key_bytes);
-                format!(
-                    "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----",
-                    public_key_b64
-                )
-            }
-            _ => panic!("Expected ECDSA private key"),
-        };
+        let public_key1_pem = ecdsa_key1.public_key_pem().unwrap();
 
-        let public_key2_pem = match ecdsa_key2.key_material() {
-            AuthKeyMaterial::EcdsaP256Private(private_bytes) => {
-                use p256::SecretKey;
-                let secret_key = SecretKey::from_slice(private_bytes).unwrap();
-                let public_key = secret_key.public_key();
-                let public_key_bytes = public_key.to_sec1_bytes();
-                let public_key_b64 = b64_encode(&public_key_bytes);
-                format!(
-                    "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----",
-                    public_key_b64
-                )
-            }
-            _ => panic!("Expected ECDSA private key"),
-        };
+        let public_key2_pem = ecdsa_key2.public_key_pem().unwrap();
 
         let configs = vec![
             AuthKeyConfig {
@@ -3036,7 +3099,7 @@ mod tests {
 
         // Simulate key rotation: old key + new key
         let old_key = Authenticator::gen_key_legacy().unwrap();
-        let new_key = Authenticator::gen_key_hmac().unwrap();
+        let new_key = Authenticator::gen_key_ecdsa().unwrap();
 
         // Phase 1: Old key for signing, new key for verification only
         let rotation_configs = vec![
@@ -3048,7 +3111,7 @@ mod tests {
             AuthKeyConfig {
                 key_id: Some("new-v2".to_string()),
                 private_key: None,
-                public_key: Some(new_key.key_material().to_base64()),
+                public_key: Some(new_key.public_key_pem().unwrap()),
             },
         ];
 

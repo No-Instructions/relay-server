@@ -3,6 +3,10 @@ use crate::auth::{DocPermission, FilePermission, Permission, PrefixPermission};
 use ciborium;
 use coset::{CborSerializable, CoseMac0Builder, CoseSign1Builder, HeaderBuilder};
 use ecdsa::{Signature, SigningKey, VerifyingKey};
+use ed25519_dalek::{
+    SecretKey as Ed25519SecretKey, Signature as Ed25519Signature, Signer,
+    SigningKey as Ed25519SigningKey, Verifier, VerifyingKey as Ed25519VerifyingKey,
+};
 use p256::{PublicKey, SecretKey};
 use thiserror::Error;
 
@@ -16,8 +20,8 @@ pub enum CwtError {
     UnsupportedAlgorithm,
     #[error("Invalid CWT claims")]
     InvalidClaims,
-    #[error("HMAC signature verification failed")]
-    HmacVerificationFailed,
+    #[error("Signature verification failed")]
+    SignatureVerificationFailed,
     #[error("Serialization error: {0}")]
     Serialization(String),
 }
@@ -42,6 +46,8 @@ enum KeyMaterial {
     Symmetric(Vec<u8>),
     EcdsaP256Private(SigningKey<p256::NistP256>),
     EcdsaP256Public(VerifyingKey<p256::NistP256>),
+    Ed25519Private(Ed25519SigningKey),
+    Ed25519Public(Ed25519VerifyingKey),
 }
 
 impl CwtAuthenticator {
@@ -98,6 +104,33 @@ impl CwtAuthenticator {
         })
     }
 
+    /// Creates a new CwtAuthenticator with an Ed25519 private key
+    pub fn new_ed25519(private_key_bytes: &[u8], key_id: Option<String>) -> Result<Self, CwtError> {
+        let secret_key =
+            Ed25519SecretKey::try_from(private_key_bytes).map_err(|_| CwtError::InvalidCose)?;
+        let signing_key = Ed25519SigningKey::from(&secret_key);
+        Ok(Self {
+            key_material: KeyMaterial::Ed25519Private(signing_key),
+            key_id,
+        })
+    }
+
+    /// Creates a new CwtAuthenticator with an Ed25519 public key
+    pub fn new_ed25519_public(
+        public_key_bytes: &[u8],
+        key_id: Option<String>,
+    ) -> Result<Self, CwtError> {
+        let key_array: &[u8; 32] = public_key_bytes
+            .try_into()
+            .map_err(|_| CwtError::InvalidCose)?;
+        let verifying_key =
+            Ed25519VerifyingKey::from_bytes(key_array).map_err(|_| CwtError::InvalidCose)?;
+        Ok(Self {
+            key_material: KeyMaterial::Ed25519Public(verifying_key),
+            key_id,
+        })
+    }
+
     /// Parse key material from raw bytes
     /// Default assumption for 32-byte keys is symmetric (HMAC) unless explicitly specified otherwise
     fn parse_key_material(key_bytes: &[u8]) -> Result<KeyMaterial, CwtError> {
@@ -118,8 +151,20 @@ impl CwtAuthenticator {
         if trimmed.starts_with("-----BEGIN") && trimmed.contains("-----END") {
             // PEM format - determine key type from header
             if trimmed.contains("-----BEGIN PUBLIC KEY-----") {
-                // ECDSA public key in PEM format
+                // Try Ed25519 first, then fall back to ECDSA
                 let key_bytes = Self::extract_pem_content(trimmed)?;
+
+                // Try Ed25519 public key first (32 bytes)
+                if key_bytes.len() == 32 {
+                    if let Ok(key_array) = key_bytes.as_slice().try_into() {
+                        if let Ok(verifying_key) = Ed25519VerifyingKey::from_bytes(key_array) {
+                            tracing::info!("Parsed PEM Ed25519 public key");
+                            return Ok(KeyMaterial::Ed25519Public(verifying_key));
+                        }
+                    }
+                }
+
+                // Fall back to ECDSA public key
                 let public_key = PublicKey::from_sec1_bytes(&key_bytes).map_err(|e| {
                     tracing::error!("Failed to parse ECDSA public key: {}", e);
                     CwtError::InvalidCose
@@ -130,8 +175,19 @@ impl CwtAuthenticator {
             } else if trimmed.contains("-----BEGIN PRIVATE KEY-----")
                 || trimmed.contains("-----BEGIN EC PRIVATE KEY-----")
             {
-                // ECDSA private key in PEM format
+                // Try Ed25519 first, then fall back to ECDSA
                 let key_bytes = Self::extract_pem_content(trimmed)?;
+
+                // Try Ed25519 private key first (32 bytes)
+                if key_bytes.len() == 32 {
+                    if let Ok(secret_key) = Ed25519SecretKey::try_from(key_bytes.as_slice()) {
+                        let signing_key = Ed25519SigningKey::from(&secret_key);
+                        tracing::info!("Parsed PEM Ed25519 private key");
+                        return Ok(KeyMaterial::Ed25519Private(signing_key));
+                    }
+                }
+
+                // Fall back to ECDSA private key
                 let secret_key = SecretKey::from_slice(&key_bytes).map_err(|e| {
                     tracing::error!("Failed to parse ECDSA private key: {}", e);
                     CwtError::InvalidCose
@@ -193,7 +249,11 @@ impl CwtAuthenticator {
                 tracing::debug!("Creating COSE_Sign1 token with ECDSA P-256 private key");
                 self.create_cwt_sign1(claims)?
             }
-            KeyMaterial::EcdsaP256Public(_) => {
+            KeyMaterial::Ed25519Private(_) => {
+                tracing::debug!("Creating COSE_Sign1 token with Ed25519 private key");
+                self.create_cwt_sign1(claims)?
+            }
+            KeyMaterial::EcdsaP256Public(_) | KeyMaterial::Ed25519Public(_) => {
                 tracing::error!(
                     "Cannot create tokens with public key - need private key for signing"
                 );
@@ -225,6 +285,8 @@ impl CwtAuthenticator {
             KeyMaterial::Symmetric(_) => coset::iana::Algorithm::HMAC_256_256, // Fallback for symmetric
             KeyMaterial::EcdsaP256Private(_) => coset::iana::Algorithm::ES256, // ES256 for ECDSA P-256
             KeyMaterial::EcdsaP256Public(_) => coset::iana::Algorithm::ES256, // ES256 for ECDSA P-256
+            KeyMaterial::Ed25519Private(_) => coset::iana::Algorithm::EdDSA,  // EdDSA for Ed25519
+            KeyMaterial::Ed25519Public(_) => coset::iana::Algorithm::EdDSA,   // EdDSA for Ed25519
         };
 
         let mut protected = HeaderBuilder::new().algorithm(algorithm);
@@ -395,9 +457,12 @@ impl CwtAuthenticator {
                                     return Err(CwtError::InvalidCose);
                                 }
                             }
-                            KeyMaterial::EcdsaP256Private(_) | KeyMaterial::EcdsaP256Public(_) => {
+                            KeyMaterial::EcdsaP256Private(_)
+                            | KeyMaterial::EcdsaP256Public(_)
+                            | KeyMaterial::Ed25519Private(_)
+                            | KeyMaterial::Ed25519Public(_) => {
                                 tracing::error!(
-                                    "COSE_Mac0 requires symmetric key, but ECDSA key provided"
+                                    "COSE_Mac0 requires symmetric key, but asymmetric key provided"
                                 );
                                 return Err(CwtError::InvalidCose);
                             }
@@ -407,8 +472,11 @@ impl CwtAuthenticator {
                         // COSE_Sign1
                         tracing::debug!("Found COSE_Sign1 tag (18)");
                         match &self.key_material {
-                            KeyMaterial::EcdsaP256Private(_) | KeyMaterial::EcdsaP256Public(_) => {
-                                tracing::debug!("Using ECDSA key for COSE_Sign1 verification");
+                            KeyMaterial::EcdsaP256Private(_)
+                            | KeyMaterial::EcdsaP256Public(_)
+                            | KeyMaterial::Ed25519Private(_)
+                            | KeyMaterial::Ed25519Public(_) => {
+                                tracing::debug!("Using asymmetric key for COSE_Sign1 verification");
 
                                 // Extract the inner array from the tag and re-encode it
                                 if let ciborium::Value::Tag(18, inner_array) = cose_cbor {
@@ -451,9 +519,10 @@ impl CwtAuthenticator {
 
                 match &self.key_material {
                     KeyMaterial::Symmetric(_) => self.verify_cwt_mac0(&cose_bytes),
-                    KeyMaterial::EcdsaP256Private(_) | KeyMaterial::EcdsaP256Public(_) => {
-                        self.verify_cwt_sign1(&cose_bytes)
-                    }
+                    KeyMaterial::EcdsaP256Private(_)
+                    | KeyMaterial::EcdsaP256Public(_)
+                    | KeyMaterial::Ed25519Private(_)
+                    | KeyMaterial::Ed25519Public(_) => self.verify_cwt_sign1(&cose_bytes),
                 }
             }
             _ => {
@@ -479,7 +548,7 @@ impl CwtAuthenticator {
                     if signature == expected_signature {
                         Ok(())
                     } else {
-                        Err(CwtError::HmacVerificationFailed)
+                        Err(CwtError::SignatureVerificationFailed)
                     }
                 }
                 KeyMaterial::EcdsaP256Private(signing_key) => {
@@ -490,13 +559,13 @@ impl CwtAuthenticator {
                     let signature_obj = match Signature::<p256::NistP256>::from_slice(signature) {
                         Ok(sig) => sig,
                         Err(_) => {
-                            return Err(CwtError::HmacVerificationFailed);
+                            return Err(CwtError::SignatureVerificationFailed);
                         }
                     };
 
                     match verifying_key.verify(data, &signature_obj) {
                         Ok(()) => Ok(()),
-                        Err(_) => Err(CwtError::HmacVerificationFailed),
+                        Err(_) => Err(CwtError::SignatureVerificationFailed),
                     }
                 }
                 KeyMaterial::EcdsaP256Public(verifying_key) => {
@@ -506,20 +575,49 @@ impl CwtAuthenticator {
                     let signature_obj = match Signature::<p256::NistP256>::from_slice(signature) {
                         Ok(sig) => sig,
                         Err(_) => {
-                            return Err(CwtError::HmacVerificationFailed);
+                            return Err(CwtError::SignatureVerificationFailed);
                         }
                     };
 
                     match verifying_key.verify(data, &signature_obj) {
                         Ok(()) => Ok(()),
-                        Err(_) => Err(CwtError::HmacVerificationFailed),
+                        Err(_) => Err(CwtError::SignatureVerificationFailed),
+                    }
+                }
+                KeyMaterial::Ed25519Private(signing_key) => {
+                    // Ed25519 verification using private key's verifying key
+                    let verifying_key = signing_key.verifying_key();
+                    let signature_obj = match Ed25519Signature::from_slice(signature) {
+                        Ok(sig) => sig,
+                        Err(_) => {
+                            return Err(CwtError::SignatureVerificationFailed);
+                        }
+                    };
+
+                    match verifying_key.verify(data, &signature_obj) {
+                        Ok(()) => Ok(()),
+                        Err(_) => Err(CwtError::SignatureVerificationFailed),
+                    }
+                }
+                KeyMaterial::Ed25519Public(verifying_key) => {
+                    // Ed25519 verification using public key directly
+                    let signature_obj = match Ed25519Signature::from_slice(signature) {
+                        Ok(sig) => sig,
+                        Err(_) => {
+                            return Err(CwtError::SignatureVerificationFailed);
+                        }
+                    };
+
+                    match verifying_key.verify(data, &signature_obj) {
+                        Ok(()) => Ok(()),
+                        Err(_) => Err(CwtError::SignatureVerificationFailed),
                     }
                 }
             }
         });
 
         if verification_result.is_err() {
-            return Err(CwtError::HmacVerificationFailed);
+            return Err(CwtError::SignatureVerificationFailed);
         }
 
         // Extract and parse claims
@@ -573,12 +671,12 @@ impl CwtAuthenticator {
             if tag == expected_tag {
                 Ok(())
             } else {
-                Err(CwtError::HmacVerificationFailed)
+                Err(CwtError::SignatureVerificationFailed)
             }
         });
 
         if verification_result.is_err() {
-            return Err(CwtError::HmacVerificationFailed);
+            return Err(CwtError::SignatureVerificationFailed);
         }
 
         // Extract and parse claims
@@ -720,7 +818,12 @@ impl CwtAuthenticator {
                 let signature: Signature<p256::NistP256> = signing_key.sign(data);
                 signature.to_bytes().to_vec()
             }
-            KeyMaterial::EcdsaP256Public(_) => {
+            KeyMaterial::Ed25519Private(signing_key) => {
+                // Ed25519 signing
+                let signature = signing_key.sign(data);
+                signature.to_bytes().to_vec()
+            }
+            KeyMaterial::EcdsaP256Public(_) | KeyMaterial::Ed25519Public(_) => {
                 // Cannot sign with public key
                 panic!("Cannot sign with public key - this should be caught earlier")
             }
@@ -731,11 +834,14 @@ impl CwtAuthenticator {
         // This method should only be called for symmetric keys
         let private_key = match &self.key_material {
             KeyMaterial::Symmetric(key) => key,
-            KeyMaterial::EcdsaP256Private(_) | KeyMaterial::EcdsaP256Public(_) => {
+            KeyMaterial::EcdsaP256Private(_)
+            | KeyMaterial::EcdsaP256Public(_)
+            | KeyMaterial::Ed25519Private(_)
+            | KeyMaterial::Ed25519Public(_) => {
                 tracing::error!(
-                    "create_mac_tag_with_alg called with EC key - this should not happen"
+                    "create_mac_tag_with_alg called with asymmetric key - this should not happen"
                 );
-                panic!("MAC operations not supported with EC keys");
+                panic!("MAC operations not supported with asymmetric keys");
             }
         };
 
@@ -1075,7 +1181,7 @@ mod tests {
         let wrong_auth = CwtAuthenticator::new(wrong_key, None).unwrap();
 
         let result = wrong_auth.verify_cwt_mac0(&mac0_token);
-        assert!(matches!(result, Err(CwtError::HmacVerificationFailed)));
+        assert!(matches!(result, Err(CwtError::SignatureVerificationFailed)));
     }
 
     #[test]
@@ -1241,7 +1347,7 @@ mod tests {
         let token = authenticator.create_cwt(claims).unwrap();
         let result = other_authenticator.verify_cwt(&token);
 
-        assert_eq!(result, Err(CwtError::HmacVerificationFailed));
+        assert_eq!(result, Err(CwtError::SignatureVerificationFailed));
     }
 
     #[test]
@@ -1308,5 +1414,143 @@ mod tests {
             ecdsa_verification_result.is_err(),
             "Symmetric key should not be able to verify ECDSA token"
         );
+    }
+
+    #[test]
+    fn test_ed25519_cwt_roundtrip() {
+        use rand::rngs::OsRng;
+        use rand::RngCore;
+
+        // Generate a random Ed25519 key pair
+        let mut secret_bytes = [0u8; 32];
+        OsRng.fill_bytes(&mut secret_bytes);
+        let secret_key: Ed25519SecretKey = secret_bytes;
+        let signing_key = Ed25519SigningKey::from(&secret_key);
+        let private_key_bytes = secret_key;
+        let public_key_bytes = signing_key.verifying_key().to_bytes();
+
+        // Create authenticators with private and public keys
+        let private_auth =
+            CwtAuthenticator::new_ed25519(&private_key_bytes, Some("ed25519-test".to_string()))
+                .unwrap();
+        let public_auth = CwtAuthenticator::new_ed25519_public(
+            &public_key_bytes,
+            Some("ed25519-test".to_string()),
+        )
+        .unwrap();
+
+        let claims = CwtClaims {
+            issuer: Some("ed25519-issuer".to_string()),
+            subject: Some("test-user".to_string()),
+            audience: Some("test-audience".to_string()),
+            expiration: Some(9999999999),
+            issued_at: Some(1000000000),
+            scope: "doc:test-ed25519:rw".to_string(),
+            channel: Some("ed25519-channel".to_string()),
+        };
+
+        // Create token with private key
+        let token = private_auth.create_cwt(claims.clone()).unwrap();
+
+        // Verify with private key
+        let decoded_private = private_auth.verify_cwt(&token).unwrap();
+        assert_eq!(decoded_private, claims);
+
+        // Verify with public key
+        let decoded_public = public_auth.verify_cwt(&token).unwrap();
+        assert_eq!(decoded_public, claims);
+
+        // Verify all claims are correct
+        assert_eq!(decoded_public.issuer, Some("ed25519-issuer".to_string()));
+        assert_eq!(decoded_public.subject, Some("test-user".to_string()));
+        assert_eq!(decoded_public.audience, Some("test-audience".to_string()));
+        assert_eq!(decoded_public.scope, "doc:test-ed25519:rw");
+        assert_eq!(decoded_public.channel, Some("ed25519-channel".to_string()));
+    }
+
+    #[test]
+    fn test_ed25519_vs_ecdsa_incompatibility() {
+        use p256::SecretKey;
+        use rand::rngs::OsRng;
+
+        // Create Ed25519 key
+        use rand::RngCore;
+        let mut ed25519_secret_bytes = [0u8; 32];
+        OsRng.fill_bytes(&mut ed25519_secret_bytes);
+        let ed25519_private_bytes = ed25519_secret_bytes;
+        let ed25519_auth = CwtAuthenticator::new_ed25519(&ed25519_private_bytes, None).unwrap();
+
+        // Create ECDSA P-256 key
+        let ecdsa_secret_key = SecretKey::random(&mut OsRng);
+        let ecdsa_private_bytes = ecdsa_secret_key.to_bytes();
+        let ecdsa_auth = CwtAuthenticator::new_ecdsa_p256(&ecdsa_private_bytes, None).unwrap();
+
+        let claims = CwtClaims {
+            issuer: Some("test".to_string()),
+            subject: None,
+            audience: None,
+            expiration: Some(9999999999),
+            issued_at: None,
+            scope: "server".to_string(),
+            channel: None,
+        };
+
+        // Create tokens with different key types
+        let ed25519_token = ed25519_auth.create_cwt(claims.clone()).unwrap();
+        let ecdsa_token = ecdsa_auth.create_cwt(claims.clone()).unwrap();
+
+        // Verify that cross-verification fails
+        let ecdsa_verify_ed25519 = ecdsa_auth.verify_cwt(&ed25519_token);
+        assert!(
+            ecdsa_verify_ed25519.is_err(),
+            "ECDSA key should not be able to verify Ed25519 token"
+        );
+
+        let ed25519_verify_ecdsa = ed25519_auth.verify_cwt(&ecdsa_token);
+        assert!(
+            ed25519_verify_ecdsa.is_err(),
+            "Ed25519 key should not be able to verify ECDSA token"
+        );
+
+        // Verify that self-verification works
+        assert!(ed25519_auth.verify_cwt(&ed25519_token).is_ok());
+        assert!(ecdsa_auth.verify_cwt(&ecdsa_token).is_ok());
+    }
+
+    #[test]
+    fn test_ed25519_different_algorithms() {
+        use rand::rngs::OsRng;
+
+        use rand::RngCore;
+        let mut secret_bytes = [0u8; 32];
+        OsRng.fill_bytes(&mut secret_bytes);
+        let private_key_bytes = secret_bytes;
+        let ed25519_auth =
+            CwtAuthenticator::new_ed25519(&private_key_bytes, Some("test-ed25519".to_string()))
+                .unwrap();
+
+        let claims = CwtClaims {
+            issuer: Some("test-issuer".to_string()),
+            subject: None,
+            audience: None,
+            expiration: Some(9999999999),
+            issued_at: Some(1000000000),
+            scope: "test:ed25519".to_string(),
+            channel: None,
+        };
+
+        // Test create_cwt (wrapped in CWT tag)
+        let wrapped_token = ed25519_auth.create_cwt(claims.clone()).unwrap();
+        let decoded_wrapped = ed25519_auth.verify_cwt(&wrapped_token).unwrap();
+        assert_eq!(decoded_wrapped, claims);
+
+        // Test create_cwt_sign1 (direct COSE_Sign1)
+        let sign1_token = ed25519_auth.create_cwt_sign1(claims.clone()).unwrap();
+        let decoded_sign1 = ed25519_auth.verify_cwt_sign1(&sign1_token).unwrap();
+        assert_eq!(decoded_sign1, claims);
+
+        // Verify that both can be verified by verify_cwt auto-detection
+        assert!(ed25519_auth.verify_cwt(&wrapped_token).is_ok());
+        assert!(ed25519_auth.verify_cwt(&sign1_token).is_ok());
     }
 }
