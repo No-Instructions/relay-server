@@ -4,11 +4,97 @@ use std::time::SystemTime;
 use tokio::io::AsyncReadExt;
 use y_sweet_core::{
     api_types::Authorization,
-    auth::{Authenticator, ExpirationTimeEpochMillis, Permission},
+    auth::{AuthKeyEntry, AuthKeyMaterial, Authenticator, ExpirationTimeEpochMillis, Permission},
     store::{s3::S3Config, s3::S3Store, Store},
 };
 
-async fn sign_stdin(auth: &Authenticator) -> Result<()> {
+fn create_authenticator_with_type(
+    key: &str,
+    key_type: &str,
+) -> Result<Authenticator, anyhow::Error> {
+    match key_type {
+        "hmac" => {
+            // For HMAC, try to use the standard constructor first
+            match Authenticator::new(key) {
+                Ok(auth) => Ok(auth),
+                Err(_) => {
+                    // Fall back to manual construction
+                    use y_sweet_core::auth::b64_decode;
+                    let key_bytes = b64_decode(key.trim())?;
+                    if key_bytes.len() != 32 {
+                        anyhow::bail!("HMAC keys must be 32 bytes");
+                    }
+                    Ok(Authenticator {
+                        keys: vec![AuthKeyEntry {
+                            key_id: None,
+                            key_material: AuthKeyMaterial::Hmac256(key_bytes),
+                            can_sign: true,
+                        }],
+                        key_lookup: std::collections::HashMap::new(),
+                        keys_without_id: vec![0],
+                    })
+                }
+            }
+        }
+        "legacy" => {
+            // For legacy, try to use the standard constructor first
+            match Authenticator::new(key) {
+                Ok(auth) => Ok(auth),
+                Err(_) => {
+                    // Fall back to manual construction
+                    use y_sweet_core::auth::b64_decode;
+                    let key_bytes = b64_decode(key.trim())?;
+                    if key_bytes.len() != 30 {
+                        anyhow::bail!("Legacy keys must be 30 bytes");
+                    }
+                    Ok(Authenticator {
+                        keys: vec![AuthKeyEntry {
+                            key_id: None,
+                            key_material: AuthKeyMaterial::Legacy(key_bytes),
+                            can_sign: true,
+                        }],
+                        key_lookup: std::collections::HashMap::new(),
+                        keys_without_id: vec![0],
+                    })
+                }
+            }
+        }
+        "es256" => {
+            // For ES256, we need manual construction since Authenticator::new doesn't support it
+            use y_sweet_core::auth::b64_decode;
+            let key_bytes = b64_decode(key.trim())?;
+            Ok(Authenticator {
+                keys: vec![AuthKeyEntry {
+                    key_id: None,
+                    key_material: AuthKeyMaterial::EcdsaP256Private(key_bytes),
+                    can_sign: true,
+                }],
+                key_lookup: std::collections::HashMap::new(),
+                keys_without_id: vec![0],
+            })
+        }
+        "eddsa" => {
+            // For EdDSA, we need manual construction since Authenticator::new doesn't support it
+            use y_sweet_core::auth::b64_decode;
+            let key_bytes = b64_decode(key.trim())?;
+            if key_bytes.len() != 32 {
+                anyhow::bail!("EdDSA keys must be 32 bytes");
+            }
+            Ok(Authenticator {
+                keys: vec![AuthKeyEntry {
+                    key_id: None,
+                    key_material: AuthKeyMaterial::Ed25519Private(key_bytes),
+                    can_sign: true,
+                }],
+                key_lookup: std::collections::HashMap::new(),
+                keys_without_id: vec![0],
+            })
+        }
+        _ => anyhow::bail!("Invalid key type. Must be: hmac, legacy, es256, or eddsa"),
+    }
+}
+
+async fn sign_stdin(auth: &Authenticator, key_type: &str) -> Result<()> {
     let mut stdin = tokio::io::stdin();
     let mut buffer = String::new();
     stdin.read_to_string(&mut buffer).await?;
@@ -64,7 +150,11 @@ async fn sign_stdin(auth: &Authenticator) -> Result<()> {
             let doc_id =
                 doc_id.ok_or_else(|| anyhow::anyhow!("docId is required for document tokens"))?;
 
-            let token = auth.gen_doc_token(doc_id, authorization, expiration, None)?;
+            let token = if key_type == "legacy" {
+                auth.gen_doc_token(doc_id, authorization, expiration, None)?
+            } else {
+                auth.gen_doc_token_cwt(doc_id, authorization, expiration, None, None)?
+            };
 
             output.insert(
                 "docId".to_string(),
@@ -92,15 +182,28 @@ async fn sign_stdin(auth: &Authenticator) -> Result<()> {
             let doc_id =
                 doc_id.ok_or_else(|| anyhow::anyhow!("docId is required for file tokens"))?;
 
-            let token = auth.gen_file_token(
-                file_hash,
-                doc_id,
-                authorization,
-                expiration,
-                content_type,
-                content_length,
-                None,
-            )?;
+            let token = if key_type == "legacy" {
+                auth.gen_file_token(
+                    file_hash,
+                    doc_id,
+                    authorization,
+                    expiration,
+                    content_type,
+                    content_length,
+                    None,
+                )?
+            } else {
+                auth.gen_file_token_cwt(
+                    file_hash,
+                    doc_id,
+                    authorization,
+                    expiration,
+                    content_type,
+                    content_length,
+                    None,
+                    None,
+                )?
+            };
 
             output.insert(
                 "fileHash".to_string(),
@@ -201,7 +304,7 @@ async fn sign_stdin(auth: &Authenticator) -> Result<()> {
     Ok(())
 }
 
-async fn verify_stdin(auth: &Authenticator, id: Option<&str>) -> Result<()> {
+async fn verify_stdin(auth: &Authenticator, id: Option<&str>, key_type: &str) -> Result<()> {
     let mut stdin = tokio::io::stdin();
     let mut token = String::new();
     stdin.read_to_string(&mut token).await?;
@@ -222,7 +325,13 @@ async fn verify_stdin(auth: &Authenticator, id: Option<&str>) -> Result<()> {
     );
 
     // First, try to decode the token to determine its type and extract payload data
-    let token_decode_result = auth.decode_token(token);
+    let token_decode_result = if key_type == "legacy" {
+        auth.decode_token(token)
+    } else {
+        // For CWT tokens, we need to use verify_token_auto to extract the permission
+        // but we can't extract full payload details easily, so we'll handle this in verification
+        Err(y_sweet_core::auth::AuthError::InvalidToken)
+    };
     let token_type = match &token_decode_result {
         Ok(payload) => {
             match &payload.payload {
@@ -345,12 +454,30 @@ async fn verify_stdin(auth: &Authenticator, id: Option<&str>) -> Result<()> {
             }
         }
         Err(err) => {
-            // Even if token is invalid, add the error for diagnostics
-            verification.insert(
-                "error".to_string(),
-                serde_json::Value::String(format!("Failed to decode token: {}", err)),
-            );
-            "unknown"
+            // For CWT tokens, we can't decode the payload easily, so try verification to determine type
+            if key_type != "legacy" {
+                match auth.verify_token_auto(token, current_time) {
+                    Ok(Permission::Server) => "server",
+                    Ok(Permission::Doc(_)) => "document",
+                    Ok(Permission::File(_)) => "file",
+                    Ok(Permission::Prefix(_)) => "prefix",
+                    Err(_) => {
+                        // If verification also fails, add the original decode error
+                        verification.insert(
+                            "error".to_string(),
+                            serde_json::Value::String(format!("Failed to decode token: {}", err)),
+                        );
+                        "unknown"
+                    }
+                }
+            } else {
+                // For legacy tokens, add the decode error
+                verification.insert(
+                    "error".to_string(),
+                    serde_json::Value::String(format!("Failed to decode token: {}", err)),
+                );
+                "unknown"
+            }
         }
     };
 
@@ -364,7 +491,18 @@ async fn verify_stdin(auth: &Authenticator, id: Option<&str>) -> Result<()> {
             // For server tokens we need to check:
             // 1. If it's a valid server token
             // 2. If a doc_id was provided, note that server tokens can access all docs
-            match auth.verify_server_token(token, current_time) {
+            let verify_result = if key_type == "legacy" {
+                auth.verify_server_token(token, current_time).map(|_| ())
+            } else {
+                // For CWT tokens, use auto verification and check if it's a server permission
+                match auth.verify_token_auto(token, current_time) {
+                    Ok(Permission::Server) => Ok(()),
+                    Ok(_) => Err(y_sweet_core::auth::AuthError::InvalidToken),
+                    Err(e) => Err(e),
+                }
+            };
+
+            match verify_result {
                 Ok(()) => {
                     verification.insert("valid".to_string(), serde_json::Value::Bool(true));
 
@@ -396,7 +534,20 @@ async fn verify_stdin(auth: &Authenticator, id: Option<&str>) -> Result<()> {
         }
         "document" => {
             if let Some(id) = id {
-                match auth.verify_doc_token(token, id, current_time) {
+                let verify_result = if key_type == "legacy" {
+                    auth.verify_doc_token(token, id, current_time)
+                } else {
+                    // For CWT tokens, use auto verification
+                    match auth.verify_token_auto(token, current_time) {
+                        Ok(Permission::Doc(doc_perm)) if doc_perm.doc_id == id => {
+                            Ok(doc_perm.authorization)
+                        }
+                        Ok(_) => Err(y_sweet_core::auth::AuthError::InvalidToken),
+                        Err(e) => Err(e),
+                    }
+                };
+
+                match verify_result {
                     Ok(authorization) => {
                         let auth_str = match authorization {
                             Authorization::ReadOnly => "read-only",
@@ -690,6 +841,10 @@ enum SignSubcommand {
         /// The authentication key for signing tokens
         #[clap(long, env = "RELAY_SERVER_AUTH")]
         auth: String,
+
+        /// Key type (hmac, legacy, es256, eddsa)
+        #[clap(long, default_value = "hmac")]
+        key_type: String,
     },
 
     /// Verify a token for a document or file
@@ -697,6 +852,10 @@ enum SignSubcommand {
         /// The authentication key for verifying tokens
         #[clap(long, env = "RELAY_SERVER_AUTH")]
         auth: String,
+
+        /// Key type (hmac, legacy, es256, eddsa)
+        #[clap(long, default_value = "hmac")]
+        key_type: String,
 
         /// The document ID to verify against
         #[clap(long)]
@@ -740,19 +899,20 @@ async fn main() -> Result<()> {
     // No need for complex logging setup in this simple tool
 
     match &opts.subcmd {
-        SignSubcommand::Sign { auth } => {
-            let authenticator = Authenticator::new(auth)?;
-            sign_stdin(&authenticator).await?;
+        SignSubcommand::Sign { auth, key_type } => {
+            let authenticator = create_authenticator_with_type(auth, key_type)?;
+            sign_stdin(&authenticator, key_type).await?;
         }
         SignSubcommand::Verify {
             auth,
+            key_type,
             doc_id,
             file_hash,
         } => {
-            let authenticator = Authenticator::new(auth)?;
+            let authenticator = create_authenticator_with_type(auth, key_type)?;
             // Use the doc_id if provided, otherwise use file_hash if provided
             let id = doc_id.as_deref().or(file_hash.as_deref());
-            verify_stdin(&authenticator, id).await?;
+            verify_stdin(&authenticator, id, key_type).await?;
         }
         SignSubcommand::Presign {
             action,
