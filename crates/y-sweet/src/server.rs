@@ -103,7 +103,7 @@ pub struct Server {
     store: Option<Arc<Box<dyn Store>>>,
     checkpoint_freq: Duration,
     authenticator: Option<Authenticator>,
-    url_prefix: Option<Url>,
+    url: Option<Url>,
     allowed_hosts: Vec<AllowedHost>,
     cancellation_token: CancellationToken,
     /// Whether to garbage collect docs that are no longer in use.
@@ -120,7 +120,7 @@ impl Server {
         store: Option<Box<dyn Store>>,
         checkpoint_freq: Duration,
         authenticator: Option<Authenticator>,
-        url_prefix: Option<Url>,
+        url: Option<Url>,
         allowed_hosts: Vec<AllowedHost>,
         cancellation_token: CancellationToken,
         doc_gc: bool,
@@ -173,7 +173,7 @@ impl Server {
             store: store.map(Arc::new),
             checkpoint_freq,
             authenticator,
-            url_prefix,
+            url,
             allowed_hosts,
             cancellation_token,
             doc_gc,
@@ -1199,13 +1199,13 @@ async fn new_doc(
 }
 
 fn generate_context_aware_urls(
-    url_prefix: &Option<Url>,
+    url: &Option<Url>,
     allowed_hosts: &[AllowedHost],
     request_host: &str,
     doc_id: &str,
 ) -> Result<(String, String), AppError> {
     // Priority 1: Explicit URL prefix
-    if let Some(prefix) = url_prefix {
+    if let Some(prefix) = url {
         let ws_scheme = if prefix.scheme() == "https" {
             "wss"
         } else {
@@ -1287,7 +1287,7 @@ async fn auth_doc(
     };
 
     let (url, base_url) = generate_context_aware_urls(
-        &server_state.url_prefix,
+        &server_state.url,
         &server_state.allowed_hosts,
         &host.to_string(),
         &doc_id,
@@ -2382,7 +2382,8 @@ mod test {
         }
 
         // Create a mock authenticator
-        let authenticator = y_sweet_core::auth::Authenticator::gen_key().unwrap();
+        let mut authenticator = y_sweet_core::auth::Authenticator::gen_key().unwrap();
+        authenticator.set_expected_audience(Some("https://api.example.com".to_string()));
         let doc_id = "test-doc-123";
         let file_hash = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
 
@@ -2479,13 +2480,12 @@ mod test {
 
     #[tokio::test]
     async fn test_generate_context_aware_urls_with_prefix() {
-        let url_prefix: Url = "https://api.example.com".parse().unwrap();
+        let url: Url = "https://api.example.com".parse().unwrap();
         let allowed_hosts = vec![];
         let doc_id = "test-doc";
 
         let (ws_url, base_url) =
-            generate_context_aware_urls(&Some(url_prefix), &allowed_hosts, "unused-host", doc_id)
-                .unwrap();
+            generate_context_aware_urls(&Some(url), &allowed_hosts, "unused-host", doc_id).unwrap();
 
         assert_eq!(ws_url, "wss://api.example.com/d/test-doc/ws");
         assert_eq!(base_url, "https://api.example.com/d/test-doc");

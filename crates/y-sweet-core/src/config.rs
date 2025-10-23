@@ -45,7 +45,7 @@ pub struct ServerConfig {
     #[serde(default = "default_port")]
     pub port: u16,
 
-    pub url_prefix: Option<String>,
+    pub url: Option<String>,
 
     #[serde(default)]
     pub allowed_hosts: Vec<AllowedHost>,
@@ -270,7 +270,7 @@ impl Default for ServerConfig {
         Self {
             host: default_host(),
             port: default_port(),
-            url_prefix: None,
+            url: None,
             allowed_hosts: Vec::new(),
             checkpoint_freq_seconds: default_checkpoint_freq_seconds(),
             doc_gc: default_doc_gc(),
@@ -432,12 +432,12 @@ impl Config {
             }
         }
 
-        if let Ok(url_prefix) = env::var("RELAY_SERVER_URL") {
+        if let Ok(url) = env::var("RELAY_SERVER_URL") {
             tracing::info!(
-                "Config override: server.url_prefix = {} (from RELAY_SERVER_URL)",
-                url_prefix
+                "Config override: server.url = {} (from RELAY_SERVER_URL)",
+                url
             );
-            self.server.url_prefix = Some(url_prefix);
+            self.server.url = Some(url);
         }
 
         if let Ok(checkpoint_freq) = env::var("RELAY_SERVER_CHECKPOINT_FREQ_SECONDS") {
@@ -615,11 +615,10 @@ impl Config {
             }
         }
 
-        // Validate URL prefix if present
-        if let Some(ref url_prefix) = self.server.url_prefix {
-            Url::parse(url_prefix).map_err(|_| {
-                ConfigError::InvalidConfiguration(format!("Invalid URL prefix: {}", url_prefix))
-            })?;
+        // Validate URL if present
+        if let Some(ref url) = self.server.url {
+            Url::parse(url)
+                .map_err(|_| ConfigError::InvalidConfiguration(format!("Invalid URL: {}", url)))?;
         }
 
         // Validate store configuration

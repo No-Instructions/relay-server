@@ -104,6 +104,10 @@ pub enum AuthError {
     NoSigningKey,
     #[error("Duplicate key_id: {0}")]
     DuplicateKeyId(String),
+    #[error("Invalid audience claim: expected '{expected}', found '{found}'")]
+    InvalidAudience { expected: String, found: String },
+    #[error("Missing audience claim: expected '{expected}'")]
+    MissingAudience { expected: String },
 }
 
 impl AuthError {
@@ -126,6 +130,8 @@ impl AuthError {
             AuthError::NoKeyProvided => "no_key_provided",
             AuthError::NoSigningKey => "no_signing_key",
             AuthError::DuplicateKeyId(_) => "duplicate_key_id",
+            AuthError::InvalidAudience { .. } => "invalid_audience",
+            AuthError::MissingAudience { .. } => "missing_audience",
         }
     }
 }
@@ -174,6 +180,7 @@ pub struct Authenticator {
     pub keys: Vec<AuthKeyEntry>,
     pub key_lookup: std::collections::HashMap<String, usize>,
     pub keys_without_id: Vec<usize>,
+    pub expected_audience: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -593,6 +600,7 @@ impl Authenticator {
             }],
             key_lookup: std::collections::HashMap::new(),
             keys_without_id: vec![0],
+            expected_audience: None,
         })
     }
 
@@ -651,7 +659,13 @@ impl Authenticator {
             keys,
             key_lookup,
             keys_without_id,
+            expected_audience: None,
         })
+    }
+
+    /// Set the expected audience for CWT token validation
+    pub fn set_expected_audience(&mut self, audience: Option<String>) {
+        self.expected_audience = audience;
     }
 
     /// Create a CWT authenticator from a specific key entry
@@ -807,6 +821,7 @@ impl Authenticator {
             keys,
             key_lookup,
             keys_without_id,
+            expected_audience: None,
         }
     }
 
@@ -1003,7 +1018,7 @@ impl Authenticator {
         let claims = CwtClaims {
             issuer: Some("relay-server".to_string()),
             subject,
-            audience: None,
+            audience: self.expected_audience.clone(),
             expiration: expiration_time.map(|exp| exp.0 / 1000), // Convert to seconds
             issued_at: Some(
                 std::time::SystemTime::now()
@@ -1164,6 +1179,7 @@ impl Authenticator {
             }],
             key_lookup: std::collections::HashMap::new(),
             keys_without_id: vec![0],
+            expected_audience: None,
         })
     }
 
@@ -1181,6 +1197,7 @@ impl Authenticator {
             }],
             key_lookup: std::collections::HashMap::new(),
             keys_without_id: vec![0],
+            expected_audience: None,
         })
     }
 
@@ -1195,6 +1212,7 @@ impl Authenticator {
             }],
             key_lookup: std::collections::HashMap::new(),
             keys_without_id: vec![0],
+            expected_audience: None,
         })
     }
 
@@ -1285,7 +1303,15 @@ impl Authenticator {
                 let payload = self.verify_custom_with_key(key_entry, token, current_time)?;
                 Ok(payload.payload)
             }
-            TokenFormat::Cwt => self.verify_cwt_with_key(key_entry, token, current_time),
+            TokenFormat::Cwt => {
+                if let Some(ref audience) = self.expected_audience {
+                    self.verify_cwt_with_key(key_entry, token, current_time, audience)
+                } else {
+                    // For backward compatibility, skip audience validation if not configured
+                    tracing::warn!("CWT token verification without audience validation - consider configuring server.url");
+                    return Err(AuthError::InvalidToken);
+                }
+            }
         }
     }
 
@@ -1366,6 +1392,7 @@ impl Authenticator {
         key_entry: &AuthKeyEntry,
         token: &str,
         current_time: u64,
+        expected_audience: &str,
     ) -> Result<Permission, AuthError> {
         use crate::cwt::scope_to_permission;
 
@@ -1383,7 +1410,7 @@ impl Authenticator {
                 AuthError::InvalidToken
             })?;
 
-        let claims = cwt_auth.verify_cwt(&token_bytes).map_err(|e| match e {
+        let claims = cwt_auth.verify_cwt(&token_bytes, expected_audience).map_err(|e| match e {
             crate::cwt::CwtError::InvalidCbor => {
                 tracing::debug!("Token has invalid CBOR structure");
                 AuthError::InvalidCbor
@@ -1399,6 +1426,21 @@ impl Authenticator {
             crate::cwt::CwtError::SignatureVerificationFailed => {
                 tracing::debug!("Signature verification failed");
                 AuthError::SignatureVerificationFailed
+            }
+            crate::cwt::CwtError::InvalidAudience { expected, found } => {
+                tracing::warn!(
+                    expected = expected,
+                    found = found,
+                    "Authentication failed: CWT token audience validation failed - potential cross-service token reuse attempt"
+                );
+                AuthError::InvalidAudience { expected, found }
+            }
+            crate::cwt::CwtError::MissingAudience { expected } => {
+                tracing::warn!(
+                    expected = expected,
+                    "Authentication failed: CWT token missing audience claim - potential security risk"
+                );
+                AuthError::MissingAudience { expected }
             }
             _ => {
                 tracing::debug!("Other CWT error: {:?}", e);
@@ -1459,6 +1501,7 @@ impl Authenticator {
         &self,
         token: &str,
         current_time: u64,
+        expected_audience: &str,
     ) -> Result<(Permission, Option<String>), AuthError> {
         // Use the new multi-key verification logic
         // Extract key_id from token (if present)
@@ -1472,7 +1515,12 @@ impl Authenticator {
         if let Some(key_id) = token_key_id {
             // Use hashmap lookup for keys with key_id (O(1) performance)
             if let Some(&index) = self.key_lookup.get(key_id) {
-                return self.verify_cwt_with_channel(&self.keys[index], token_data, current_time);
+                return self.verify_cwt_with_channel(
+                    &self.keys[index],
+                    token_data,
+                    current_time,
+                    expected_audience,
+                );
             } else {
                 return Err(AuthError::KeyMismatch);
             }
@@ -1480,9 +1528,12 @@ impl Authenticator {
 
         // For tokens without key_id, try all keys without key_id in configuration order
         for &index in &self.keys_without_id {
-            if let Ok((permission, channel)) =
-                self.verify_cwt_with_channel(&self.keys[index], token, current_time)
-            {
+            if let Ok((permission, channel)) = self.verify_cwt_with_channel(
+                &self.keys[index],
+                token,
+                current_time,
+                expected_audience,
+            ) {
                 return Ok((permission, channel));
             }
         }
@@ -1497,6 +1548,7 @@ impl Authenticator {
         key_entry: &AuthKeyEntry,
         token: &str,
         current_time: u64,
+        expected_audience: &str,
     ) -> Result<(Permission, Option<String>), AuthError> {
         use crate::cwt::scope_to_permission;
 
@@ -1514,7 +1566,7 @@ impl Authenticator {
                 AuthError::InvalidToken
             })?;
 
-        let claims = cwt_auth.verify_cwt(&token_bytes).map_err(|e| match e {
+        let claims = cwt_auth.verify_cwt(&token_bytes, expected_audience).map_err(|e| match e {
             crate::cwt::CwtError::InvalidCbor => {
                 tracing::debug!("Token has invalid CBOR structure");
                 AuthError::InvalidCbor
@@ -1530,6 +1582,21 @@ impl Authenticator {
             crate::cwt::CwtError::SignatureVerificationFailed => {
                 tracing::debug!("Signature verification failed");
                 AuthError::SignatureVerificationFailed
+            }
+            crate::cwt::CwtError::InvalidAudience { expected, found } => {
+                tracing::warn!(
+                    expected = expected,
+                    found = found,
+                    "Authentication failed: CWT token audience validation failed - potential cross-service token reuse attempt"
+                );
+                AuthError::InvalidAudience { expected, found }
+            }
+            crate::cwt::CwtError::MissingAudience { expected } => {
+                tracing::warn!(
+                    expected = expected,
+                    "Authentication failed: CWT token missing audience claim - potential security risk"
+                );
+                AuthError::MissingAudience { expected }
             }
             _ => {
                 tracing::debug!("Other CWT error: {:?}", e);
@@ -1673,9 +1740,14 @@ impl Authenticator {
                 Ok((permission, None)) // Custom tokens don't have channel claims
             }
             TokenFormat::Cwt => {
-                let (permission, channel) =
-                    self.verify_cwt_token_with_channel(token, current_time)?;
-                Ok((permission, channel))
+                if let Some(ref audience) = self.expected_audience {
+                    let (permission, channel) =
+                        self.verify_cwt_token_with_channel(token, current_time, audience)?;
+                    Ok((permission, channel))
+                } else {
+                    tracing::warn!("CWT token verification without audience validation - consider configuring server.url");
+                    return Err(AuthError::InvalidToken);
+                }
             }
         }
     }
@@ -1684,6 +1756,12 @@ impl Authenticator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn create_test_authenticator_with_audience() -> Authenticator {
+        let mut auth = Authenticator::gen_key().unwrap();
+        auth.set_expected_audience(Some("https://api.example.com".to_string()));
+        auth
+    }
 
     #[test]
     fn test_file_token_with_metadata() {
@@ -1841,7 +1919,7 @@ mod tests {
 
     #[test]
     fn test_server_token_for_doc_auth() {
-        let authenticator = Authenticator::gen_key().unwrap();
+        let authenticator = create_test_authenticator_with_audience();
         let server_token = authenticator.server_token().unwrap();
         assert!(matches!(
             authenticator.verify_doc_token(&server_token, "doc123", 0),
@@ -1874,9 +1952,10 @@ mod tests {
         ));
 
         // Test CWT tokens with key ID
-        let cwt_authenticator = Authenticator::gen_key()
+        let mut cwt_authenticator = Authenticator::gen_key()
             .unwrap()
             .with_key_id("myKeyId".try_into().unwrap());
+        cwt_authenticator.set_expected_audience(Some("https://api.example.com".to_string()));
         let server_token = cwt_authenticator.server_token().unwrap();
         assert!(
             server_token.starts_with("myKeyId."),
@@ -2012,7 +2091,7 @@ mod tests {
     // CWT Token Tests
     #[test]
     fn test_cwt_server_token() {
-        let authenticator = Authenticator::gen_key().unwrap();
+        let authenticator = create_test_authenticator_with_audience();
         let token = authenticator.server_token_cwt().unwrap();
 
         assert_eq!(detect_token_format(&token), TokenFormat::Cwt);
@@ -2023,7 +2102,7 @@ mod tests {
 
     #[test]
     fn test_cwt_doc_token() {
-        let authenticator = Authenticator::gen_key().unwrap();
+        let authenticator = create_test_authenticator_with_audience();
         let token = authenticator
             .gen_doc_token_cwt(
                 "doc123",
@@ -2051,7 +2130,7 @@ mod tests {
 
     #[test]
     fn test_cwt_file_token() {
-        let authenticator = Authenticator::gen_key().unwrap();
+        let authenticator = create_test_authenticator_with_audience();
         let file_hash = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
         let doc_id = "doc123";
 
@@ -2115,7 +2194,7 @@ mod tests {
     #[test]
     fn test_mixed_token_verification() {
         let legacy_authenticator = Authenticator::gen_key_legacy().unwrap();
-        let cwt_authenticator = Authenticator::gen_key().unwrap();
+        let cwt_authenticator = create_test_authenticator_with_audience();
 
         // Custom tokens should work with auto verification
         let custom_token = legacy_authenticator
@@ -2149,9 +2228,10 @@ mod tests {
 
     #[test]
     fn test_cwt_token_with_key_id() {
-        let authenticator = Authenticator::gen_key()
+        let mut authenticator = Authenticator::gen_key()
             .unwrap()
             .with_key_id("test_key".try_into().unwrap());
+        authenticator.set_expected_audience(Some("https://api.example.com".to_string()));
 
         let token = authenticator
             .gen_doc_token_cwt(
@@ -2175,7 +2255,7 @@ mod tests {
 
     #[test]
     fn test_cwt_expiration() {
-        let authenticator = Authenticator::gen_key().unwrap();
+        let authenticator = create_test_authenticator_with_audience();
         let short_expiration = ExpirationTimeEpochMillis(1000); // 1 second after epoch
 
         let token = authenticator
@@ -2191,8 +2271,8 @@ mod tests {
 
     #[test]
     fn test_cwt_invalid_signature() {
-        let authenticator1 = Authenticator::gen_key().unwrap();
-        let authenticator2 = Authenticator::gen_key().unwrap();
+        let authenticator1 = create_test_authenticator_with_audience();
+        let authenticator2 = create_test_authenticator_with_audience();
 
         let token = authenticator1
             .gen_doc_token_cwt(
@@ -2274,7 +2354,7 @@ mod tests {
 
     #[test]
     fn test_user_identification_cwt_tokens() {
-        let authenticator = Authenticator::gen_key().unwrap();
+        let authenticator = create_test_authenticator_with_audience();
 
         // Test doc token with user
         let doc_token = authenticator
@@ -2389,7 +2469,7 @@ mod tests {
 
     #[test]
     fn test_cwt_channel_claims() {
-        let authenticator = Authenticator::gen_key().unwrap();
+        let authenticator = create_test_authenticator_with_audience();
         let doc_id = "test_doc_123";
         let channel = "team-updates";
 
@@ -2477,7 +2557,7 @@ mod tests {
     #[test]
     fn test_user_identification_mixed_tokens() {
         let legacy_authenticator = Authenticator::gen_key_legacy().unwrap();
-        let cwt_authenticator = Authenticator::gen_key().unwrap();
+        let cwt_authenticator = create_test_authenticator_with_audience();
 
         // Create custom and CWT tokens for the same resource but different users
         let custom_token = legacy_authenticator
@@ -2539,14 +2619,15 @@ mod tests {
         );
 
         // Create authenticator from the key
-        let auth = Authenticator::new(key_base64).expect("Failed to create authenticator");
+        let mut auth = Authenticator::new(key_base64).expect("Failed to create authenticator");
+        auth.set_expected_audience(Some("https://test.example.com".to_string()));
 
         // Test at a valid time (iat=1756959508, exp=1756961308)
         let test_time = 1756959508u64 * 1000 + 60000; // 1 minute after issuance, well before expiry
 
         // The verify_cwt_token method returns Permission
         // where Permission contains the doc_id and authorization
-        match auth.verify_cwt_token_with_channel(token, test_time) {
+        match auth.verify_cwt_token_with_channel(token, test_time, "https://test.example.com") {
             Ok((permission, _channel)) => {
                 // Token verification succeeded
 
@@ -2573,7 +2654,7 @@ mod tests {
     #[test]
     fn test_prefix_token_generation_and_verification() {
         let legacy_authenticator = Authenticator::gen_key_legacy().unwrap();
-        let cwt_authenticator = Authenticator::gen_key().unwrap();
+        let cwt_authenticator = create_test_authenticator_with_audience();
 
         // Test custom format prefix tokens
         let custom_token = legacy_authenticator
@@ -2647,7 +2728,7 @@ mod tests {
 
     #[test]
     fn test_empty_prefix_token() {
-        let authenticator = Authenticator::gen_key().unwrap();
+        let authenticator = create_test_authenticator_with_audience();
 
         // Empty prefix should match any document (server-like behavior but with user tracking)
         let empty_prefix_token = authenticator
@@ -2675,7 +2756,7 @@ mod tests {
     #[test]
     fn test_prefix_token_user_extraction() {
         let legacy_authenticator = Authenticator::gen_key_legacy().unwrap();
-        let cwt_authenticator = Authenticator::gen_key().unwrap();
+        let cwt_authenticator = create_test_authenticator_with_audience();
 
         // Test custom format prefix token user extraction
         let custom_token = legacy_authenticator
@@ -2752,7 +2833,7 @@ mod tests {
 
     #[test]
     fn test_prefix_token_file_operations() {
-        let authenticator = Authenticator::gen_key().unwrap();
+        let authenticator = create_test_authenticator_with_audience();
 
         let prefix_token = authenticator
             .gen_prefix_token_cwt(
@@ -3030,14 +3111,14 @@ mod tests {
     fn test_multi_key_signing_key_selection() {
         use crate::config::AuthKeyConfig;
 
-        let hmac_key = Authenticator::gen_key_hmac().unwrap();
-        let public_key = Authenticator::gen_key_hmac().unwrap(); // Use as public key
+        let hmac_key = Authenticator::gen_key_legacy().unwrap();
+        let ecdsa_key = Authenticator::gen_key_ecdsa().unwrap(); // Use as public key
 
         let configs = vec![
             AuthKeyConfig {
                 key_id: Some("readonly".to_string()),
                 private_key: None,
-                public_key: Some(public_key.key_material().to_base64()),
+                public_key: Some(ecdsa_key.public_key_pem().unwrap()),
             },
             AuthKeyConfig {
                 key_id: Some("signing".to_string()),
@@ -3046,11 +3127,16 @@ mod tests {
             },
         ];
 
-        let multi_auth = Authenticator::from_multi_key_config(&configs).unwrap();
+        let mut multi_auth = Authenticator::from_multi_key_config(&configs).unwrap();
+        multi_auth.set_expected_audience(Some("https://api.example.com".to_string()));
 
         // Should be able to generate tokens (using the signing key)
-        let server_token = multi_auth.server_token();
-        assert!(server_token.is_ok());
+        let server_token = multi_auth.server_token_legacy();
+        assert!(
+            server_token.is_ok(),
+            "Failed to generate server token: {:?}",
+            server_token.err()
+        );
 
         // The token should be prefixed with the signing key's key_id
         let token = server_token.unwrap();

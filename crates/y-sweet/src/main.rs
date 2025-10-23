@@ -101,7 +101,7 @@ enum ServSubcommand {
         auth: Option<String>,
 
         #[clap(long, env = "RELAY_SERVER_URL")]
-        url_prefix: Option<Url>,
+        url: Option<Url>,
 
         #[clap(long, env = "RELAY_SERVER_ALLOWED_HOSTS", value_delimiter = ',')]
         allowed_hosts: Option<Vec<String>>,
@@ -192,7 +192,7 @@ fn load_config_for_serve_args(
     metrics_port: &Option<u16>,
     checkpoint_freq_seconds: u64,
     auth: &Option<String>,
-    url_prefix: &Option<Url>,
+    url: &Option<Url>,
     allowed_hosts: &Option<Vec<String>>,
 ) -> Result<Config> {
     // Load base configuration
@@ -264,8 +264,8 @@ fn load_config_for_serve_args(
         }
     }
 
-    if let Some(url_prefix) = url_prefix {
-        config.server.url_prefix = Some(url_prefix.to_string());
+    if let Some(url) = url {
+        config.server.url = Some(url.to_string());
     }
 
     if let Some(allowed_hosts) = allowed_hosts {
@@ -412,15 +412,15 @@ fn parse_allowed_hosts(hosts: Vec<String>) -> Result<Vec<AllowedHost>> {
 }
 
 fn generate_allowed_hosts(
-    url_prefix: Option<&Url>,
+    url: Option<&Url>,
     explicit_hosts: Option<Vec<String>>,
     fly_app_name: Option<&str>,
 ) -> Result<Vec<AllowedHost>> {
     if let Some(hosts) = explicit_hosts {
         // Parse explicit hosts with schemes
         parse_allowed_hosts(hosts)
-    } else if let Some(prefix) = url_prefix {
-        // Auto-generate from url_prefix + flycast
+    } else if let Some(prefix) = url {
+        // Auto-generate from url + flycast
         let mut hosts = vec![AllowedHost {
             host: prefix.host_str().unwrap().to_string(),
             scheme: prefix.scheme().to_string(),
@@ -461,7 +461,7 @@ async fn main() -> Result<()> {
             checkpoint_freq_seconds,
             store,
             auth,
-            url_prefix,
+            url,
             allowed_hosts,
         } => {
             // Load configuration
@@ -473,7 +473,7 @@ async fn main() -> Result<()> {
                 metrics_port,
                 *checkpoint_freq_seconds,
                 auth,
-                url_prefix,
+                url,
                 allowed_hosts,
             )?;
 
@@ -482,12 +482,22 @@ async fn main() -> Result<()> {
             tracing::info!("Using log level: {}", log_level);
 
             // Create authenticator from config
-            let auth = if !config.auth.is_empty() {
+            let mut auth = if !config.auth.is_empty() {
                 Some(Authenticator::from_multi_key_config(&config.auth)?)
             } else {
                 tracing::warn!("No auth key set. Only use this for local development!");
                 None
             };
+
+            // Set expected audience for CWT validation if server URL is configured
+            if let Some(ref mut authenticator) = auth {
+                authenticator.set_expected_audience(config.server.url.clone());
+                if let Some(ref url) = config.server.url {
+                    tracing::info!("CWT audience validation enabled for: {}", url);
+                } else {
+                    tracing::warn!("No server URL configured - CWT tokens will be rejected");
+                }
+            }
 
             // Parse server host
             let server_host: IpAddr = config
@@ -520,9 +530,9 @@ async fn main() -> Result<()> {
             };
 
             // Parse URL prefix
-            let url_prefix = config
+            let url = config
                 .server
-                .url_prefix
+                .url
                 .as_ref()
                 .map(|s| Url::parse(s))
                 .transpose()?;
@@ -532,8 +542,8 @@ async fn main() -> Result<()> {
 
             // Generate allowed hosts (use config + auto-generation from URL prefix)
             let allowed_hosts = if config.server.allowed_hosts.is_empty() {
-                // Auto-generate from url_prefix if no explicit hosts configured
-                generate_allowed_hosts(url_prefix.as_ref(), None, fly_app_name.as_deref())?
+                // Auto-generate from url if no explicit hosts configured
+                generate_allowed_hosts(url.as_ref(), None, fly_app_name.as_deref())?
             } else {
                 // Use configured hosts, but also add Fly.io auto-detection if applicable
                 let explicit_hosts: Vec<String> = config
@@ -548,11 +558,7 @@ async fn main() -> Result<()> {
                         }
                     })
                     .collect();
-                generate_allowed_hosts(
-                    url_prefix.as_ref(),
-                    Some(explicit_hosts),
-                    fly_app_name.as_deref(),
-                )?
+                generate_allowed_hosts(url.as_ref(), Some(explicit_hosts), fly_app_name.as_deref())?
             };
 
             let token = CancellationToken::new();
@@ -573,7 +579,7 @@ async fn main() -> Result<()> {
                 store,
                 std::time::Duration::from_secs(config.server.checkpoint_freq_seconds),
                 auth,
-                url_prefix.clone(),
+                url.clone(),
                 allowed_hosts,
                 token.clone(),
                 config.server.doc_gc,
@@ -834,8 +840,8 @@ async fn main() -> Result<()> {
                                 config.logging.level, config.logging.format
                             );
 
-                            if let Some(url_prefix) = &config.server.url_prefix {
-                                println!("  URL prefix: {}", url_prefix);
+                            if let Some(url) = &config.server.url {
+                                println!("  URL prefix: {}", url);
                             }
 
                             if !config.server.allowed_hosts.is_empty() {
@@ -1045,17 +1051,17 @@ mod tests {
 
     #[test]
     fn test_generate_allowed_hosts_from_prefix() {
-        let url_prefix: Url = "https://api.example.com".parse().unwrap();
+        let url: Url = "https://api.example.com".parse().unwrap();
 
         // Without FLY_APP_NAME
-        let hosts = generate_allowed_hosts(Some(&url_prefix), None, None).unwrap();
+        let hosts = generate_allowed_hosts(Some(&url), None, None).unwrap();
 
         assert_eq!(hosts.len(), 1);
         assert_eq!(hosts[0].host, "api.example.com");
         assert_eq!(hosts[0].scheme, "https");
 
         // With FLY_APP_NAME
-        let hosts = generate_allowed_hosts(Some(&url_prefix), None, Some("my-app")).unwrap();
+        let hosts = generate_allowed_hosts(Some(&url), None, Some("my-app")).unwrap();
 
         assert_eq!(hosts.len(), 2);
         assert_eq!(hosts[0].host, "api.example.com");
@@ -1073,9 +1079,8 @@ mod tests {
     #[test]
     fn test_fly_io_scenario() {
         // Simulate a Fly.io deployment scenario
-        let url_prefix: Url = "https://api.mycompany.com".parse().unwrap();
-        let hosts =
-            generate_allowed_hosts(Some(&url_prefix), None, Some("my-relay-server")).unwrap();
+        let url: Url = "https://api.mycompany.com".parse().unwrap();
+        let hosts = generate_allowed_hosts(Some(&url), None, Some("my-relay-server")).unwrap();
 
         // Should have both external and internal hosts
         assert_eq!(hosts.len(), 2);

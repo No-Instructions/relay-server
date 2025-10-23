@@ -99,7 +99,7 @@ port = 8080                   # PORT (standard env var)
 metrics_port = 9090           # METRICS_PORT
 
 # URL configuration
-url_prefix = "https://api.example.com"  # RELAY_SERVER_URL
+url = "https://api.example.com"  # RELAY_SERVER_URL
 
 # Allowed hosts for context-aware URL generation
 allowed_hosts = [
@@ -356,7 +356,7 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
         store,
         Duration::from_secs(config.server.checkpoint_freq_seconds),
         authenticator,
-        config.server.url_prefix.as_ref().map(|s| Url::parse(s)).transpose()?,
+        config.server.url.as_ref().map(|s| Url::parse(s)).transpose()?,
         config.server.allowed_hosts.clone(),
         CancellationToken::new(),
         config.server.doc_gc,

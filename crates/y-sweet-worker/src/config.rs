@@ -55,7 +55,7 @@ pub struct Configuration {
     pub bucket: String,
     pub s3_store_config: Option<S3Config>,
     pub bucket_prefix: Option<String>,
-    pub url_prefix: Option<String>,
+    pub url: Option<String>,
     pub timeout_interval: Duration,
 }
 
@@ -115,7 +115,7 @@ impl TryFrom<&Env> for Configuration {
             bucket: BUCKET.to_string(),
             s3_store_config: s3_config,
             bucket_prefix: env.var(S3_BUCKET_PREFIX).map(|s| s.to_string()).ok(),
-            url_prefix: None,
+            url: None,
             timeout_interval,
         })
     }

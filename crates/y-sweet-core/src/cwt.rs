@@ -24,6 +24,10 @@ pub enum CwtError {
     SignatureVerificationFailed,
     #[error("Serialization error: {0}")]
     Serialization(String),
+    #[error("Invalid audience claim: expected '{expected}', found '{found}'")]
+    InvalidAudience { expected: String, found: String },
+    #[error("Missing audience claim: expected '{expected}'")]
+    MissingAudience { expected: String },
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -342,7 +346,11 @@ impl CwtAuthenticator {
         Ok(result)
     }
 
-    pub fn verify_cwt(&self, token_bytes: &[u8]) -> Result<CwtClaims, CwtError> {
+    pub fn verify_cwt(
+        &self,
+        token_bytes: &[u8],
+        expected_audience: &str,
+    ) -> Result<CwtClaims, CwtError> {
         // RFC 8392 Section 7.2: Validating a CWT
         // Follow the exact steps from the RFC
 
@@ -451,7 +459,7 @@ impl CwtAuthenticator {
                                             );
                                             CwtError::InvalidCbor
                                         })?;
-                                    self.verify_cwt_mac0(&inner_bytes)
+                                    self.verify_cwt_mac0(&inner_bytes, expected_audience)
                                 } else {
                                     tracing::debug!("Unexpected COSE structure");
                                     return Err(CwtError::InvalidCose);
@@ -483,7 +491,7 @@ impl CwtAuthenticator {
                                     let mut inner_bytes = Vec::new();
                                     ciborium::ser::into_writer(&inner_array, &mut inner_bytes)
                                         .map_err(|_e| CwtError::InvalidCbor)?;
-                                    self.verify_cwt_sign1(&inner_bytes)
+                                    self.verify_cwt_sign1(&inner_bytes, expected_audience)
                                 } else {
                                     return Err(CwtError::InvalidCose);
                                 }
@@ -518,11 +526,15 @@ impl CwtAuthenticator {
                 })?;
 
                 match &self.key_material {
-                    KeyMaterial::Symmetric(_) => self.verify_cwt_mac0(&cose_bytes),
+                    KeyMaterial::Symmetric(_) => {
+                        self.verify_cwt_mac0(&cose_bytes, expected_audience)
+                    }
                     KeyMaterial::EcdsaP256Private(_)
                     | KeyMaterial::EcdsaP256Public(_)
                     | KeyMaterial::Ed25519Private(_)
-                    | KeyMaterial::Ed25519Public(_) => self.verify_cwt_sign1(&cose_bytes),
+                    | KeyMaterial::Ed25519Public(_) => {
+                        self.verify_cwt_sign1(&cose_bytes, expected_audience)
+                    }
                 }
             }
             _ => {
@@ -532,7 +544,11 @@ impl CwtAuthenticator {
         }
     }
 
-    pub fn verify_cwt_sign1(&self, token_bytes: &[u8]) -> Result<CwtClaims, CwtError> {
+    pub fn verify_cwt_sign1(
+        &self,
+        token_bytes: &[u8],
+        expected_audience: &str,
+    ) -> Result<CwtClaims, CwtError> {
         let sign1 = coset::CoseSign1::from_slice(token_bytes).map_err(|e| {
             tracing::debug!("Failed to parse COSE_Sign1 structure: {:?}", e);
             CwtError::InvalidCbor
@@ -626,10 +642,16 @@ impl CwtAuthenticator {
             CwtError::InvalidCose
         })?;
 
-        self.extract_claims_from_payload(&payload)
+        let claims = self.extract_claims_from_payload(&payload)?;
+        self.validate_audience(&claims, expected_audience)?;
+        Ok(claims)
     }
 
-    pub fn verify_cwt_mac0(&self, token_bytes: &[u8]) -> Result<CwtClaims, CwtError> {
+    pub fn verify_cwt_mac0(
+        &self,
+        token_bytes: &[u8],
+        expected_audience: &str,
+    ) -> Result<CwtClaims, CwtError> {
         let mac0 = coset::CoseMac0::from_slice(token_bytes).map_err(|e| {
             tracing::debug!("Failed to parse COSE_Mac0 structure: {:?}", e);
             tracing::debug!("COSE_Mac0 parse error: {:?}", e);
@@ -685,7 +707,9 @@ impl CwtAuthenticator {
             CwtError::InvalidCose
         })?;
 
-        self.extract_claims_from_payload(&payload)
+        let claims = self.extract_claims_from_payload(&payload)?;
+        self.validate_audience(&claims, expected_audience)?;
+        Ok(claims)
     }
 
     fn extract_claims_from_payload(&self, payload: &[u8]) -> Result<CwtClaims, CwtError> {
@@ -695,6 +719,39 @@ impl CwtAuthenticator {
         })?;
 
         self.parse_claims_map(claims_map)
+    }
+
+    fn validate_audience(
+        &self,
+        claims: &CwtClaims,
+        expected_audience: &str,
+    ) -> Result<(), CwtError> {
+        match &claims.audience {
+            Some(token_audience) if token_audience == expected_audience => {
+                // Valid - token intended for this service
+                Ok(())
+            }
+            Some(token_audience) => {
+                tracing::warn!(
+                    expected = expected_audience,
+                    found = token_audience,
+                    "CWT audience validation failed - token intended for different service"
+                );
+                Err(CwtError::InvalidAudience {
+                    expected: expected_audience.to_string(),
+                    found: token_audience.clone(),
+                })
+            }
+            None => {
+                tracing::warn!(
+                    expected = expected_audience,
+                    "CWT audience validation failed - missing audience claim"
+                );
+                Err(CwtError::MissingAudience {
+                    expected: expected_audience.to_string(),
+                })
+            }
+        }
     }
 
     fn build_claims_map(&self, claims: CwtClaims) -> Result<ciborium::Value, CwtError> {
@@ -985,7 +1042,7 @@ mod tests {
         let claims = CwtClaims {
             issuer: Some("relay-server".to_string()),
             subject: None,
-            audience: None,
+            audience: Some("https://api.example.com".to_string()),
             expiration: Some(1444064944),
             issued_at: Some(1443944944),
             scope: "server".to_string(),
@@ -996,7 +1053,9 @@ mod tests {
 
         // Try parsing the CBOR directly to see what fails
 
-        let parsed_claims = authenticator.verify_cwt(&token).unwrap();
+        let parsed_claims = authenticator
+            .verify_cwt(&token, "https://api.example.com")
+            .unwrap();
 
         assert_eq!(parsed_claims.scope, "server");
         assert_eq!(parsed_claims.issuer, Some("relay-server".to_string()));
@@ -1011,7 +1070,7 @@ mod tests {
         let claims = CwtClaims {
             issuer: Some("relay-server".to_string()),
             subject: None,
-            audience: None,
+            audience: Some("https://api.example.com".to_string()),
             expiration: Some(1444064944),
             issued_at: Some(1443944944),
             scope: "doc:test_doc_123:rw".to_string(),
@@ -1019,7 +1078,9 @@ mod tests {
         };
 
         let token = authenticator.create_cwt(claims).unwrap();
-        let parsed_claims = authenticator.verify_cwt(&token).unwrap();
+        let parsed_claims = authenticator
+            .verify_cwt(&token, "https://api.example.com")
+            .unwrap();
 
         assert_eq!(parsed_claims.scope, "doc:test_doc_123:rw");
         assert_eq!(parsed_claims.issuer, Some("relay-server".to_string()));
@@ -1032,7 +1093,7 @@ mod tests {
         let claims = CwtClaims {
             issuer: Some("relay-server".to_string()),
             subject: None,
-            audience: None,
+            audience: Some("https://api.example.com".to_string()),
             expiration: Some(1444064944),
             issued_at: None,
             scope: "file:abcdef1234567890:doc123:r".to_string(),
@@ -1040,7 +1101,9 @@ mod tests {
         };
 
         let token = authenticator.create_cwt(claims).unwrap();
-        let parsed_claims = authenticator.verify_cwt(&token).unwrap();
+        let parsed_claims = authenticator
+            .verify_cwt(&token, "https://api.example.com")
+            .unwrap();
 
         assert_eq!(parsed_claims.scope, "file:abcdef1234567890:doc123:r");
     }
@@ -1113,7 +1176,7 @@ mod tests {
         let claims = CwtClaims {
             issuer: Some("relay-server".to_string()),
             subject: Some("admin@org123.com".to_string()),
-            audience: None,
+            audience: Some("https://api.example.com".to_string()),
             expiration: Some(1444064944),
             issued_at: Some(1443944944),
             scope: "prefix:org123-:rw".to_string(),
@@ -1121,7 +1184,9 @@ mod tests {
         };
 
         let token = authenticator.create_cwt(claims).unwrap();
-        let parsed_claims = authenticator.verify_cwt(&token).unwrap();
+        let parsed_claims = authenticator
+            .verify_cwt(&token, "https://api.example.com")
+            .unwrap();
 
         assert_eq!(parsed_claims.scope, "prefix:org123-:rw");
         assert_eq!(parsed_claims.subject, Some("admin@org123.com".to_string()));
@@ -1157,7 +1222,9 @@ mod tests {
 
         // Test COSE_Mac0 token creation and verification
         let mac0_token = cwt_auth.create_cwt_mac0(rfc_claims.clone()).unwrap();
-        let decoded_mac0_claims = cwt_auth.verify_cwt_mac0(&mac0_token).unwrap();
+        let decoded_mac0_claims = cwt_auth
+            .verify_cwt_mac0(&mac0_token, "coap://light.example.com")
+            .unwrap();
 
         // Verify all claims match
         assert_eq!(decoded_mac0_claims.issuer, rfc_claims.issuer);
@@ -1168,19 +1235,23 @@ mod tests {
         assert_eq!(decoded_mac0_claims.scope, rfc_claims.scope);
 
         // Test that verify_cwt() can auto-detect COSE_Mac0
-        let auto_decoded_claims = cwt_auth.verify_cwt(&mac0_token).unwrap();
+        let auto_decoded_claims = cwt_auth
+            .verify_cwt(&mac0_token, "coap://light.example.com")
+            .unwrap();
         assert_eq!(auto_decoded_claims.issuer, rfc_claims.issuer);
 
         // Test COSE_Sign1 still works
         let sign1_token = cwt_auth.create_cwt_sign1(rfc_claims.clone()).unwrap();
-        let decoded_sign1_claims = cwt_auth.verify_cwt_sign1(&sign1_token).unwrap();
+        let decoded_sign1_claims = cwt_auth
+            .verify_cwt_sign1(&sign1_token, "coap://light.example.com")
+            .unwrap();
         assert_eq!(decoded_sign1_claims.issuer, rfc_claims.issuer);
 
         // Test that wrong key fails for COSE_Mac0
         let wrong_key = b"wrong_key_123456789012345678901234";
         let wrong_auth = CwtAuthenticator::new(wrong_key, None).unwrap();
 
-        let result = wrong_auth.verify_cwt_mac0(&mac0_token);
+        let result = wrong_auth.verify_cwt_mac0(&mac0_token, "coap://light.example.com");
         assert!(matches!(result, Err(CwtError::SignatureVerificationFailed)));
     }
 
@@ -1250,7 +1321,7 @@ mod tests {
         let claims = CwtClaims {
             issuer: Some("test-issuer".to_string()),
             subject: None,
-            audience: None,
+            audience: Some("test-audience".to_string()),
             expiration: Some(2000000000),
             issued_at: Some(1000000000),
             scope: "test:scope".to_string(),
@@ -1261,21 +1332,25 @@ mod tests {
         let mac0_64 = cwt_auth
             .create_cwt_mac0_with_alg(claims.clone(), coset::iana::Algorithm::HMAC_256_64)
             .unwrap();
-        let decoded_64 = cwt_auth.verify_cwt_mac0(&mac0_64).unwrap();
+        let decoded_64 = cwt_auth.verify_cwt_mac0(&mac0_64, "test-audience").unwrap();
         assert_eq!(decoded_64.issuer, claims.issuer);
 
         // Test HMAC_384_384 (48-byte MAC - but using SHA-256 for now)
         let mac0_384 = cwt_auth
             .create_cwt_mac0_with_alg(claims.clone(), coset::iana::Algorithm::HMAC_384_384)
             .unwrap();
-        let decoded_384 = cwt_auth.verify_cwt_mac0(&mac0_384).unwrap();
+        let decoded_384 = cwt_auth
+            .verify_cwt_mac0(&mac0_384, "test-audience")
+            .unwrap();
         assert_eq!(decoded_384.issuer, claims.issuer);
 
         // Test HMAC_256_256 (32-byte MAC)
         let mac0_256 = cwt_auth
             .create_cwt_mac0_with_alg(claims.clone(), coset::iana::Algorithm::HMAC_256_256)
             .unwrap();
-        let decoded_256 = cwt_auth.verify_cwt_mac0(&mac0_256).unwrap();
+        let decoded_256 = cwt_auth
+            .verify_cwt_mac0(&mac0_256, "test-audience")
+            .unwrap();
         assert_eq!(decoded_256.issuer, claims.issuer);
 
         // Verify tokens are different (different MAC lengths)
@@ -1284,9 +1359,9 @@ mod tests {
         assert_ne!(mac0_64, mac0_256);
 
         // Verify that verify_cwt() auto-detection works with all lengths
-        assert!(cwt_auth.verify_cwt(&mac0_64).is_ok());
-        assert!(cwt_auth.verify_cwt(&mac0_384).is_ok());
-        assert!(cwt_auth.verify_cwt(&mac0_256).is_ok());
+        assert!(cwt_auth.verify_cwt(&mac0_64, "test-audience").is_ok());
+        assert!(cwt_auth.verify_cwt(&mac0_384, "test-audience").is_ok());
+        assert!(cwt_auth.verify_cwt(&mac0_256, "test-audience").is_ok());
     }
 
     #[test]
@@ -1297,7 +1372,7 @@ mod tests {
         let claims_with_channel = CwtClaims {
             issuer: Some("test-issuer".to_string()),
             subject: None,
-            audience: None,
+            audience: Some("https://api.example.com".to_string()),
             expiration: Some(1444064944),
             issued_at: Some(1443944944),
             scope: "doc:test_doc:rw".to_string(),
@@ -1305,7 +1380,9 @@ mod tests {
         };
 
         let token_bytes = cwt_auth.create_cwt(claims_with_channel.clone()).unwrap();
-        let decoded_claims = cwt_auth.verify_cwt(&token_bytes).unwrap();
+        let decoded_claims = cwt_auth
+            .verify_cwt(&token_bytes, "https://api.example.com")
+            .unwrap();
 
         assert_eq!(decoded_claims, claims_with_channel);
         assert_eq!(decoded_claims.channel, Some("team-updates".to_string()));
@@ -1314,7 +1391,7 @@ mod tests {
         let claims_without_channel = CwtClaims {
             issuer: Some("test-issuer".to_string()),
             subject: None,
-            audience: None,
+            audience: Some("https://api.example.com".to_string()),
             expiration: Some(1444064944),
             issued_at: Some(1443944944),
             scope: "doc:test_doc:rw".to_string(),
@@ -1322,7 +1399,9 @@ mod tests {
         };
 
         let token_bytes = cwt_auth.create_cwt(claims_without_channel.clone()).unwrap();
-        let decoded_claims = cwt_auth.verify_cwt(&token_bytes).unwrap();
+        let decoded_claims = cwt_auth
+            .verify_cwt(&token_bytes, "https://api.example.com")
+            .unwrap();
 
         assert_eq!(decoded_claims, claims_without_channel);
         assert_eq!(decoded_claims.channel, None);
@@ -1337,7 +1416,7 @@ mod tests {
         let claims = CwtClaims {
             issuer: None,
             subject: None,
-            audience: None,
+            audience: Some("https://api.example.com".to_string()),
             expiration: None,
             issued_at: None,
             scope: "server".to_string(),
@@ -1345,7 +1424,7 @@ mod tests {
         };
 
         let token = authenticator.create_cwt(claims).unwrap();
-        let result = other_authenticator.verify_cwt(&token);
+        let result = other_authenticator.verify_cwt(&token, "https://api.example.com");
 
         assert_eq!(result, Err(CwtError::SignatureVerificationFailed));
     }
@@ -1355,7 +1434,7 @@ mod tests {
         let authenticator = create_test_authenticator();
         let invalid_cbor = b"not valid cbor data";
 
-        let result = authenticator.verify_cwt(invalid_cbor);
+        let result = authenticator.verify_cwt(invalid_cbor, "https://api.example.com");
         assert_eq!(result, Err(CwtError::InvalidCbor));
     }
 
@@ -1368,7 +1447,7 @@ mod tests {
         let claims = CwtClaims {
             issuer: Some("test".to_string()),
             subject: None,
-            audience: None,
+            audience: Some("https://api.example.com".to_string()),
             expiration: Some(9999999999),
             issued_at: None,
             scope: "server".to_string(),
@@ -1377,7 +1456,9 @@ mod tests {
 
         // Should create COSE_Mac0 token with symmetric key
         let token = symmetric_auth.create_cwt(claims.clone()).unwrap();
-        let decoded = symmetric_auth.verify_cwt(&token).unwrap();
+        let decoded = symmetric_auth
+            .verify_cwt(&token, "https://api.example.com")
+            .unwrap();
         assert_eq!(decoded.scope, "server");
 
         // Test 2: ECDSA P-256 key routing
@@ -1392,24 +1473,30 @@ mod tests {
 
         // Should create COSE_Sign1 token with ECDSA key
         let ecdsa_token = ecdsa_auth.create_cwt(claims.clone()).unwrap();
-        let ecdsa_decoded = ecdsa_auth.verify_cwt(&ecdsa_token).unwrap();
+        let ecdsa_decoded = ecdsa_auth
+            .verify_cwt(&ecdsa_token, "https://api.example.com")
+            .unwrap();
         assert_eq!(ecdsa_decoded.scope, "server");
 
         // Test 3: Auto-detection (32-byte key could be either)
         let auto_symmetric_auth = CwtAuthenticator::new(symmetric_key, None).unwrap();
         let auto_token = auto_symmetric_auth.create_cwt(claims.clone()).unwrap();
-        let auto_decoded = auto_symmetric_auth.verify_cwt(&auto_token).unwrap();
+        let auto_decoded = auto_symmetric_auth
+            .verify_cwt(&auto_token, "https://api.example.com")
+            .unwrap();
         assert_eq!(auto_decoded.scope, "server");
 
         // Test 4: Cross-verification should fail (different key types produce different tokens)
         let symmetric_token = symmetric_auth.create_cwt(claims.clone()).unwrap();
-        let ecdsa_verification_result = ecdsa_auth.verify_cwt(&symmetric_token);
+        let ecdsa_verification_result =
+            ecdsa_auth.verify_cwt(&symmetric_token, "https://api.example.com");
         assert!(
             ecdsa_verification_result.is_err(),
             "ECDSA key should not be able to verify HMAC token"
         );
 
-        let ecdsa_verification_result = symmetric_auth.verify_cwt(&ecdsa_token);
+        let ecdsa_verification_result =
+            symmetric_auth.verify_cwt(&ecdsa_token, "https://api.example.com");
         assert!(
             ecdsa_verification_result.is_err(),
             "Symmetric key should not be able to verify ECDSA token"
@@ -1453,11 +1540,11 @@ mod tests {
         let token = private_auth.create_cwt(claims.clone()).unwrap();
 
         // Verify with private key
-        let decoded_private = private_auth.verify_cwt(&token).unwrap();
+        let decoded_private = private_auth.verify_cwt(&token, "test-audience").unwrap();
         assert_eq!(decoded_private, claims);
 
         // Verify with public key
-        let decoded_public = public_auth.verify_cwt(&token).unwrap();
+        let decoded_public = public_auth.verify_cwt(&token, "test-audience").unwrap();
         assert_eq!(decoded_public, claims);
 
         // Verify all claims are correct
@@ -1488,7 +1575,7 @@ mod tests {
         let claims = CwtClaims {
             issuer: Some("test".to_string()),
             subject: None,
-            audience: None,
+            audience: Some("https://api.example.com".to_string()),
             expiration: Some(9999999999),
             issued_at: None,
             scope: "server".to_string(),
@@ -1500,21 +1587,25 @@ mod tests {
         let ecdsa_token = ecdsa_auth.create_cwt(claims.clone()).unwrap();
 
         // Verify that cross-verification fails
-        let ecdsa_verify_ed25519 = ecdsa_auth.verify_cwt(&ed25519_token);
+        let ecdsa_verify_ed25519 = ecdsa_auth.verify_cwt(&ed25519_token, "https://api.example.com");
         assert!(
             ecdsa_verify_ed25519.is_err(),
             "ECDSA key should not be able to verify Ed25519 token"
         );
 
-        let ed25519_verify_ecdsa = ed25519_auth.verify_cwt(&ecdsa_token);
+        let ed25519_verify_ecdsa = ed25519_auth.verify_cwt(&ecdsa_token, "https://api.example.com");
         assert!(
             ed25519_verify_ecdsa.is_err(),
             "Ed25519 key should not be able to verify ECDSA token"
         );
 
         // Verify that self-verification works
-        assert!(ed25519_auth.verify_cwt(&ed25519_token).is_ok());
-        assert!(ecdsa_auth.verify_cwt(&ecdsa_token).is_ok());
+        assert!(ed25519_auth
+            .verify_cwt(&ed25519_token, "https://api.example.com")
+            .is_ok());
+        assert!(ecdsa_auth
+            .verify_cwt(&ecdsa_token, "https://api.example.com")
+            .is_ok());
     }
 
     #[test]
@@ -1532,7 +1623,7 @@ mod tests {
         let claims = CwtClaims {
             issuer: Some("test-issuer".to_string()),
             subject: None,
-            audience: None,
+            audience: Some("test-audience".to_string()),
             expiration: Some(9999999999),
             issued_at: Some(1000000000),
             scope: "test:ed25519".to_string(),
@@ -1541,16 +1632,24 @@ mod tests {
 
         // Test create_cwt (wrapped in CWT tag)
         let wrapped_token = ed25519_auth.create_cwt(claims.clone()).unwrap();
-        let decoded_wrapped = ed25519_auth.verify_cwt(&wrapped_token).unwrap();
+        let decoded_wrapped = ed25519_auth
+            .verify_cwt(&wrapped_token, "test-audience")
+            .unwrap();
         assert_eq!(decoded_wrapped, claims);
 
         // Test create_cwt_sign1 (direct COSE_Sign1)
         let sign1_token = ed25519_auth.create_cwt_sign1(claims.clone()).unwrap();
-        let decoded_sign1 = ed25519_auth.verify_cwt_sign1(&sign1_token).unwrap();
+        let decoded_sign1 = ed25519_auth
+            .verify_cwt_sign1(&sign1_token, "test-audience")
+            .unwrap();
         assert_eq!(decoded_sign1, claims);
 
         // Verify that both can be verified by verify_cwt auto-detection
-        assert!(ed25519_auth.verify_cwt(&wrapped_token).is_ok());
-        assert!(ed25519_auth.verify_cwt(&sign1_token).is_ok());
+        assert!(ed25519_auth
+            .verify_cwt(&wrapped_token, "test-audience")
+            .is_ok());
+        assert!(ed25519_auth
+            .verify_cwt(&sign1_token, "test-audience")
+            .is_ok());
     }
 }

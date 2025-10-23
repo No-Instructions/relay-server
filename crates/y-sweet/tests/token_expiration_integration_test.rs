@@ -7,8 +7,9 @@ use y_sweet_core::auth::{Authenticator, ExpirationTimeEpochMillis};
 #[tokio::test]
 async fn test_token_expiration_integration() {
     // Create a test authenticator with a valid 32-byte base64 key
-    let auth = Authenticator::new("dGhpcy1pcy1leGFjdGx5LTMyLWJ5dGVzLWZvci10ZXN0")
+    let mut auth = Authenticator::new("dGhpcy1pcy1leGFjdGx5LTMyLWJ5dGVzLWZvci10ZXN0")
         .expect("Failed to create authenticator");
+    auth.set_expected_audience(Some("https://test.example.com".to_string()));
 
     // Create a token that expires in 1 second
     let current_time = std::time::SystemTime::now()
@@ -61,8 +62,9 @@ async fn test_token_expiration_integration() {
 #[tokio::test]
 async fn test_token_without_expiration() {
     // Create a test authenticator with a valid 32-byte base64 key
-    let auth = Authenticator::new("dGhpcy1pcy1leGFjdGx5LTMyLWJ5dGVzLWZvci10ZXN0")
+    let mut auth = Authenticator::new("dGhpcy1pcy1leGFjdGx5LTMyLWJ5dGVzLWZvci10ZXN0")
         .expect("Failed to create authenticator");
+    auth.set_expected_audience(Some("https://test.example.com".to_string()));
 
     // Create a token without expiration by using a very far future time
     let far_future = ExpirationTimeEpochMillis(u64::MAX / 2); // Very far in the future
@@ -98,8 +100,9 @@ async fn test_token_without_expiration() {
 #[tokio::test]
 async fn test_token_verification_timing() {
     // Create a test authenticator with a valid 32-byte base64 key
-    let auth = Authenticator::new("dGhpcy1pcy1leGFjdGx5LTMyLWJ5dGVzLWZvci10ZXN0")
+    let mut auth = Authenticator::new("dGhpcy1pcy1leGFjdGx5LTMyLWJ5dGVzLWZvci10ZXN0")
         .expect("Failed to create authenticator");
+    auth.set_expected_audience(Some("https://test.example.com".to_string()));
 
     // Test with expiration - create a token that expires in 2 seconds
     let current_time = std::time::SystemTime::now()

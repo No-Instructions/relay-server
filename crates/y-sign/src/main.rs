@@ -32,6 +32,7 @@ fn create_authenticator_with_type(
                         }],
                         key_lookup: std::collections::HashMap::new(),
                         keys_without_id: vec![0],
+                        expected_audience: None,
                     })
                 }
             }
@@ -55,6 +56,7 @@ fn create_authenticator_with_type(
                         }],
                         key_lookup: std::collections::HashMap::new(),
                         keys_without_id: vec![0],
+                        expected_audience: None,
                     })
                 }
             }
@@ -71,6 +73,7 @@ fn create_authenticator_with_type(
                 }],
                 key_lookup: std::collections::HashMap::new(),
                 keys_without_id: vec![0],
+                expected_audience: None,
             })
         }
         "eddsa" => {
@@ -88,6 +91,7 @@ fn create_authenticator_with_type(
                 }],
                 key_lookup: std::collections::HashMap::new(),
                 keys_without_id: vec![0],
+                expected_audience: None,
             })
         }
         _ => anyhow::bail!("Invalid key type. Must be: hmac, legacy, es256, or eddsa"),

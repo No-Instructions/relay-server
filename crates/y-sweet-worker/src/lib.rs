@@ -231,18 +231,18 @@ async fn auth_doc(
         .auth()?
         .map(|auth| auth.gen_doc_token(&doc_id, body.authorization, expiration_time));
 
-    let url = if let Some(url_prefix) = &ctx.data.config.url_prefix {
-        let mut parsed = Url::parse(url_prefix).map_err(|_| Error::ConfigurationError {
-            field: "url_prefix".to_string(),
-            value: url_prefix.to_string(),
+    let url = if let Some(url) = &ctx.data.config.url {
+        let mut parsed = Url::parse(url).map_err(|_| Error::ConfigurationError {
+            field: "url".to_string(),
+            value: url.to_string(),
         })?;
         match parsed.scheme() {
             "http" => parsed.set_scheme("ws").map_err(|_| Error::InternalError)?,
             "https" => parsed.set_scheme("wss").map_err(|_| Error::InternalError)?,
             _ => {
                 return Err(Error::ConfigurationError {
-                    field: "url_prefix".to_string(),
-                    value: url_prefix.to_string(),
+                    field: "url".to_string(),
+                    value: url.to_string(),
                 })
             }
         };
