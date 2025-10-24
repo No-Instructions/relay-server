@@ -511,12 +511,7 @@ pub enum TokenFormat {
 
 /// Detect the format of a token based on its structure
 pub fn detect_token_format(token: &str) -> TokenFormat {
-    // Remove key_id prefix if present for detection
-    let token_data = if let Some((_, token_part)) = token.split_once('.') {
-        token_part
-    } else {
-        token
-    };
+    let token_data = token;
 
     // Try to decode as base64
     if let Ok(decoded) = b64_decode(token_data) {
@@ -857,11 +852,7 @@ impl Authenticator {
 
         let auth_enc = bincode_encode(&auth_req).expect("Bincode serialization should not fail.");
         let result = b64_encode(&auth_enc);
-        Ok(if let Some(key_id) = &signing_key.key_id {
-            format!("{}.{}", key_id, result)
-        } else {
-            result
-        })
+        Ok(result)
     }
 
     pub fn with_key_id(self, key_id: KeyId) -> Self {
@@ -1103,7 +1094,6 @@ impl Authenticator {
 
         let token = b64_encode(&token_bytes);
 
-        // CWT tokens embed key IDs in COSE headers, not as prefixes
         Ok(token)
     }
 
@@ -1280,12 +1270,6 @@ impl Authenticator {
     }
 
     pub fn decode_token(&self, token: &str) -> Result<Payload, AuthError> {
-        let token = if let Some((_, token)) = token.split_once('.') {
-            token
-        } else {
-            token
-        };
-
         // Try to decode with current format first, fallback to legacy format
         let decoded_bytes = b64_decode(token)?;
         let auth_req: AuthenticatedRequest =
@@ -1314,45 +1298,10 @@ impl Authenticator {
 
         match format {
             TokenFormat::Custom => {
-                // Extract key_id from custom token (prefix format)
-                let (token_key_id, token_data) =
-                    if let Some((prefix, token_part)) = token.split_once('.') {
-                        (Some(prefix), token_part)
-                    } else {
-                        (None, token)
-                    };
-
-                // Try verification with matching key
-                if let Some(key_id) = token_key_id {
-                    tracing::trace!(
-                        "Custom token has key_id: '{}', looking up in configured keys",
-                        key_id
-                    );
-                    tracing::trace!(
-                        "Available key_ids: {:?}",
-                        self.key_lookup.keys().collect::<Vec<_>>()
-                    );
-                    // Use hashmap lookup for keys with key_id (O(1) performance)
-                    if let Some(&index) = self.key_lookup.get(key_id) {
-                        tracing::trace!("Found matching key at index {}", index);
-                        return self.verify_with_key_entry(
-                            &self.keys[index],
-                            token_data,
-                            current_time,
-                        );
-                    } else {
-                        tracing::debug!(
-                            "Custom token key ID '{}' not found in configured keys",
-                            key_id
-                        );
-                        return Err(AuthError::KeyMismatch);
-                    }
-                }
-
-                // For custom tokens without key_id, try all keys without key_id in configuration order
+                // Try all keys in configuration order
                 let mut last_error = AuthError::KeyMismatch;
 
-                for &index in &self.keys_without_id {
+                for (index, _) in self.keys.iter().enumerate() {
                     match self.verify_with_key_entry(&self.keys[index], token, current_time) {
                         Ok(permission) => return Ok(permission),
                         Err(err) => {
@@ -1380,7 +1329,7 @@ impl Authenticator {
                 Err(last_error)
             }
             TokenFormat::Cwt => {
-                // CWT tokens use COSE header key IDs only - no prefix support
+                // CWT tokens use COSE header key IDs
                 if let Some(ref audience) = self.expected_audience {
                     let (permission, _channel) =
                         self.verify_cwt_token_with_channel(token, current_time, audience)?;
@@ -1605,7 +1554,6 @@ impl Authenticator {
         current_time: u64,
         expected_audience: &str,
     ) -> Result<(Permission, Option<String>), AuthError> {
-        // CWT tokens use COSE header key IDs only - no prefix support
         // Extract key ID from COSE headers
         let cwt_key_id = extract_cwt_key_id(token);
 
@@ -2070,11 +2018,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert!(
-            legacy_token.starts_with("myKeyId."),
-            "Token {} does not start with myKeyId.",
-            legacy_token
-        );
+        assert!(!legacy_token.contains("."));
         assert!(matches!(
             legacy_authenticator.verify_doc_token(&legacy_token, "doc123", 0),
             Ok(Authorization::Full)
@@ -2086,7 +2030,6 @@ mod tests {
             .with_key_id("myKeyId".try_into().unwrap());
         cwt_authenticator.set_expected_audience(Some("https://api.example.com".to_string()));
         let server_token = cwt_authenticator.server_token().unwrap();
-        // CWT tokens no longer use prefix format - key ID is embedded in COSE headers
         assert!(
             !server_token.contains("."),
             "Token {} should not contain dots (no prefix format)",
@@ -2109,65 +2052,6 @@ mod tests {
             KeyId::new("myKeyId".to_string()),
             Ok(KeyId("myKeyId".to_string()))
         );
-    }
-
-    #[test]
-    fn test_key_id_mismatch() {
-        let authenticator = Authenticator::gen_key_legacy()
-            .unwrap()
-            .with_key_id("myKeyId".try_into().unwrap());
-        let token = authenticator
-            .gen_doc_token(
-                "doc123",
-                Authorization::Full,
-                ExpirationTimeEpochMillis(0),
-                None,
-            )
-            .unwrap();
-        let token = token.replace("myKeyId.", "aDifferentKeyId.");
-        assert!(token.starts_with("aDifferentKeyId."));
-        assert!(matches!(
-            authenticator.verify_doc_token(&token, "doc123", 0),
-            Err(AuthError::KeyMismatch)
-        ));
-    }
-
-    #[test]
-    fn test_missing_key_id() {
-        let authenticator = Authenticator::gen_key_legacy()
-            .unwrap()
-            .with_key_id("myKeyId".try_into().unwrap());
-        let token = authenticator
-            .gen_doc_token(
-                "doc123",
-                Authorization::Full,
-                ExpirationTimeEpochMillis(0),
-                None,
-            )
-            .unwrap();
-        let token = token.replace("myKeyId.", "");
-        assert!(matches!(
-            authenticator.verify_doc_token(&token, "doc123", 0),
-            Err(AuthError::KeyMismatch)
-        ));
-    }
-
-    #[test]
-    fn test_unexpected_key_id() {
-        let authenticator = Authenticator::gen_key_legacy().unwrap();
-        let token = authenticator
-            .gen_doc_token(
-                "doc123",
-                Authorization::Full,
-                ExpirationTimeEpochMillis(0),
-                None,
-            )
-            .unwrap();
-        let token = format!("unexpectedKeyId.{}", token);
-        assert!(matches!(
-            authenticator.verify_doc_token(&token, "doc123", 0),
-            Err(AuthError::KeyMismatch)
-        ));
     }
 
     #[test]
@@ -2373,7 +2257,6 @@ mod tests {
             )
             .unwrap();
 
-        // CWT tokens no longer use prefix format - key ID is embedded in COSE headers
         assert!(!token.contains("."));
         assert_eq!(detect_token_format(&token), TokenFormat::Cwt);
 
@@ -3102,9 +2985,7 @@ mod tests {
         let hmac_token = hmac_auth.server_token_cwt().unwrap();
         let ecdsa_token = ecdsa_auth.server_token_cwt().unwrap();
 
-        // CWT tokens no longer use prefix format - key IDs are embedded in COSE headers
         // Note: For this test to work properly, we'd need to ensure the same key material
-        // For now, let's test that tokens don't use prefix format
         assert!(!hmac_token.contains("."));
         assert!(!ecdsa_token.contains("."));
     }
@@ -3199,13 +3080,11 @@ mod tests {
 
         let multi_auth = Authenticator::from_multi_key_config(&configs).unwrap();
 
-        // Test token with non-existent key ID
-        let fake_token = "nonexistent.fakecontent";
+        // Test token with invalid content
+        let fake_token = "invalidtokencontent";
 
-        assert!(matches!(
-            multi_auth.verify_token_auto(&fake_token, 0),
-            Err(AuthError::KeyMismatch)
-        ));
+        // Should fail with some error
+        assert!(multi_auth.verify_token_auto(&fake_token, 0).is_err());
     }
 
     #[test]
@@ -3269,9 +3148,8 @@ mod tests {
             server_token.err()
         );
 
-        // The token should be prefixed with the signing key's key_id
         let token = server_token.unwrap();
-        assert!(token.starts_with("signing."));
+        assert!(!token.contains("."));
     }
 
     #[test]
@@ -3350,7 +3228,6 @@ mod tests {
             .verify_doc_token(&token, "test-doc", 0)
             .is_ok());
 
-        // The token should have the old key's ID
-        assert!(token.starts_with("old-v1."));
+        assert!(!token.contains("."));
     }
 }
