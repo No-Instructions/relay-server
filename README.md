@@ -22,35 +22,28 @@ Configuration can be provided via a relay.toml file, or via environment variable
 ```toml
 # relay.toml
 [server]
+url = "https://relay.example.com"
 host = "0.0.0.0"
 port = 8080
-allowed_hosts = [
-    { host = "relay.example.com", scheme = "https" },
-]
 
-[auth]
-# ES256 Public key from Relay.md
-public_key = """
------BEGIN PUBLIC KEY-----
-BLeyXALY7Ce5OTlPar+HBH8M90ROhcc/SOvm5T3E7zWp
-mKsyQ2mhyZ9gxnnPsJ5RRQI0Cm/vcUd3ZEJ5uhO7nhI=
------END PUBLIC KEY-----
-"""
+# Relay.md public keys
+[[auth]]
+key_id = "relay_2025_10_22"
+public_key = "/6OgBTHaRdWLogewMdyE+7AxnI0/HP3WGqRs/bYBlFg="
 
+[[auth]]
+key_id = "relay_2025_10_23"
+public_key = "fbm9JLHrwPpST5HAYORTQR/i1VbZ1kdp2ZEy0XpMbf0="
+
+# Document and attachment persistence
+# Supports S3-compatible storage
 [store]
 type = "aws"
 bucket = "my-bucket"
 region = "us-east-1"
-access_key_id = "AKIA..."
-secret_access_key = "secret..."
+access_key_id = "AKIA..."        # or set AWS_ACCESS_KEY_ID
+secret_access_key = "secret..."  # or set AWS_SECRET_ACCESS_KEY
 prefix = ""
-
-# [metrics]
-# port = 9090
-
-# [logging]
-# level = "trace"
-# format = "pretty"
 ```
 
 ## Self-hosting
