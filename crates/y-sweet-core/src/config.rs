@@ -499,19 +499,35 @@ impl Config {
 
         // Override auth configuration
         if let Ok(auth_key) = env::var("RELAY_SERVER_AUTH") {
-            tracing::info!(
-                "Config override: auth enabled with private_key set (from RELAY_SERVER_AUTH)"
-            );
-
             let key_id = env::var("RELAY_SERVER_KEY_ID").ok();
 
-            // Clear existing auth configs and add the environment variable config
-            self.auth.clear();
-            self.auth.push(AuthKeyConfig {
-                key_id,
-                private_key: Some(auth_key),
-                public_key: None,
-            });
+            // Check if there's already a private key in the config
+            let has_private_key = self.auth.iter().any(|config| config.private_key.is_some());
+
+            if has_private_key {
+                tracing::info!(
+                    "Config override: RELAY_SERVER_AUTH overriding existing private key"
+                );
+
+                // Remove existing private key entries and add the new one
+                self.auth.retain(|config| config.private_key.is_none());
+                self.auth.push(AuthKeyConfig {
+                    key_id,
+                    private_key: Some(auth_key),
+                    public_key: None,
+                });
+            } else {
+                tracing::info!(
+                    "Config override: RELAY_SERVER_AUTH added to multi-key list (from RELAY_SERVER_AUTH)"
+                );
+
+                // Add to existing multi-key list
+                self.auth.push(AuthKeyConfig {
+                    key_id,
+                    private_key: Some(auth_key),
+                    public_key: None,
+                });
+            }
         }
 
         // Override store configuration
@@ -805,5 +821,201 @@ impl Default for Config {
             logging: LoggingConfig::default(),
             metrics: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+    use std::sync::Mutex;
+
+    // Use a mutex to prevent tests from running concurrently and interfering with each other
+    static TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+    fn with_env_vars<F>(vars: Vec<(&str, Option<&str>)>, test: F)
+    where
+        F: FnOnce(),
+    {
+        let _guard = TEST_MUTEX.lock().unwrap();
+
+        // Save original values
+        let original_values: Vec<(String, Option<String>)> = vars
+            .iter()
+            .map(|(key, _)| (key.to_string(), env::var(key).ok()))
+            .collect();
+
+        // Clear all auth-related vars first
+        for key in &["RELAY_SERVER_AUTH", "RELAY_SERVER_KEY_ID"] {
+            env::remove_var(key);
+        }
+
+        // Set test values
+        for (key, value) in &vars {
+            if let Some(val) = value {
+                env::set_var(key, val);
+            } else {
+                env::remove_var(key);
+            }
+        }
+
+        // Run the test
+        test();
+
+        // Restore original values
+        for (key, original_value) in original_values {
+            if let Some(val) = original_value {
+                env::set_var(&key, val);
+            } else {
+                env::remove_var(&key);
+            }
+        }
+    }
+
+    #[test]
+    fn test_relay_server_auth_adds_to_empty_config() {
+        with_env_vars(
+            vec![
+                ("RELAY_SERVER_AUTH", Some("test-auth-key")),
+                ("RELAY_SERVER_KEY_ID", Some("test-key-id")),
+            ],
+            || {
+                let config = Config::from_env_only().unwrap();
+
+                // Should have one auth entry from RELAY_SERVER_AUTH
+                assert_eq!(config.auth.len(), 1);
+                assert_eq!(config.auth[0].key_id, Some("test-key-id".to_string()));
+                assert!(config.auth[0].private_key.is_some());
+                assert_eq!(
+                    config.auth[0].private_key.as_ref().unwrap(),
+                    "test-auth-key"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn test_relay_server_auth_with_existing_public_keys() {
+        // First create a config with some public keys from a TOML file
+        let toml_content = r#"
+[[auth]]
+key_id = "public-key-1"
+public_key = "test-public-key-1"
+
+[[auth]]
+key_id = "public-key-2"
+public_key = "test-public-key-2"
+"#;
+
+        // Create a temporary config file
+        let temp_dir = std::env::temp_dir();
+        let config_path = temp_dir.join("test_config.toml");
+        std::fs::write(&config_path, toml_content).unwrap();
+
+        // Load config from file, then apply env vars
+        let mut config = Config::from_file(&config_path).unwrap();
+
+        with_env_vars(
+            vec![
+                ("RELAY_SERVER_AUTH", Some("env-private-key")),
+                ("RELAY_SERVER_KEY_ID", Some("env-key")),
+            ],
+            || {
+                config.apply_env_overrides().unwrap();
+
+                // Should have 3 auth entries: 2 public keys + 1 private key from env
+                assert_eq!(config.auth.len(), 3);
+
+                // Check that public keys are preserved
+                let public_keys = config
+                    .auth
+                    .iter()
+                    .filter(|a| a.public_key.is_some())
+                    .count();
+                assert_eq!(public_keys, 2);
+
+                // Check that private key was added
+                let private_keys = config
+                    .auth
+                    .iter()
+                    .filter(|a| a.private_key.is_some())
+                    .count();
+                assert_eq!(private_keys, 1);
+
+                // Check the private key content
+                let private_key_entry = config
+                    .auth
+                    .iter()
+                    .find(|a| a.key_id == Some("env-key".to_string()));
+                assert!(private_key_entry.is_some());
+                assert_eq!(
+                    private_key_entry.unwrap().private_key.as_ref().unwrap(),
+                    "env-private-key"
+                );
+            },
+        );
+
+        // Clean up
+        std::fs::remove_file(&config_path).ok();
+    }
+
+    #[test]
+    fn test_relay_server_auth_overrides_existing_private_key() {
+        // Create config with existing private key
+        let toml_content = r#"
+[[auth]]
+key_id = "original-private"
+private_key = "original-private-key"
+
+[[auth]]
+key_id = "public-key-1"
+public_key = "test-public-key"
+"#;
+
+        let temp_dir = std::env::temp_dir();
+        let config_path = temp_dir.join("test_config_override.toml");
+        std::fs::write(&config_path, toml_content).unwrap();
+
+        let mut config = Config::from_file(&config_path).unwrap();
+
+        with_env_vars(
+            vec![
+                ("RELAY_SERVER_AUTH", Some("new-private-key")),
+                ("RELAY_SERVER_KEY_ID", Some("new-private")),
+            ],
+            || {
+                config.apply_env_overrides().unwrap();
+
+                // Should have 2 auth entries: 1 public key + 1 private key (env override)
+                assert_eq!(config.auth.len(), 2);
+
+                // Should have only one private key
+                let private_keys = config
+                    .auth
+                    .iter()
+                    .filter(|a| a.private_key.is_some())
+                    .count();
+                assert_eq!(private_keys, 1);
+
+                // The private key should be from env var, not the original
+                let private_key_entry = config
+                    .auth
+                    .iter()
+                    .find(|a| a.private_key.is_some())
+                    .unwrap();
+                assert_eq!(private_key_entry.key_id, Some("new-private".to_string()));
+                assert_eq!(
+                    private_key_entry.private_key.as_ref().unwrap(),
+                    "new-private-key"
+                );
+
+                // Public key should still be there
+                let public_key_entry = config.auth.iter().find(|a| a.public_key.is_some()).unwrap();
+                assert_eq!(public_key_entry.key_id, Some("public-key-1".to_string()));
+            },
+        );
+
+        // Clean up
+        std::fs::remove_file(&config_path).ok();
     }
 }
