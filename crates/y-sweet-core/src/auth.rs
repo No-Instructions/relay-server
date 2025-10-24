@@ -538,6 +538,73 @@ pub fn detect_token_format(token: &str) -> TokenFormat {
     TokenFormat::Custom
 }
 
+/// Extract key ID from CWT token COSE headers
+fn extract_cwt_key_id(token: &str) -> Option<String> {
+    // Decode the base64 token
+    let token_bytes = match b64_decode(token) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            tracing::trace!("Failed to base64 decode token for key ID extraction");
+            return None;
+        }
+    };
+
+    // Parse as CBOR to access COSE structure
+    let cbor_value: ciborium::Value = match ciborium::de::from_reader(&token_bytes[..]) {
+        Ok(value) => value,
+        Err(_) => {
+            tracing::trace!("Failed to parse token as CBOR for key ID extraction");
+            return None;
+        }
+    };
+
+    // Navigate to COSE structure to extract key ID
+    let cose_structure = match &cbor_value {
+        // CWT tag 61 wrapping COSE
+        ciborium::Value::Tag(61, inner) => &**inner,
+        // Direct COSE structure
+        _ => &cbor_value,
+    };
+
+    match cose_structure {
+        // COSE_Sign1 (tag 18) or COSE_Mac0 (tag 17)
+        ciborium::Value::Tag(tag_num, cose_content) if *tag_num == 17 || *tag_num == 18 => {
+            if let ciborium::Value::Array(cose_array) = &**cose_content {
+                if let Some(ciborium::Value::Bytes(protected_bytes)) = cose_array.get(0) {
+                    // Parse protected headers
+                    if let Ok(protected_map) =
+                        ciborium::de::from_reader::<ciborium::Value, _>(&protected_bytes[..])
+                    {
+                        if let ciborium::Value::Map(headers) = protected_map {
+                            // Look for key ID (COSE parameter 4)
+                            for (key, value) in headers {
+                                if let ciborium::Value::Integer(param_num) = key {
+                                    if let Ok(4) = TryInto::<i32>::try_into(param_num) {
+                                        if let ciborium::Value::Bytes(kid_bytes) = value {
+                                            if let Ok(kid_str) = String::from_utf8(kid_bytes) {
+                                                tracing::trace!(
+                                                    "Extracted key ID from CWT COSE headers: '{}'",
+                                                    kid_str
+                                                );
+                                                return Some(kid_str);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        _ => {
+            tracing::trace!("Token doesn't have recognizable COSE structure for key ID extraction");
+        }
+    }
+
+    None
+}
+
 fn is_cwt_token(data: &[u8]) -> bool {
     // Try to parse as CBOR value first
     if let Ok(cbor_value) = ciborium::de::from_reader(&data[..]) {
@@ -1036,12 +1103,8 @@ impl Authenticator {
 
         let token = b64_encode(&token_bytes);
 
-        let signing_key = self.get_signing_key()?;
-        Ok(if let Some(key_id) = &signing_key.key_id {
-            format!("{}.{}", key_id, token)
-        } else {
-            token
-        })
+        // CWT tokens embed key IDs in COSE headers, not as prefixes
+        Ok(token)
     }
 
     pub fn verify_doc_token(
@@ -1246,49 +1309,88 @@ impl Authenticator {
         token: &str,
         current_time: u64,
     ) -> Result<Permission, AuthError> {
-        // Extract key_id from token (if present)
-        let (token_key_id, token_data) = if let Some((prefix, token_part)) = token.split_once('.') {
-            (Some(prefix), token_part)
-        } else {
-            (None, token)
-        };
+        // Determine token format first
+        let format = detect_token_format(token);
 
-        // Try verification with matching key
-        if let Some(key_id) = token_key_id {
-            // Use hashmap lookup for keys with key_id (O(1) performance)
-            if let Some(&index) = self.key_lookup.get(key_id) {
-                return self.verify_with_key_entry(&self.keys[index], token_data, current_time);
-            } else {
-                return Err(AuthError::KeyMismatch);
-            }
-        }
+        match format {
+            TokenFormat::Custom => {
+                // Extract key_id from custom token (prefix format)
+                let (token_key_id, token_data) =
+                    if let Some((prefix, token_part)) = token.split_once('.') {
+                        (Some(prefix), token_part)
+                    } else {
+                        (None, token)
+                    };
 
-        // For tokens without key_id, try all keys without key_id in configuration order
-        let mut last_error = AuthError::KeyMismatch;
-
-        for &index in &self.keys_without_id {
-            match self.verify_with_key_entry(&self.keys[index], token, current_time) {
-                Ok(permission) => return Ok(permission),
-                Err(err) => {
-                    // Prioritize specific errors over generic ones
-                    match (&last_error, &err) {
-                        // Always prefer non-signature errors (like Expired, InvalidResource)
-                        (_, AuthError::Expired) => last_error = err,
-                        (_, AuthError::InvalidResource) => last_error = err,
-                        (_, AuthError::InvalidClaims) => last_error = err,
-                        (_, AuthError::InvalidToken) => last_error = err,
-                        // Only replace KeyMismatch with signature errors
-                        (AuthError::KeyMismatch, AuthError::InvalidSignature) => last_error = err,
-                        (AuthError::KeyMismatch, AuthError::SignatureVerificationFailed) => {
-                            last_error = err
-                        }
-                        _ => {} // Keep the existing error
+                // Try verification with matching key
+                if let Some(key_id) = token_key_id {
+                    tracing::trace!(
+                        "Custom token has key_id: '{}', looking up in configured keys",
+                        key_id
+                    );
+                    tracing::trace!(
+                        "Available key_ids: {:?}",
+                        self.key_lookup.keys().collect::<Vec<_>>()
+                    );
+                    // Use hashmap lookup for keys with key_id (O(1) performance)
+                    if let Some(&index) = self.key_lookup.get(key_id) {
+                        tracing::trace!("Found matching key at index {}", index);
+                        return self.verify_with_key_entry(
+                            &self.keys[index],
+                            token_data,
+                            current_time,
+                        );
+                    } else {
+                        tracing::debug!(
+                            "Custom token key ID '{}' not found in configured keys",
+                            key_id
+                        );
+                        return Err(AuthError::KeyMismatch);
                     }
+                }
+
+                // For custom tokens without key_id, try all keys without key_id in configuration order
+                let mut last_error = AuthError::KeyMismatch;
+
+                for &index in &self.keys_without_id {
+                    match self.verify_with_key_entry(&self.keys[index], token, current_time) {
+                        Ok(permission) => return Ok(permission),
+                        Err(err) => {
+                            // Prioritize specific errors over generic ones
+                            match (&last_error, &err) {
+                                // Always prefer non-signature errors (like Expired, InvalidResource)
+                                (_, AuthError::Expired) => last_error = err,
+                                (_, AuthError::InvalidResource) => last_error = err,
+                                (_, AuthError::InvalidClaims) => last_error = err,
+                                (_, AuthError::InvalidToken) => last_error = err,
+                                // Only replace KeyMismatch with signature errors
+                                (AuthError::KeyMismatch, AuthError::InvalidSignature) => {
+                                    last_error = err
+                                }
+                                (
+                                    AuthError::KeyMismatch,
+                                    AuthError::SignatureVerificationFailed,
+                                ) => last_error = err,
+                                _ => {} // Keep the existing error
+                            }
+                        }
+                    }
+                }
+
+                Err(last_error)
+            }
+            TokenFormat::Cwt => {
+                // CWT tokens use COSE header key IDs only - no prefix support
+                if let Some(ref audience) = self.expected_audience {
+                    let (permission, _channel) =
+                        self.verify_cwt_token_with_channel(token, current_time, audience)?;
+                    Ok(permission)
+                } else {
+                    tracing::warn!("CWT token verification without audience validation - consider configuring server.url");
+                    Err(AuthError::InvalidToken)
                 }
             }
         }
-
-        Err(last_error)
     }
 
     /// Verify a token with a specific key entry
@@ -1503,43 +1605,70 @@ impl Authenticator {
         current_time: u64,
         expected_audience: &str,
     ) -> Result<(Permission, Option<String>), AuthError> {
-        // Use the new multi-key verification logic
-        // Extract key_id from token (if present)
-        let (token_key_id, token_data) = if let Some((prefix, token_part)) = token.split_once('.') {
-            (Some(prefix), token_part)
-        } else {
-            (None, token)
-        };
+        // CWT tokens use COSE header key IDs only - no prefix support
+        // Extract key ID from COSE headers
+        let cwt_key_id = extract_cwt_key_id(token);
 
         // Try verification with matching key
-        if let Some(key_id) = token_key_id {
+        if let Some(key_id) = cwt_key_id.as_deref() {
+            tracing::trace!(
+                "CWT token has COSE header key_id: '{}', looking up in configured keys",
+                key_id
+            );
+            tracing::trace!(
+                "Available key_ids: {:?}",
+                self.key_lookup.keys().collect::<Vec<_>>()
+            );
             // Use hashmap lookup for keys with key_id (O(1) performance)
             if let Some(&index) = self.key_lookup.get(key_id) {
+                tracing::trace!("Found matching key at index {}", index);
                 return self.verify_cwt_with_channel(
                     &self.keys[index],
-                    token_data,
+                    token,
                     current_time,
                     expected_audience,
                 );
             } else {
+                tracing::debug!(
+                    "CWT COSE header key ID '{}' not found in configured keys",
+                    key_id
+                );
                 return Err(AuthError::KeyMismatch);
             }
         }
 
-        // For tokens without key_id, try all keys without key_id in configuration order
+        // For CWT tokens without key_id in COSE headers, try all keys without key_id in configuration order
+        tracing::trace!("CWT token has no COSE header key_id, trying all keys without key_id");
+        let mut last_error = AuthError::KeyMismatch;
+
         for &index in &self.keys_without_id {
-            if let Ok((permission, channel)) = self.verify_cwt_with_channel(
+            match self.verify_cwt_with_channel(
                 &self.keys[index],
                 token,
                 current_time,
                 expected_audience,
             ) {
-                return Ok((permission, channel));
+                Ok((permission, channel)) => return Ok((permission, channel)),
+                Err(err) => {
+                    // Prioritize specific errors over generic ones
+                    match (&last_error, &err) {
+                        // Always prefer non-signature errors (like Expired, InvalidResource)
+                        (_, AuthError::Expired) => last_error = err,
+                        (_, AuthError::InvalidResource) => last_error = err,
+                        (_, AuthError::InvalidClaims) => last_error = err,
+                        (_, AuthError::InvalidToken) => last_error = err,
+                        // Only replace KeyMismatch with signature errors
+                        (AuthError::KeyMismatch, AuthError::InvalidSignature) => last_error = err,
+                        (AuthError::KeyMismatch, AuthError::SignatureVerificationFailed) => {
+                            last_error = err
+                        }
+                        _ => {} // Keep the existing error
+                    }
+                }
             }
         }
 
-        // Generic error - don't reveal which keys were tried for security
-        Err(AuthError::KeyMismatch)
+        Err(last_error)
     }
 
     /// Verify a CWT token with a specific key entry and extract both permission and channel
@@ -1957,9 +2086,10 @@ mod tests {
             .with_key_id("myKeyId".try_into().unwrap());
         cwt_authenticator.set_expected_audience(Some("https://api.example.com".to_string()));
         let server_token = cwt_authenticator.server_token().unwrap();
+        // CWT tokens no longer use prefix format - key ID is embedded in COSE headers
         assert!(
-            server_token.starts_with("myKeyId."),
-            "Token {} does not start with myKeyId.",
+            !server_token.contains("."),
+            "Token {} should not contain dots (no prefix format)",
             server_token
         );
         assert_eq!(
@@ -2243,7 +2373,8 @@ mod tests {
             )
             .unwrap();
 
-        assert!(token.starts_with("test_key."));
+        // CWT tokens no longer use prefix format - key ID is embedded in COSE headers
+        assert!(!token.contains("."));
         assert_eq!(detect_token_format(&token), TokenFormat::Cwt);
 
         // Verify the token works
@@ -2971,11 +3102,11 @@ mod tests {
         let hmac_token = hmac_auth.server_token_cwt().unwrap();
         let ecdsa_token = ecdsa_auth.server_token_cwt().unwrap();
 
-        // Multi-key authenticator should be able to verify both
+        // CWT tokens no longer use prefix format - key IDs are embedded in COSE headers
         // Note: For this test to work properly, we'd need to ensure the same key material
-        // For now, let's test the key ID extraction logic
-        assert!(hmac_token.starts_with("hmac-key."));
-        assert!(ecdsa_token.starts_with("ecdsa-key."));
+        // For now, let's test that tokens don't use prefix format
+        assert!(!hmac_token.contains("."));
+        assert!(!ecdsa_token.contains("."));
     }
 
     #[test]
