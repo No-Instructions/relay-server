@@ -1,19 +1,9 @@
 openapi: 3.1.0
 info:
-  title: Y-Sweet Server API
+  title: Relay Server API
   version: '0.5.0'
   x-logo:
-    url: 'https://raw.githubusercontent.com/jamsocket/y-sweet/main/logo.svg'
-  description: |
-    Y-Sweet has two APIs:
-    1. **A document management API** (this one), which allows creating and updating documents.
-    2. **A single document API**, which allows connecting to and updating a single document.
-
-    This approach allows for the document management server to live outside of the “data plane” in a multi-server setup,
-    so that none of the actual document data (i.e. the Yjs document updates) ever passes through the document management API.
-
-    The API described here is the document management API. A caller can use this API to obtain a `baseUrl` for a given document,
-    which can then be used as a base for the [single document API](/document.html).
+    url: 'https://f.system3.md/relay-text.svg'
 paths:
   /doc/new:
     post:
@@ -164,123 +154,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-  /doc/{docId}/as-update:
-    get:
-      summary: Get Document Update
-      description: |
-        Retrieves the document as an update.
-
-        Deprecated; use `GET /doc/{docId}/auth` and then call `as-update` relative to the returned `baseUrl` field instead.
-      deprecated: true
-      security:
-        - bearerAuth: []
-      parameters:
-        - in: path
-          name: docId
-          required: true
-          schema:
-            type: string
-          description: Document ID
-      responses:
-        '200':
-          description: Document update
-          content:
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
-        '401':
-          description: Unauthorized
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '404':
-          description: Document not found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-  /doc/{docId}/update:
-    post:
-      summary: Update Document
-      description: |
-        Updates the document with the provided data.
-
-        Deprecated; use `GET /doc/{docId}/auth` and then call `update` relative to the returned `baseUrl` field instead.
-      deprecated: true
-      security:
-        - bearerAuth: []
-      parameters:
-        - in: path
-          name: docId
-          required: true
-          schema:
-            type: string
-          description: Document ID
-      requestBody:
-        required: true
-        content:
-          application/octet-stream:
-            schema:
-              type: string
-              format: binary
-      responses:
-        '200':
-          description: Document updated
-        '400':
-          description: Bad Request
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '401':
-          description: Unauthorized
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '404':
-          description: Document not found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-
-  /doc/ws/{docId}:
-    get:
-      summary: Deprecated WebSocket Endpoint
-      description: |
-        Establishes a WebSocket connection. Deprecated; use `POST /doc/{docId}/auth` and connect
-        to the returned `url` instead.
-      deprecated: true
-      parameters:
-        - in: path
-          name: docId
-          required: true
-          schema:
-            type: string
-        - in: query
-          name: token
-          required: false
-          schema:
-            type: string
-      responses:
-        '101':
-          description: Switching Protocols
-        '400':
-          description: Bad Request
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '401':
-          description: Unauthorized
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-
   /d/{docId}/as-update:
     get:
       summary: Get Document Update
