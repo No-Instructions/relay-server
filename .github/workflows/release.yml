@@ -130,6 +130,39 @@ jobs:
         name: linux-binary-arm64
         path: ./crates/target/aarch64-unknown-linux-musl/release/relay 
 
+  build-linux-armv7:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v2
+      
+    - name: Setup Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        target: armv7-unknown-linux-musleabihf
+        override: true
+        
+    - name: Install musl-tools 
+      run: sudo apt-get install -y musl-tools
+
+    - run: sudo apt-get install gcc-arm-linux-gnueabihf
+
+    - name: Build for Linux ARMv7
+      uses: actions-rs/cargo@v1
+      env:
+        CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER: arm-linux-gnueabihf-gcc
+        CC: arm-linux-gnueabihf-gcc
+      with:
+        command: build
+        args: --release --target armv7-unknown-linux-musleabihf --manifest-path=crates/Cargo.toml
+        
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: linux-binary-armv7
+        path: ./crates/target/armv7-unknown-linux-musleabihf/release/relay
+
   build-windows:
     runs-on: ubuntu-latest
     steps:
@@ -162,7 +195,7 @@ jobs:
         path: ./crates/target/x86_64-pc-windows-gnu/release/relay.exe
 
   release:
-    needs: [build-linux, build-macos-arm64, build-macos-x64, build-windows, build-linux-arm64]
+    needs: [build-linux, build-macos-arm64, build-macos-x64, build-windows, build-linux-arm64, build-linux-armv7]
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request'
     steps:
@@ -176,6 +209,7 @@ jobs:
         macos-binary-x64/relay
         macos-binary-arm64/relay
         linux-binary-arm64/relay
+        linux-binary-armv7/relay
     - name: ls
       run: ls -la
     - name: rename and move
@@ -184,7 +218,8 @@ jobs:
         mv linux-binary/relay.gz relay-linux-x64.gz &&
         mv macos-binary-x64/relay.gz relay-macos-x64.gz &&
         mv macos-binary-arm64/relay.gz relay-macos-arm64.gz &&
-        mv linux-binary-arm64/relay.gz relay-linux-arm64.gz
+        mv linux-binary-arm64/relay.gz relay-linux-arm64.gz &&
+        mv linux-binary-armv7/relay.gz relay-linux-armv7.gz
     - name: Release
       uses: softprops/action-gh-release@v1
       with:
@@ -196,3 +231,4 @@ jobs:
             relay-macos-x64.gz
             relay-macos-arm64.gz
             relay-linux-arm64.gz
+            relay-linux-armv7.gz
