@@ -9,6 +9,7 @@ repository = "https://github.com/drifting-in-space/y-sweet"
 
 [dependencies]
 anyhow = "1.0.72"
+ciborium = "0.2"
 clap = { version = "4.3.12", features = ["derive", "env"] }
 rusty-s3 = "0.7.0"
 serde_json = "1.0.103"

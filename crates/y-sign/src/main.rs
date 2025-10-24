@@ -98,7 +98,22 @@ fn create_authenticator_with_type(
     }
 }
 
-async fn sign_stdin(auth: &Authenticator, key_type: &str) -> Result<()> {
+fn create_authenticator_with_type_and_audience(
+    key: &str,
+    key_type: &str,
+    audience: &str,
+) -> Result<Authenticator, anyhow::Error> {
+    let mut authenticator = create_authenticator_with_type(key, key_type)?;
+    authenticator.expected_audience = Some(audience.to_string());
+    Ok(authenticator)
+}
+
+async fn sign_stdin(
+    auth: &Authenticator,
+    key_type: &str,
+    audience: &str,
+    auth_key: &str,
+) -> Result<()> {
     let mut stdin = tokio::io::stdin();
     let mut buffer = String::new();
     stdin.read_to_string(&mut buffer).await?;
@@ -250,7 +265,14 @@ async fn sign_stdin(auth: &Authenticator, key_type: &str) -> Result<()> {
             // For server tokens, we don't need doc_id or file_hash
             // We also don't use the authorization parameter since server tokens always have full access
 
-            let token = auth.server_token()?;
+            let token = if key_type == "legacy" {
+                auth.server_token_legacy()?
+            } else {
+                // For CWT tokens, we need to create an authenticator with the audience set
+                let auth_with_audience =
+                    create_authenticator_with_type_and_audience(auth_key, key_type, audience)?;
+                auth_with_audience.server_token_cwt()?
+            };
 
             output.insert("token".to_string(), serde_json::Value::String(token));
             output.insert(
@@ -828,6 +850,160 @@ async fn presign_stdin(s3_config: &S3Config, auth: &Authenticator, action: &str)
     Ok(())
 }
 
+async fn decode_token(token: Option<&str>) -> Result<()> {
+    use y_sweet_core::auth::{b64_decode, detect_token_format, TokenFormat};
+
+    let token = if let Some(token) = token {
+        token.to_string()
+    } else {
+        let mut stdin = tokio::io::stdin();
+        let mut buffer = String::new();
+        stdin.read_to_string(&mut buffer).await?;
+        buffer.trim().to_string()
+    };
+
+    let mut output = serde_json::Map::new();
+    output.insert(
+        "token".to_string(),
+        serde_json::Value::String(token.clone()),
+    );
+
+    // Try to decode the token
+    match b64_decode(&token) {
+        Ok(token_bytes) => {
+            // Determine token format
+            let format = detect_token_format(&token);
+            output.insert(
+                "format".to_string(),
+                serde_json::Value::String(
+                    match format {
+                        TokenFormat::Custom => "custom",
+                        TokenFormat::Cwt => "cwt",
+                    }
+                    .to_string(),
+                ),
+            );
+
+            match format {
+                TokenFormat::Cwt => {
+                    // Parse as CBOR and show structure
+                    match ciborium::de::from_reader::<ciborium::Value, _>(&token_bytes[..]) {
+                        Ok(cbor_value) => {
+                            output.insert(
+                                "cbor_structure".to_string(),
+                                format_cbor_value(&cbor_value),
+                            );
+
+                            // Try to extract claims if possible
+                            if let ciborium::Value::Tag(61, inner_value) = &cbor_value {
+                                if let ciborium::Value::Tag(cose_tag, cose_inner) = &**inner_value {
+                                    output.insert(
+                                        "cose_tag".to_string(),
+                                        serde_json::Value::Number((*cose_tag).into()),
+                                    );
+
+                                    // Extract payload from COSE structure
+                                    if let ciborium::Value::Array(cose_array) = &**cose_inner {
+                                        if cose_array.len() >= 3 {
+                                            if let ciborium::Value::Bytes(payload_bytes) =
+                                                &cose_array[2]
+                                            {
+                                                match ciborium::de::from_reader::<ciborium::Value, _>(
+                                                    &payload_bytes[..],
+                                                ) {
+                                                    Ok(claims_cbor) => {
+                                                        output.insert(
+                                                            "claims".to_string(),
+                                                            format_cbor_value(&claims_cbor),
+                                                        );
+                                                    }
+                                                    Err(e) => {
+                                                        output.insert(
+                                                            "claims_error".to_string(),
+                                                            serde_json::Value::String(
+                                                                e.to_string(),
+                                                            ),
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            output.insert(
+                                "cbor_error".to_string(),
+                                serde_json::Value::String(e.to_string()),
+                            );
+                        }
+                    }
+                }
+                TokenFormat::Custom => {
+                    output.insert(
+                        "note".to_string(),
+                        serde_json::Value::String(
+                            "Custom format tokens are binary encoded".to_string(),
+                        ),
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            output.insert(
+                "decode_error".to_string(),
+                serde_json::Value::String(e.to_string()),
+            );
+        }
+    }
+
+    println!("{}", serde_json::Value::Object(output));
+    Ok(())
+}
+
+fn format_cbor_value(value: &ciborium::Value) -> serde_json::Value {
+    match value {
+        ciborium::Value::Integer(i) => {
+            // Convert ciborium integer to i64 then to serde_json::Number
+            let i64_val: i64 = (*i).try_into().unwrap_or(0);
+            serde_json::Value::Number(i64_val.into())
+        }
+        ciborium::Value::Bytes(b) => serde_json::Value::String(format!("bytes({})", b.len())),
+        ciborium::Value::Float(f) => serde_json::Value::Number(
+            serde_json::Number::from_f64(*f).unwrap_or(serde_json::Number::from(0)),
+        ),
+        ciborium::Value::Text(s) => serde_json::Value::String(s.clone()),
+        ciborium::Value::Bool(b) => serde_json::Value::Bool(*b),
+        ciborium::Value::Null => serde_json::Value::Null,
+        ciborium::Value::Tag(tag, inner) => {
+            let mut obj = serde_json::Map::new();
+            obj.insert("tag".to_string(), serde_json::Value::Number((*tag).into()));
+            obj.insert("value".to_string(), format_cbor_value(inner));
+            serde_json::Value::Object(obj)
+        }
+        ciborium::Value::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(format_cbor_value).collect())
+        }
+        ciborium::Value::Map(map) => {
+            let mut obj = serde_json::Map::new();
+            for (k, v) in map {
+                let key = match k {
+                    ciborium::Value::Text(s) => s.clone(),
+                    ciborium::Value::Integer(i) => {
+                        let i64_val: i64 = (*i).try_into().unwrap_or(0);
+                        i64_val.to_string()
+                    }
+                    _ => format!("{:?}", k),
+                };
+                obj.insert(key, format_cbor_value(v));
+            }
+            serde_json::Value::Object(obj)
+        }
+        _ => serde_json::Value::String(format!("{:?}", value)),
+    }
+}
+
 // This function is now replaced by S3Config::from_env in y-sweet-core
 
 /// Y-Sign is a tool for signing and verifying tokens for y-sweet
@@ -849,6 +1025,10 @@ enum SignSubcommand {
         /// Key type (hmac, legacy, es256, eddsa)
         #[clap(long, default_value = "hmac")]
         key_type: String,
+
+        /// The expected audience for the token
+        #[clap(long)]
+        audience: String,
     },
 
     /// Verify a token for a document or file
@@ -861,6 +1041,10 @@ enum SignSubcommand {
         #[clap(long, default_value = "hmac")]
         key_type: String,
 
+        /// The expected audience for the token
+        #[clap(long)]
+        audience: String,
+
         /// The document ID to verify against
         #[clap(long)]
         doc_id: Option<String>,
@@ -868,6 +1052,12 @@ enum SignSubcommand {
         /// The file hash to verify against
         #[clap(long)]
         file_hash: Option<String>,
+    },
+
+    /// Decode a token and show its contents
+    Decode {
+        /// Token to decode (if not provided, reads from stdin)
+        token: Option<String>,
     },
 
     /// Generate a presigned URL for a file using a token
@@ -903,20 +1093,29 @@ async fn main() -> Result<()> {
     // No need for complex logging setup in this simple tool
 
     match &opts.subcmd {
-        SignSubcommand::Sign { auth, key_type } => {
+        SignSubcommand::Sign {
+            auth,
+            key_type,
+            audience,
+        } => {
             let authenticator = create_authenticator_with_type(auth, key_type)?;
-            sign_stdin(&authenticator, key_type).await?;
+            sign_stdin(&authenticator, key_type, audience, auth).await?;
         }
         SignSubcommand::Verify {
             auth,
             key_type,
+            audience,
             doc_id,
             file_hash,
         } => {
-            let authenticator = create_authenticator_with_type(auth, key_type)?;
+            let authenticator =
+                create_authenticator_with_type_and_audience(auth, key_type, audience)?;
             // Use the doc_id if provided, otherwise use file_hash if provided
             let id = doc_id.as_deref().or(file_hash.as_deref());
             verify_stdin(&authenticator, id, key_type).await?;
+        }
+        SignSubcommand::Decode { token } => {
+            decode_token(token.as_deref()).await?;
         }
         SignSubcommand::Presign {
             action,
