@@ -81,29 +81,25 @@ enum ServSubcommand {
         config: Option<PathBuf>,
 
         // Legacy CLI arguments - kept for backward compatibility
-        #[clap(env = "RELAY_SERVER_STORAGE")]
+        #[clap()]
         store: Option<String>,
 
-        #[clap(long, default_value = "8080", env = "PORT")]
-        port: u16,
-        #[clap(long, env = "RELAY_SERVER_HOST")]
+        #[clap(long)]
+        port: Option<u16>,
+        #[clap(long)]
         host: Option<IpAddr>,
-        #[clap(long, env = "METRICS_PORT")]
+        #[clap(long)]
         metrics_port: Option<u16>,
-        #[clap(
-            long,
-            default_value = "10",
-            env = "RELAY_SERVER_CHECKPOINT_FREQ_SECONDS"
-        )]
-        checkpoint_freq_seconds: u64,
+        #[clap(long)]
+        checkpoint_freq_seconds: Option<u64>,
 
-        #[clap(long, env = "RELAY_SERVER_AUTH")]
+        #[clap(long)]
         auth: Option<String>,
 
-        #[clap(long, env = "RELAY_SERVER_URL")]
+        #[clap(long)]
         url: Option<Url>,
 
-        #[clap(long, env = "RELAY_SERVER_ALLOWED_HOSTS", value_delimiter = ',')]
+        #[clap(long, value_delimiter = ',')]
         allowed_hosts: Option<Vec<String>>,
     },
 
@@ -119,7 +115,7 @@ enum ServSubcommand {
     /// The YDoc update should be passed in via stdin.
     ConvertFromUpdate {
         /// The store to write the document to.
-        #[clap(env = "RELAY_SERVER_STORAGE")]
+        #[clap()]
         store: String,
 
         /// The ID of the document to write.
@@ -135,27 +131,23 @@ enum ServSubcommand {
     },
 
     ServeDoc {
-        #[clap(long, default_value = "8080", env = "PORT")]
-        port: u16,
+        #[clap(long)]
+        port: Option<u16>,
 
-        #[clap(long, env = "RELAY_SERVER_HOST")]
+        #[clap(long)]
         host: Option<IpAddr>,
 
-        #[clap(
-            long,
-            default_value = "10",
-            env = "RELAY_SERVER_CHECKPOINT_FREQ_SECONDS"
-        )]
-        checkpoint_freq_seconds: u64,
+        #[clap(long)]
+        checkpoint_freq_seconds: Option<u64>,
     },
 
     Sign {
-        #[clap(long, env = "RELAY_SERVER_AUTH")]
+        #[clap(long)]
         auth: String,
     },
 
     Verify {
-        #[clap(long, env = "RELAY_SERVER_AUTH")]
+        #[clap(long)]
         auth: String,
 
         #[clap(long)]
@@ -187,10 +179,10 @@ fn load_config_for_serve_args(
     config: Option<&PathBuf>,
     // CLI overrides
     store: &Option<String>,
-    port: u16,
+    port: &Option<u16>,
     host: &Option<IpAddr>,
     metrics_port: &Option<u16>,
-    checkpoint_freq_seconds: u64,
+    checkpoint_freq_seconds: &Option<u64>,
     auth: &Option<String>,
     url: &Option<Url>,
     allowed_hosts: &Option<Vec<String>>,
@@ -232,9 +224,9 @@ fn load_config_for_serve_args(
         }
     }
 
-    // Override server settings with CLI args (non-default values)
-    if port != 8080 {
-        config.server.port = port;
+    // Override server settings with CLI args (always apply when provided)
+    if let Some(port_val) = port {
+        config.server.port = *port_val;
     }
     if let Some(port) = metrics_port {
         if config.metrics.is_none() {
@@ -243,8 +235,8 @@ fn load_config_for_serve_args(
             metrics_config.port = *port;
         }
     }
-    if checkpoint_freq_seconds != 10 {
-        config.server.checkpoint_freq_seconds = checkpoint_freq_seconds;
+    if let Some(freq) = checkpoint_freq_seconds {
+        config.server.checkpoint_freq_seconds = *freq;
     }
 
     if let Some(host) = host {
@@ -468,10 +460,10 @@ async fn main() -> Result<()> {
             let config = load_config_for_serve_args(
                 config.as_ref(),
                 store,
-                *port,
+                port,
                 host,
                 metrics_port,
-                *checkpoint_freq_seconds,
+                checkpoint_freq_seconds,
                 auth,
                 url,
                 allowed_hosts,
@@ -861,10 +853,13 @@ async fn main() -> Result<()> {
                 ConfigSubcommand::Show { config } => {
                     match Config::load(Some(config.as_path())) {
                         Ok(config) => {
+                            // Print environment variables to stderr first
+                            config.print_env();
+
                             println!("Current configuration:");
                             println!();
 
-                            // Convert to TOML for display
+                            // Convert to regular TOML for display
                             match toml::to_string_pretty(&config) {
                                 Ok(toml_str) => println!("{}", toml_str),
                                 Err(e) => {
@@ -951,7 +946,7 @@ async fn main() -> Result<()> {
 
             let server = y_sweet::server::Server::new(
                 store,
-                std::time::Duration::from_secs(*checkpoint_freq_seconds),
+                std::time::Duration::from_secs(checkpoint_freq_seconds.unwrap_or(10)),
                 None,   // No authenticator
                 None,   // No URL prefix
                 vec![], // No allowed hosts for single doc mode
@@ -969,7 +964,7 @@ async fn main() -> Result<()> {
 
             let addr = SocketAddr::new(
                 host.unwrap_or(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
-                *port,
+                port.unwrap_or(8080),
             );
 
             let listener = TcpListener::bind(addr).await?;

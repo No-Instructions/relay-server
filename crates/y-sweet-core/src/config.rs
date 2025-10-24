@@ -1,9 +1,250 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
 use thiserror::Error;
 use url::Url;
 
 use crate::webhook::WebhookConfig as CoreWebhookConfig;
+
+// Environment variable override definition
+struct EnvOverride {
+    env_var: &'static str,
+    config_path: &'static str,
+    apply: fn(&mut Config, &str) -> Result<(), ConfigError>,
+}
+
+// Centralized override table - single source of truth
+static ENV_OVERRIDES: &[EnvOverride] = &[
+    EnvOverride {
+        env_var: "RELAY_SERVER_HOST",
+        config_path: "server.host",
+        apply: |config, value| {
+            config.server.host = value.to_string();
+            Ok(())
+        },
+    },
+    EnvOverride {
+        env_var: "PORT",
+        config_path: "server.port",
+        apply: |config, value| {
+            config.server.port = value
+                .parse()
+                .map_err(|_| ConfigError::InvalidPort(value.to_string()))?;
+            Ok(())
+        },
+    },
+    EnvOverride {
+        env_var: "METRICS_PORT",
+        config_path: "metrics.port",
+        apply: |config, value| {
+            let port: u16 = value
+                .parse()
+                .map_err(|_| ConfigError::InvalidPort(value.to_string()))?;
+            if config.metrics.is_none() {
+                config.metrics = Some(MetricsConfig { port });
+            } else if let Some(ref mut metrics) = config.metrics {
+                metrics.port = port;
+            }
+            Ok(())
+        },
+    },
+    EnvOverride {
+        env_var: "RELAY_SERVER_URL",
+        config_path: "server.url",
+        apply: |config, value| {
+            config.server.url = Some(value.to_string());
+            Ok(())
+        },
+    },
+    EnvOverride {
+        env_var: "RELAY_SERVER_CHECKPOINT_FREQ_SECONDS",
+        config_path: "server.checkpoint_freq_seconds",
+        apply: |config, value| {
+            let freq: u64 = value.parse().map_err(|_| {
+                ConfigError::InvalidConfiguration(format!(
+                    "Invalid checkpoint frequency: {}",
+                    value
+                ))
+            })?;
+            config.server.checkpoint_freq_seconds = freq;
+            Ok(())
+        },
+    },
+    EnvOverride {
+        env_var: "RELAY_SERVER_DOC_GC",
+        config_path: "server.doc_gc",
+        apply: |config, value| {
+            let gc_enabled = match value.to_lowercase().as_str() {
+                "true" | "1" | "yes" => true,
+                "false" | "0" | "no" => false,
+                _ => {
+                    return Err(ConfigError::InvalidConfiguration(format!(
+                        "Invalid doc_gc value: {}",
+                        value
+                    )))
+                }
+            };
+            config.server.doc_gc = gc_enabled;
+            Ok(())
+        },
+    },
+    EnvOverride {
+        env_var: "RELAY_SERVER_REDACT_ERRORS",
+        config_path: "server.redact_errors",
+        apply: |config, value| {
+            let redact = match value.to_lowercase().as_str() {
+                "true" | "1" | "yes" => true,
+                "false" | "0" | "no" => false,
+                _ => {
+                    return Err(ConfigError::InvalidConfiguration(format!(
+                        "Invalid redact_errors value: {}",
+                        value
+                    )))
+                }
+            };
+            config.server.redact_errors = redact;
+            Ok(())
+        },
+    },
+    EnvOverride {
+        env_var: "RELAY_SERVER_ALLOWED_HOSTS",
+        config_path: "server.allowed_hosts",
+        apply: |config, value| {
+            let hosts: Vec<String> = value.split(',').map(|s| s.trim().to_string()).collect();
+            let parsed_hosts = Config::parse_allowed_hosts(hosts)?;
+            config.server.allowed_hosts = parsed_hosts;
+            Ok(())
+        },
+    },
+    EnvOverride {
+        env_var: "RELAY_SERVER_AUTH",
+        config_path: "auth",
+        apply: |config, value| {
+            let key_id = std::env::var("RELAY_SERVER_KEY_ID").ok();
+            let has_private_key = config
+                .auth
+                .iter()
+                .any(|config| config.private_key.is_some());
+
+            if has_private_key {
+                config.auth.retain(|config| config.private_key.is_none());
+                config.auth.push(AuthKeyConfig {
+                    key_id,
+                    private_key: Some(value.to_string()),
+                    public_key: None,
+                });
+            } else {
+                config.auth.push(AuthKeyConfig {
+                    key_id,
+                    private_key: Some(value.to_string()),
+                    public_key: None,
+                });
+            }
+            Ok(())
+        },
+    },
+    EnvOverride {
+        env_var: "RELAY_SERVER_STORAGE",
+        config_path: "store",
+        apply: |config, value| {
+            if value.starts_with("s3://") {
+                let url = Url::parse(value).map_err(|_| {
+                    ConfigError::InvalidConfiguration(format!("Invalid S3 URL: {}", value))
+                })?;
+
+                let bucket = url
+                    .host_str()
+                    .ok_or_else(|| {
+                        ConfigError::InvalidConfiguration(
+                            "Invalid S3 URL: missing bucket".to_string(),
+                        )
+                    })?
+                    .to_string();
+
+                let prefix = url.path().trim_start_matches('/');
+                let prefix = if prefix.is_empty() {
+                    String::new()
+                } else {
+                    prefix.to_string()
+                };
+
+                let region = std::env::var("AWS_REGION").unwrap_or_else(|_| default_s3_region());
+                config.store = StoreConfig::S3(S3StoreConfig {
+                    bucket,
+                    prefix,
+                    region,
+                    endpoint: String::new(),
+                    path_style: false,
+                    presigned_url_expiration: default_presigned_url_expiration(),
+                    access_key_id: None,
+                    secret_access_key: None,
+                });
+            } else {
+                config.store = StoreConfig::Filesystem(FilesystemStoreConfig {
+                    path: value.to_string(),
+                });
+            }
+            Ok(())
+        },
+    },
+    EnvOverride {
+        env_var: "RELAY_SERVER_WEBHOOK_CONFIG",
+        config_path: "webhooks",
+        apply: |config, value| {
+            let webhooks: Vec<CoreWebhookConfig> = serde_json::from_str(value).map_err(|e| {
+                ConfigError::InvalidConfiguration(format!("Invalid webhook config JSON: {}", e))
+            })?;
+            config.webhooks = webhooks;
+            Ok(())
+        },
+    },
+    EnvOverride {
+        env_var: "RUST_LOG",
+        config_path: "logging.level",
+        apply: |config, value| {
+            config.logging.level = value.to_string();
+            Ok(())
+        },
+    },
+    EnvOverride {
+        env_var: "RELAY_SERVER_LOG_FORMAT",
+        config_path: "logging.format",
+        apply: |config, value| {
+            config.logging.format = value.to_string();
+            Ok(())
+        },
+    },
+];
+
+// Additional environment variables recognized by Y-Sweet (but not in override system)
+pub const ADDITIONAL_ENV_VARS: &[&str] = &[
+    // AWS credentials & config
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_ENDPOINT_URL_S3",
+    "AWS_S3_USE_PATH_STYLE",
+    // Legacy/alternative storage variables
+    "STORAGE_BUCKET",
+    "AWS_S3_BUCKET",
+    "STORAGE_PREFIX",
+    "AWS_S3_BUCKET_PREFIX",
+    // Special variables
+    "SESSION_BACKEND_KEY",
+    "FLY_APP_NAME",
+];
+
+// Get all override env var names
+pub fn get_override_env_vars() -> Vec<&'static str> {
+    ENV_OVERRIDES.iter().map(|o| o.env_var).collect()
+}
+
+// Get all recognized env var names
+pub fn get_all_recognized_env_vars() -> Vec<&'static str> {
+    let mut all_vars = get_override_env_vars();
+    all_vars.extend_from_slice(ADDITIONAL_ENV_VARS);
+    all_vars
+}
 
 #[derive(Error, Debug)]
 pub enum ConfigError {
@@ -35,6 +276,10 @@ pub struct Config {
     pub logging: LoggingConfig,
 
     pub metrics: Option<MetricsConfig>,
+
+    /// Track which fields were overridden by environment variables
+    #[serde(skip)]
+    pub env_overrides: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -403,210 +648,48 @@ impl Config {
     fn apply_env_overrides(&mut self) -> Result<(), ConfigError> {
         use std::env;
 
-        // Override server configuration
-        if let Ok(host) = env::var("RELAY_SERVER_HOST") {
-            tracing::info!(
-                "Config override: server.host = {} (from RELAY_SERVER_HOST)",
-                host
-            );
-            self.server.host = host;
-        }
-
-        if let Ok(port) = env::var("PORT") {
-            tracing::info!("Config override: server.port = {} (from PORT)", port);
-            self.server.port = port.parse().map_err(|_| ConfigError::InvalidPort(port))?;
-        }
-
-        if let Ok(metrics_port) = env::var("METRICS_PORT") {
-            let port: u16 = metrics_port
-                .parse()
-                .map_err(|_| ConfigError::InvalidPort(metrics_port.clone()))?;
-            tracing::info!(
-                "Config override: metrics.port = {} (from METRICS_PORT)",
-                port
-            );
-            if self.metrics.is_none() {
-                self.metrics = Some(MetricsConfig { port });
-            } else if let Some(ref mut metrics) = self.metrics {
-                metrics.port = port;
-            }
-        }
-
-        if let Ok(url) = env::var("RELAY_SERVER_URL") {
-            tracing::info!(
-                "Config override: server.url = {} (from RELAY_SERVER_URL)",
-                url
-            );
-            self.server.url = Some(url);
-        }
-
-        if let Ok(checkpoint_freq) = env::var("RELAY_SERVER_CHECKPOINT_FREQ_SECONDS") {
-            let freq: u64 = checkpoint_freq.parse().map_err(|_| {
-                ConfigError::InvalidConfiguration(format!(
-                    "Invalid checkpoint frequency: {}",
-                    checkpoint_freq
-                ))
-            })?;
-            tracing::info!("Config override: server.checkpoint_freq_seconds = {} (from RELAY_SERVER_CHECKPOINT_FREQ_SECONDS)", freq);
-            self.server.checkpoint_freq_seconds = freq;
-        }
-
-        if let Ok(doc_gc) = env::var("RELAY_SERVER_DOC_GC") {
-            let gc_enabled = match doc_gc.to_lowercase().as_str() {
-                "true" | "1" | "yes" => true,
-                "false" | "0" | "no" => false,
-                _ => {
-                    return Err(ConfigError::InvalidConfiguration(format!(
-                        "Invalid doc_gc value: {}",
-                        doc_gc
-                    )))
-                }
-            };
-            tracing::info!(
-                "Config override: server.doc_gc = {} (from RELAY_SERVER_DOC_GC)",
-                gc_enabled
-            );
-            self.server.doc_gc = gc_enabled;
-        }
-
-        if let Ok(redact_errors) = env::var("RELAY_SERVER_REDACT_ERRORS") {
-            let redact = match redact_errors.to_lowercase().as_str() {
-                "true" | "1" | "yes" => true,
-                "false" | "0" | "no" => false,
-                _ => {
-                    return Err(ConfigError::InvalidConfiguration(format!(
-                        "Invalid redact_errors value: {}",
-                        redact_errors
-                    )))
-                }
-            };
-            tracing::info!(
-                "Config override: server.redact_errors = {} (from RELAY_SERVER_REDACT_ERRORS)",
-                redact
-            );
-            self.server.redact_errors = redact;
-        }
-
-        if let Ok(allowed_hosts) = env::var("RELAY_SERVER_ALLOWED_HOSTS") {
-            let hosts: Vec<String> = allowed_hosts
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .collect();
-            let parsed_hosts = Self::parse_allowed_hosts(hosts)?;
-            tracing::info!("Config override: server.allowed_hosts = {} hosts (from RELAY_SERVER_ALLOWED_HOSTS)", parsed_hosts.len());
-            self.server.allowed_hosts = parsed_hosts;
-        }
-
-        // Override auth configuration
-        if let Ok(auth_key) = env::var("RELAY_SERVER_AUTH") {
-            let key_id = env::var("RELAY_SERVER_KEY_ID").ok();
-
-            // Check if there's already a private key in the config
-            let has_private_key = self.auth.iter().any(|config| config.private_key.is_some());
-
-            if has_private_key {
+        for override_def in ENV_OVERRIDES {
+            if let Ok(value) = env::var(override_def.env_var) {
                 tracing::info!(
-                    "Config override: RELAY_SERVER_AUTH overriding existing private key"
+                    "Config override: {} = {} (from {})",
+                    override_def.config_path,
+                    value,
+                    override_def.env_var
                 );
 
-                // Remove existing private key entries and add the new one
-                self.auth.retain(|config| config.private_key.is_none());
-                self.auth.push(AuthKeyConfig {
-                    key_id,
-                    private_key: Some(auth_key),
-                    public_key: None,
-                });
-            } else {
-                tracing::info!(
-                    "Config override: RELAY_SERVER_AUTH added to multi-key list (from RELAY_SERVER_AUTH)"
+                (override_def.apply)(self, &value)?;
+                self.env_overrides.insert(
+                    override_def.config_path.to_string(),
+                    override_def.env_var.to_string(),
                 );
-
-                // Add to existing multi-key list
-                self.auth.push(AuthKeyConfig {
-                    key_id,
-                    private_key: Some(auth_key),
-                    public_key: None,
-                });
             }
-        }
-
-        // Override store configuration
-        if let Ok(storage) = env::var("RELAY_SERVER_STORAGE") {
-            if storage.starts_with("s3://") {
-                // Parse S3 URL
-                let url = Url::parse(&storage).map_err(|_| {
-                    ConfigError::InvalidConfiguration(format!("Invalid S3 URL: {}", storage))
-                })?;
-
-                let bucket = url
-                    .host_str()
-                    .ok_or_else(|| {
-                        ConfigError::InvalidConfiguration(
-                            "Invalid S3 URL: missing bucket".to_string(),
-                        )
-                    })?
-                    .to_string();
-
-                let prefix = url.path().trim_start_matches('/');
-                let prefix = if prefix.is_empty() {
-                    String::new()
-                } else {
-                    prefix.to_string()
-                };
-
-                let region = env::var("AWS_REGION").unwrap_or_else(|_| default_s3_region());
-                tracing::info!("Config override: store = S3 (bucket: {}, prefix: {}, region: {}) (from RELAY_SERVER_STORAGE, AWS_REGION={})", 
-                    bucket, prefix, region, env::var("AWS_REGION").unwrap_or_else(|_| "not set".to_string()));
-                self.store = StoreConfig::S3(S3StoreConfig {
-                    bucket,
-                    prefix,
-                    region,
-                    endpoint: String::new(),
-                    path_style: false,
-                    presigned_url_expiration: default_presigned_url_expiration(),
-                    access_key_id: None,
-                    secret_access_key: None,
-                });
-            } else {
-                tracing::info!(
-                    "Config override: store = Filesystem (path: {}) (from RELAY_SERVER_STORAGE)",
-                    storage
-                );
-                self.store = StoreConfig::Filesystem(FilesystemStoreConfig { path: storage });
-            }
-        }
-
-        // Override webhook configuration from environment
-        if let Ok(webhook_config) = env::var("RELAY_SERVER_WEBHOOK_CONFIG") {
-            let webhooks: Vec<CoreWebhookConfig> =
-                serde_json::from_str(&webhook_config).map_err(|e| {
-                    ConfigError::InvalidConfiguration(format!("Invalid webhook config JSON: {}", e))
-                })?;
-            tracing::info!(
-                "Config override: {} webhooks loaded (from RELAY_SERVER_WEBHOOK_CONFIG)",
-                webhooks.len()
-            );
-            self.webhooks = webhooks;
-        }
-
-        // Override logging configuration
-        if let Ok(log_level) = env::var("RUST_LOG") {
-            tracing::info!(
-                "Config override: logging.level = {} (from RUST_LOG)",
-                log_level
-            );
-            self.logging.level = log_level;
-        }
-
-        if let Ok(log_format) = env::var("RELAY_SERVER_LOG_FORMAT") {
-            tracing::info!(
-                "Config override: logging.format = {} (from RELAY_SERVER_LOG_FORMAT)",
-                log_format
-            );
-            self.logging.format = log_format;
         }
 
         Ok(())
+    }
+
+    /// Print all recognized environment variables that are set
+    pub fn print_env(&self) {
+        let all_env_vars = get_all_recognized_env_vars();
+        let mut found_vars = Vec::new();
+
+        for env_var in all_env_vars {
+            if let Ok(value) = std::env::var(env_var) {
+                found_vars.push((env_var, value));
+            }
+        }
+
+        if !found_vars.is_empty() {
+            eprintln!("Environment:");
+
+            // Sort for consistent output
+            found_vars.sort_by_key(|(name, _)| *name);
+
+            for (name, value) in found_vars {
+                eprintln!("{}={}", name, value);
+            }
+            eprintln!();
+        }
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
@@ -820,6 +903,7 @@ impl Default for Config {
             webhooks: Vec::new(),
             logging: LoggingConfig::default(),
             metrics: None,
+            env_overrides: HashMap::new(),
         }
     }
 }
