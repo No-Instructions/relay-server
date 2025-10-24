@@ -5,7 +5,7 @@ from urllib.parse import urlparse
 
 import requests
 
-from .error import YSweetError
+from .error import RelayServerError
 from .connection import DocConnection
 
 
@@ -14,7 +14,7 @@ class DocumentManager:
         parsed_url = urlparse(connection_string)
         self.token = parsed_url.username and requests.utils.unquote(parsed_url.username)
 
-        protocol = "http" if parsed_url.scheme == "ys" else "https"
+        protocol = parsed_url.scheme
         self.base_url = f"{protocol}://{parsed_url.netloc}{parsed_url.path}".rstrip("/")
 
     def _do_request(
@@ -38,15 +38,15 @@ class DocumentManager:
             response.raise_for_status()
         except requests.RequestException as e:
             if isinstance(e, requests.ConnectionError):
-                raise YSweetError({"code": "ServerRefused", "url": url}) from e
+                raise RelayServerError({"code": "ServerRefused", "url": url}) from e
             elif isinstance(e, requests.HTTPError):
                 if e.response.status_code == 401:
                     if self.token:
-                        raise YSweetError({"code": "InvalidAuthProvided"}) from e
+                        raise RelayServerError({"code": "InvalidAuthProvided"}) from e
                     else:
-                        raise YSweetError({"code": "NoAuthProvided"}) from e
+                        raise RelayServerError({"code": "NoAuthProvided"}) from e
                 elif e.response.status_code == 404:
-                    raise YSweetError(
+                    raise RelayServerError(
                         {
                             "code": "NotFound",
                             "status": e.response.status_code,
@@ -54,7 +54,7 @@ class DocumentManager:
                             "url": url,
                         }
                     ) from e
-                raise YSweetError(
+                raise RelayServerError(
                     {
                         "code": "ServerError",
                         "status": e.response.status_code,
@@ -63,9 +63,9 @@ class DocumentManager:
                     }
                 ) from e
             else:
-                raise YSweetError({"code": "Unknown", "message": str(e)}) from e
+                raise RelayServerError({"code": "Unknown", "message": str(e)}) from e
         except Exception as e:
-            raise YSweetError({"code": "Unknown", "message": str(e)}) from e
+            raise RelayServerError({"code": "Unknown", "message": str(e)}) from e
 
         return response
 

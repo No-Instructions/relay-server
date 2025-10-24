@@ -1,17 +1,14 @@
-# Y-Sweet Python Packages
+# Relay Python SDK
 
-This repository contains Python packages for interacting with Y-Sweet:
+Python client library for interacting with the Relay server.
 
-1. `y_sweet_sdk` - Client for the Y-Sweet server
-2. `y_sign` - Python bindings for the y-sign token generation utility
-
-## Y-Sweet SDK Usage
+## Usage
 
 ```python
-from y_sweet_sdk import DocumentManager
+from relay_sdk import DocumentManager
 
 # Get the websocket url for a document.
-doc = DocumentManager('ys://localhost:8080')
+doc = DocumentManager('http://localhost:8080')
 url = doc.get_websocket_url('my-document-id')
 
 # Connect to the document using y_py and ypy_websocket.
@@ -37,44 +34,13 @@ async with (
     await asyncio.Future()  # run forever
 ```
 
-`y_sweet_sdk` is only used to talk directly with the Y-Sweet server to obtain a WebSocket URL to pass to a client.
+`relay_sdk` is only used to talk directly with the Relay server to obtain a WebSocket URL to pass to a client.
 Use a Yjs client like [ypy-websocket](https://davidbrochart.github.io/ypy-websocket/usage/client/) or [pycrdt](https://github.com/jupyter-server/pycrdt)
-in conjunction with `y_sweet_sdk` to access the actual Y.Doc data.
-
-## Y-Sign Usage
-
-```python
-from y_sign import YSignTokenGenerator, Authorization
-
-# Initialize with your Y-Sweet authentication key
-auth_key = "your-y-sweet-auth-key"  # Get this from your Y-Sweet configuration
-generator = YSignTokenGenerator(auth_key)
-
-# Generate a document token
-doc_token = generator.generate_document_token("my-document-id")
-print(f"Document token: {doc_token['token']}")
-
-# Generate a file token with content type and size constraints
-file_token = generator.generate_file_token(
-    "file-hash-value",
-    content_type="text/plain",
-    content_length=1024
-)
-
-# Generate presigned S3 URLs for file upload/download
-# Requires proper S3 configuration via environment variables
-upload_url = generator.generate_presigned_upload_url(file_token["token"])
-download_url = generator.generate_presigned_download_url(file_token["token"])
-
-# Check if a token is valid
-is_valid = generator.is_token_valid(doc_token["token"], "my-document-id")
-```
-
-For more information about the y-sign module, see [Y-Sign Documentation](src/y_sign/README.md).
+in conjunction with `relay_sdk` to access the actual Y.Doc data.
 
 ## Developing
 
-Developing `y_sweet_sdk` requires the [`uv`](https://docs.astral.sh/uv/) project manager.
+Developing `relay_sdk` requires the [`uv`](https://docs.astral.sh/uv/) project manager.
 
 To install it on Mac or Liunux, run:
 
@@ -110,3 +76,7 @@ This runs the `pytest` command in the virtual environment.
 ### Formatting
 
 Run `uv run ruff format` to format before committing changes.
+
+## Acknowledgements
+
+This is a fork of the [y-sweet Python SDK](https://github.com/jamsocket/y-sweet) by the folks at Jamsocket.

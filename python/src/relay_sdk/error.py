@@ -1,7 +1,7 @@
 from typing import Dict, Union
 
 
-class YSweetError(Exception):
+class RelayServerError(Exception):
     def __init__(self, cause: Dict[str, Union[str, int]]):
         self.cause = cause
         super().__init__(self.get_message(cause))
