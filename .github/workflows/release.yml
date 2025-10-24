@@ -35,13 +35,13 @@ jobs:
         args: --manifest-path=crates/Cargo.toml --target aarch64-apple-darwin --release
 
     - name: strip binary
-      run: strip ./crates/target/aarch64-apple-darwin/release/y-sweet
+      run: strip ./crates/target/aarch64-apple-darwin/release/relay
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
         name: macos-binary-arm64
-        path: ./crates/target/aarch64-apple-darwin/release/y-sweet
+        path: ./crates/target/aarch64-apple-darwin/release/relay
 
   build-macos-x64:
     runs-on: macos-latest
@@ -67,7 +67,7 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: macos-binary-x64
-        path: ./crates/target/x86_64-apple-darwin/release/y-sweet 
+        path: ./crates/target/x86_64-apple-darwin/release/relay 
 
   build-linux:
     runs-on: ubuntu-latest
@@ -95,7 +95,7 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: linux-binary
-        path: ./crates/target/x86_64-unknown-linux-musl/release/y-sweet 
+        path: ./crates/target/x86_64-unknown-linux-musl/release/relay 
 
   build-linux-arm64:
     runs-on: ubuntu-latest
@@ -128,7 +128,7 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: linux-binary-arm64
-        path: ./crates/target/aarch64-unknown-linux-musl/release/y-sweet 
+        path: ./crates/target/aarch64-unknown-linux-musl/release/relay 
 
   build-windows:
     runs-on: ubuntu-latest
@@ -159,7 +159,7 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: windows-binary
-        path: ./crates/target/x86_64-pc-windows-gnu/release/y-sweet.exe
+        path: ./crates/target/x86_64-pc-windows-gnu/release/relay.exe
 
   release:
     needs: [build-linux, build-macos-arm64, build-macos-x64, build-windows, build-linux-arm64]
@@ -171,28 +171,28 @@ jobs:
     - name: Compress binary
       run: >
         gzip -9 --keep --force 
-        windows-binary/y-sweet.exe
-        linux-binary/y-sweet
-        macos-binary-x64/y-sweet
-        macos-binary-arm64/y-sweet
-        linux-binary-arm64/y-sweet
+        windows-binary/relay.exe
+        linux-binary/relay
+        macos-binary-x64/relay
+        macos-binary-arm64/relay
+        linux-binary-arm64/relay
     - name: ls
       run: ls -la
     - name: rename and move
       run: >
-        mv windows-binary/y-sweet.exe.gz y-sweet-win-x64.exe.gz &&
-        mv linux-binary/y-sweet.gz y-sweet-linux-x64.gz &&
-        mv macos-binary-x64/y-sweet.gz y-sweet-macos-x64.gz &&
-        mv macos-binary-arm64/y-sweet.gz y-sweet-macos-arm64.gz &&
-        mv linux-binary-arm64/y-sweet.gz y-sweet-linux-arm64.gz
+        mv windows-binary/relay.exe.gz relay-win-x64.exe.gz &&
+        mv linux-binary/relay.gz relay-linux-x64.gz &&
+        mv macos-binary-x64/relay.gz relay-macos-x64.gz &&
+        mv macos-binary-arm64/relay.gz relay-macos-arm64.gz &&
+        mv linux-binary-arm64/relay.gz relay-linux-arm64.gz
     - name: Release
       uses: softprops/action-gh-release@v1
       with:
         name: ${{ github.event.inputs.version }}
         draft: true
         files: |
-            y-sweet-win-x64.exe.gz
-            y-sweet-linux-x64.gz
-            y-sweet-macos-x64.gz
-            y-sweet-macos-arm64.gz
-            y-sweet-linux-arm64.gz
+            relay-win-x64.exe.gz
+            relay-linux-x64.gz
+            relay-macos-x64.gz
+            relay-macos-arm64.gz
+            relay-linux-arm64.gz
