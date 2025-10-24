@@ -1,11 +1,11 @@
 [package]
-name = "y-sweet"
-version = "0.8.2"
+name = "relay"
+version = "0.9.0"
 edition = "2021"
-description = "A standalone Yjs CRDT server with built-in persistence and auth."
+description = "Self-hosted document collaboration server for the Relay.md network"
 license = "MIT"
-homepage = "https://y-sweet.dev"
-repository = "https://github.com/drifting-in-space/y-sweet"
+homepage = "https://relay.md"
+repository = "https://github.com/no-instructions/relay-server"
 build = "build.rs"
 
 [dependencies]

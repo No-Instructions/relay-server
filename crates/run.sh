@@ -44,4 +44,4 @@ if [ -n "$TAILSCALE_AUTHKEY" ]; then
     fi
 fi
 echo "🛰️  Starting Relay Server..."
-exec y-sweet serve --host=0.0.0.0
+exec relay serve --host=0.0.0.0

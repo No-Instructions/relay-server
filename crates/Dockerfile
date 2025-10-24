@@ -10,8 +10,8 @@ FROM debian:trixie-slim
 # Write to disk by default
 ENV YSWEET_STORE="data"
 
-# Add y-sweet binary
-COPY --from=builder /build/target/release/y-sweet /usr/local/bin/y-sweet
+# Add relay binary
+COPY --from=builder /build/target/release/relay /usr/local/bin/relay
 
 # Add tailscale
 COPY --from=docker.io/tailscale/tailscale:stable /usr/local/bin/tailscaled /usr/local/bin/tailscaled

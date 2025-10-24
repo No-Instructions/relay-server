@@ -2,6 +2,9 @@ use anyhow::Context;
 use anyhow::Result;
 use axum::middleware;
 use clap::{Parser, Subcommand, ValueEnum};
+use relay::cli::{print_auth_message, sign_stdin, verify_stdin};
+use relay::server::AllowedHost;
+use relay::stores::filesystem::FileSystemStore;
 use serde_json::json;
 use std::{
     env,
@@ -15,9 +18,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::metadata::LevelFilter;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use url::Url;
-use y_sweet::cli::{print_auth_message, sign_stdin, verify_stdin};
-use y_sweet::server::AllowedHost;
-use y_sweet::stores::filesystem::FileSystemStore;
 use y_sweet_core::{
     auth::Authenticator,
     config::Config,
@@ -558,7 +558,7 @@ async fn main() -> Result<()> {
             // Use webhook configs from configuration (TOML file or env vars)
             let webhook_configs = if config.webhooks.is_empty() {
                 // Fallback to environment variable for backward compatibility
-                y_sweet::webhook::load_webhook_configs()
+                relay::webhook::load_webhook_configs()
             } else {
                 Some(config.webhooks.clone())
             };
@@ -567,7 +567,7 @@ async fn main() -> Result<()> {
                 tracing::info!("Loaded {} webhook configurations", configs.len());
             }
 
-            let server = y_sweet::server::Server::new(
+            let server = relay::server::Server::new(
                 store,
                 std::time::Duration::from_secs(config.server.checkpoint_freq_seconds),
                 auth,
@@ -588,11 +588,11 @@ async fn main() -> Result<()> {
                 async move {
                     let routes = server.routes();
                     let app = routes.layer(middleware::from_fn(
-                        y_sweet::server::Server::version_header_middleware,
+                        relay::server::Server::version_header_middleware,
                     ));
                     let app = if redact_errors {
                         app.layer(middleware::from_fn(
-                            y_sweet::server::Server::redact_error_middleware,
+                            relay::server::Server::redact_error_middleware,
                         ))
                     } else {
                         app
@@ -773,7 +773,7 @@ async fn main() -> Result<()> {
             let mut buf = Vec::new();
             stdin.read_to_end(&mut buf).await?;
 
-            y_sweet::convert::convert(store, &buf, doc_id).await?;
+            relay::convert::convert(store, &buf, doc_id).await?;
         }
         ServSubcommand::Version => {
             println!("{}", VERSION);
@@ -936,7 +936,7 @@ async fn main() -> Result<()> {
             let cancellation_token = CancellationToken::new();
 
             // Load webhook configs from environment for single doc mode
-            let webhook_configs = y_sweet::webhook::load_webhook_configs();
+            let webhook_configs = relay::webhook::load_webhook_configs();
             if let Some(ref configs) = webhook_configs {
                 tracing::info!(
                     "Loaded {} webhook configurations for single doc mode from environment",
@@ -944,7 +944,7 @@ async fn main() -> Result<()> {
                 );
             }
 
-            let server = y_sweet::server::Server::new(
+            let server = relay::server::Server::new(
                 store,
                 std::time::Duration::from_secs(checkpoint_freq_seconds.unwrap_or(10)),
                 None,   // No authenticator

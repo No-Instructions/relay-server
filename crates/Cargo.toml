@@ -2,7 +2,7 @@
 resolver = "2"
 
 members = [
-    "y-sweet",
+    "relay",
     "y-sweet-core",
     "y-sign",
 ]

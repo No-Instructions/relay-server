@@ -1752,6 +1752,42 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "caf4aa5b0f434c91fe5c7f1ecb6a5ece2130b02ad2a590589dda5146df959001"
 
 [[package]]
+name = "relay"
+version = "0.9.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "axum-extra",
+ "bincode",
+ "clap",
+ "colored",
+ "dashmap",
+ "ed25519-dalek",
+ "futures",
+ "headers",
+ "hex",
+ "http",
+ "lib0",
+ "nanoid",
+ "p256",
+ "prometheus",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "y-sweet-core",
+ "yrs",
+ "yrs-kvstore",
+]
+
+[[package]]
 name = "reqwest"
 version = "0.12.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2961,42 +2997,6 @@ dependencies = [
  "tokio",
  "url",
  "y-sweet-core",
-]
-
-[[package]]
-name = "y-sweet"
-version = "0.8.2"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "axum-extra",
- "bincode",
- "clap",
- "colored",
- "dashmap",
- "ed25519-dalek",
- "futures",
- "headers",
- "hex",
- "http",
- "lib0",
- "nanoid",
- "p256",
- "prometheus",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "toml",
- "tracing",
- "tracing-subscriber",
- "url",
- "y-sweet-core",
- "yrs",
- "yrs-kvstore",
 ]
 
 [[package]]
