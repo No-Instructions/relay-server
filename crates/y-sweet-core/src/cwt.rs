@@ -305,9 +305,18 @@ impl CwtAuthenticator {
             .create_signature(&[], |data| self.sign_with_key(data))
             .build();
 
-        let result = sign1
+        let sign1_bytes = sign1
             .to_vec()
             .map_err(|e| CwtError::Serialization(format!("COSE serialization error: {:?}", e)))?;
+
+        // Wrap with COSE_Sign1 tag 18 for defensive parsing
+        let sign1_value = ciborium::de::from_reader(&sign1_bytes[..]).map_err(|e| {
+            CwtError::Serialization(format!("Failed to parse COSE_Sign1 for tagging: {}", e))
+        })?;
+        let tagged_sign1 = ciborium::Value::Tag(18, Box::new(sign1_value));
+        let mut result = Vec::new();
+        ciborium::into_writer(&tagged_sign1, &mut result)
+            .map_err(|e| CwtError::Serialization(e.to_string()))?;
 
         Ok(result)
     }
@@ -339,9 +348,18 @@ impl CwtAuthenticator {
             .create_tag(&[], |data| self.create_mac_tag_with_alg(data, algorithm))
             .build();
 
-        let result = mac0
+        let mac0_bytes = mac0
             .to_vec()
             .map_err(|e| CwtError::Serialization(format!("COSE serialization error: {:?}", e)))?;
+
+        // Wrap with COSE_Mac0 tag 17 for defensive parsing
+        let mac0_value = ciborium::de::from_reader(&mac0_bytes[..]).map_err(|e| {
+            CwtError::Serialization(format!("Failed to parse COSE_Mac0 for tagging: {}", e))
+        })?;
+        let tagged_mac0 = ciborium::Value::Tag(17, Box::new(mac0_value));
+        let mut result = Vec::new();
+        ciborium::into_writer(&tagged_mac0, &mut result)
+            .map_err(|e| CwtError::Serialization(e.to_string()))?;
 
         Ok(result)
     }
@@ -363,78 +381,75 @@ impl CwtAuthenticator {
             })?;
 
         // Step 2: If the object begins with the CWT CBOR tag, remove it and verify that one of the COSE CBOR tags follows it
-        let (cose_cbor, _cose_bytes) = if let ciborium::Value::Tag(tag_num, inner_value) =
-            &cbor_value
-        {
-            tracing::trace!("Found CBOR tag: {}", tag_num);
-            if *tag_num == 61 {
-                // Re-encode the inner value to get bytes without the CWT tag
-                let mut inner_bytes = Vec::new();
-                ciborium::ser::into_writer(inner_value, &mut inner_bytes).map_err(|e| {
-                    tracing::debug!(
-                        "Failed to re-encode inner CBOR after removing CWT tag: {:?}",
-                        e
-                    );
-                    CwtError::InvalidCbor
-                })?;
+        let (cose_cbor, _cose_bytes, _has_cwt_tag) =
+            if let ciborium::Value::Tag(tag_num, inner_value) = &cbor_value {
+                tracing::trace!("Found CBOR tag: {}", tag_num);
+                if *tag_num == 61 {
+                    // Re-encode the inner value to get bytes without the CWT tag
+                    let mut inner_bytes = Vec::new();
+                    ciborium::ser::into_writer(inner_value, &mut inner_bytes).map_err(|e| {
+                        tracing::debug!(
+                            "Failed to re-encode inner CBOR after removing CWT tag: {:?}",
+                            e
+                        );
+                        CwtError::InvalidCbor
+                    })?;
 
-                // Parse the inner value to check for COSE tags
-                let inner_cbor = ciborium::de::from_reader(&inner_bytes[..]).map_err(|e| {
-                    tracing::debug!("Failed to parse inner CBOR after removing CWT tag: {:?}", e);
-                    CwtError::InvalidCbor
-                })?;
+                    // Parse the inner value to check for COSE tags
+                    let inner_cbor = ciborium::de::from_reader(&inner_bytes[..]).map_err(|e| {
+                        tracing::debug!(
+                            "Failed to parse inner CBOR after removing CWT tag: {:?}",
+                            e
+                        );
+                        CwtError::InvalidCbor
+                    })?;
 
-                // Verify that one of the COSE CBOR tags follows, or it's a valid COSE Array structure
-                match &inner_cbor {
-                    ciborium::Value::Tag(inner_tag, _) => match *inner_tag {
-                        17 | 18 | 96 | 97 | 16 | 95 => {
-                            tracing::trace!("Found valid COSE tag {} after CWT tag", inner_tag);
-                        }
-                        _ => {
+                    // Verify that one of the COSE CBOR tags follows, or it's a valid COSE Array structure
+                    match &inner_cbor {
+                        ciborium::Value::Tag(inner_tag, _) => match *inner_tag {
+                            17 | 18 | 96 | 97 | 16 | 95 => {
+                                tracing::trace!("Found valid COSE tag {} after CWT tag", inner_tag);
+                            }
+                            _ => {
+                                tracing::debug!(
+                                    "CWT tag not followed by valid COSE tag, found tag {}",
+                                    inner_tag
+                                );
+                                return Err(CwtError::InvalidCbor);
+                            }
+                        },
+                        ciborium::Value::Array(_) => {
+                            // Require proper COSE tags even when wrapped in CWT tag 61
                             tracing::debug!(
-                                "CWT tag not followed by valid COSE tag, found tag {}",
-                                inner_tag
+                                "CWT tag contains untagged COSE array - require proper COSE tags"
                             );
                             return Err(CwtError::InvalidCbor);
                         }
-                    },
-                    ciborium::Value::Array(_) => {
-                        // This is a valid COSE structure (arrays are the underlying structure)
+                        _ => {
+                            tracing::debug!(
+                                "CWT tag not followed by tagged COSE structure or Array"
+                            );
+                            return Err(CwtError::InvalidCbor);
+                        }
                     }
-                    _ => {
-                        tracing::debug!("CWT tag not followed by tagged COSE structure or Array");
-                        return Err(CwtError::InvalidCbor);
-                    }
-                }
 
-                (inner_cbor, inner_bytes)
-            } else {
-                tracing::debug!("Found CBOR tag {} (not CWT tag 61)", tag_num);
-                // Check if this is a valid COSE tag without CWT wrapper
-                match *tag_num {
-                    17 | 18 | 96 | 97 | 16 | 95 => {
-                        tracing::debug!("Direct COSE tag {} found (no CWT wrapper)", tag_num);
-                        (cbor_value, token_bytes.to_vec())
-                    }
-                    _ => {
-                        tracing::error!(
-                            "Invalid CBOR tag {}, expected CWT tag 61 or COSE tags",
-                            tag_num
-                        );
-                        return Err(CwtError::InvalidCbor);
-                    }
-                }
-            }
-        } else {
-            // Check if it's a plain COSE array structure (no tags at all)
-            match &cbor_value {
-                ciborium::Value::Array(_) => (cbor_value, token_bytes.to_vec()),
-                _ => {
-                    tracing::debug!("CBOR object is not tagged and not an array - invalid format");
+                    (inner_cbor, inner_bytes, true)
+                } else {
+                    tracing::debug!(
+                        "Found CBOR tag {} (not CWT tag 61) - CWT tag required",
+                        tag_num
+                    );
+                    // Require CWT tag 61 - reject direct COSE tags
                     return Err(CwtError::InvalidCbor);
                 }
-            }
-        };
+            } else {
+                // RFC 8392 Section 7.2 Step 2: If no CWT tag, the object must still have a COSE CBOR tag
+                // RFC 8392 Section 7.2 Step 3: Must be tagged with one of the COSE CBOR tags
+                tracing::debug!(
+                    "CBOR object has no CWT tag and no COSE tag - invalid CWT format per RFC 8392"
+                );
+                return Err(CwtError::InvalidCbor);
+            };
 
         // Step 3: If the object is tagged with one of the COSE CBOR tags, remove it and use it to determine the type
         // Step 3: Processing COSE CBOR tags
@@ -517,25 +532,11 @@ impl CwtAuthenticator {
                 }
             }
             ciborium::Value::Array(_) => {
-                // This is a COSE structure without tags (parsed from our own creation)
-                // Determine whether it's Mac0 or Sign1 based on the key type
-                let mut cose_bytes = Vec::new();
-                ciborium::ser::into_writer(&cose_cbor, &mut cose_bytes).map_err(|e| {
-                    tracing::debug!("Failed to serialize COSE Array: {:?}", e);
-                    CwtError::InvalidCbor
-                })?;
-
-                match &self.key_material {
-                    KeyMaterial::Symmetric(_) => {
-                        self.verify_cwt_mac0(&cose_bytes, expected_audience)
-                    }
-                    KeyMaterial::EcdsaP256Private(_)
-                    | KeyMaterial::EcdsaP256Public(_)
-                    | KeyMaterial::Ed25519Private(_)
-                    | KeyMaterial::Ed25519Public(_) => {
-                        self.verify_cwt_sign1(&cose_bytes, expected_audience)
-                    }
-                }
+                // Require proper COSE CBOR tags in all cases - untagged arrays are not valid CWTs
+                tracing::debug!(
+                    "Found untagged COSE array - require proper COSE tags for defensive parsing"
+                );
+                return Err(CwtError::InvalidCbor);
             }
             _ => {
                 tracing::debug!("Expected COSE tag or Array not found");
@@ -549,7 +550,31 @@ impl CwtAuthenticator {
         token_bytes: &[u8],
         expected_audience: &str,
     ) -> Result<CwtClaims, CwtError> {
-        let sign1 = coset::CoseSign1::from_slice(token_bytes).map_err(|e| {
+        // Check if the token is tagged and extract the COSE bytes
+        let cose_bytes = if let Ok(cbor_value) =
+            ciborium::de::from_reader::<ciborium::Value, _>(token_bytes)
+        {
+            match cbor_value {
+                ciborium::Value::Tag(18, inner_value) => {
+                    // COSE_Sign1 tag - extract the inner content
+                    let mut inner_bytes = Vec::new();
+                    ciborium::ser::into_writer(&inner_value, &mut inner_bytes).map_err(|e| {
+                        tracing::debug!("Failed to extract inner COSE_Sign1: {:?}", e);
+                        CwtError::InvalidCbor
+                    })?;
+                    inner_bytes
+                }
+                _ => {
+                    // Not tagged or wrong tag - use original bytes
+                    token_bytes.to_vec()
+                }
+            }
+        } else {
+            // Failed to parse as CBOR - use original bytes
+            token_bytes.to_vec()
+        };
+
+        let sign1 = coset::CoseSign1::from_slice(&cose_bytes).map_err(|e| {
             tracing::debug!("Failed to parse COSE_Sign1 structure: {:?}", e);
             CwtError::InvalidCbor
         })?;
@@ -652,7 +677,31 @@ impl CwtAuthenticator {
         token_bytes: &[u8],
         expected_audience: &str,
     ) -> Result<CwtClaims, CwtError> {
-        let mac0 = coset::CoseMac0::from_slice(token_bytes).map_err(|e| {
+        // Check if the token is tagged and extract the COSE bytes
+        let cose_bytes = if let Ok(cbor_value) =
+            ciborium::de::from_reader::<ciborium::Value, _>(token_bytes)
+        {
+            match cbor_value {
+                ciborium::Value::Tag(17, inner_value) => {
+                    // COSE_Mac0 tag - extract the inner content
+                    let mut inner_bytes = Vec::new();
+                    ciborium::ser::into_writer(&inner_value, &mut inner_bytes).map_err(|e| {
+                        tracing::debug!("Failed to extract inner COSE_Mac0: {:?}", e);
+                        CwtError::InvalidCbor
+                    })?;
+                    inner_bytes
+                }
+                _ => {
+                    // Not tagged or wrong tag - use original bytes
+                    token_bytes.to_vec()
+                }
+            }
+        } else {
+            // Failed to parse as CBOR - use original bytes
+            token_bytes.to_vec()
+        };
+
+        let mac0 = coset::CoseMac0::from_slice(&cose_bytes).map_err(|e| {
             tracing::debug!("Failed to parse COSE_Mac0 structure: {:?}", e);
             tracing::debug!("COSE_Mac0 parse error: {:?}", e);
             CwtError::InvalidCbor
@@ -1234,9 +1283,10 @@ mod tests {
         assert_eq!(decoded_mac0_claims.issued_at, rfc_claims.issued_at);
         assert_eq!(decoded_mac0_claims.scope, rfc_claims.scope);
 
-        // Test that verify_cwt() can auto-detect COSE_Mac0
+        // Test that verify_cwt() works with properly wrapped CWT tokens
+        let cwt_token = cwt_auth.create_cwt(rfc_claims.clone()).unwrap();
         let auto_decoded_claims = cwt_auth
-            .verify_cwt(&mac0_token, "coap://light.example.com")
+            .verify_cwt(&cwt_token, "coap://light.example.com")
             .unwrap();
         assert_eq!(auto_decoded_claims.issuer, rfc_claims.issuer);
 
@@ -1358,10 +1408,10 @@ mod tests {
         assert_ne!(mac0_384, mac0_256);
         assert_ne!(mac0_64, mac0_256);
 
-        // Verify that verify_cwt() auto-detection works with all lengths
-        assert!(cwt_auth.verify_cwt(&mac0_64, "test-audience").is_ok());
-        assert!(cwt_auth.verify_cwt(&mac0_384, "test-audience").is_ok());
-        assert!(cwt_auth.verify_cwt(&mac0_256, "test-audience").is_ok());
+        // Verify that direct COSE_Mac0 verification works with all lengths
+        assert!(cwt_auth.verify_cwt_mac0(&mac0_64, "test-audience").is_ok());
+        assert!(cwt_auth.verify_cwt_mac0(&mac0_384, "test-audience").is_ok());
+        assert!(cwt_auth.verify_cwt_mac0(&mac0_256, "test-audience").is_ok());
     }
 
     #[test]
@@ -1644,12 +1694,91 @@ mod tests {
             .unwrap();
         assert_eq!(decoded_sign1, claims);
 
-        // Verify that both can be verified by verify_cwt auto-detection
+        // Verify that CWT-wrapped token works with verify_cwt
         assert!(ed25519_auth
             .verify_cwt(&wrapped_token, "test-audience")
             .is_ok());
+        // Verify that direct COSE_Sign1 works with verify_cwt_sign1
         assert!(ed25519_auth
-            .verify_cwt(&sign1_token, "test-audience")
+            .verify_cwt_sign1(&sign1_token, "test-audience")
             .is_ok());
+    }
+
+    #[test]
+    fn test_malformed_cwt_rejection() {
+        let authenticator = create_test_authenticator();
+
+        let claims = CwtClaims {
+            issuer: Some("relay-server".to_string()),
+            subject: None,
+            audience: Some("https://api.example.com".to_string()),
+            expiration: Some(1444064944),
+            issued_at: Some(1443944944),
+            scope: "server".to_string(),
+            channel: None,
+        };
+
+        // Test 1: Create a proper CWT (should include CWT tag 61 and COSE tag)
+        let proper_token = authenticator.create_cwt(claims.clone()).unwrap();
+        // This should work
+        assert!(authenticator
+            .verify_cwt(&proper_token, "https://api.example.com")
+            .is_ok());
+
+        // Test 2: Create just the COSE_Mac0 part without CWT tag
+        let mac0_token = authenticator.create_cwt_mac0(claims.clone()).unwrap();
+
+        // Test 3: Try to verify the COSE_Mac0 without CWT wrapper as a CWT
+        // This should be rejected because we now require CWT tag 61
+        let mac0_verification = authenticator.verify_cwt(&mac0_token, "https://api.example.com");
+
+        // Parse the CBOR to check if it has proper tagging
+        let mac0_cbor: ciborium::Value = ciborium::de::from_reader(&mac0_token[..]).unwrap();
+        match &mac0_cbor {
+            ciborium::Value::Tag(tag_num, _) => {
+                // If it has a COSE tag (17 for COSE_Mac0) but no CWT tag, it should be rejected
+                if *tag_num == 17 {
+                    assert!(
+                        mac0_verification.is_err(),
+                        "COSE_Mac0 without CWT tag should be rejected - CWT tag required"
+                    );
+                }
+            }
+            ciborium::Value::Array(_) => {
+                // Untagged array - this should be rejected
+                assert!(
+                    mac0_verification.is_err(),
+                    "Untagged COSE array should be rejected"
+                );
+            }
+            _ => {
+                assert!(
+                    mac0_verification.is_err(),
+                    "Non-COSE structure should be rejected"
+                );
+            }
+        }
+
+        // Test 4: Create a completely untagged payload (just the raw CBOR map)
+        let mut claims_map = Vec::new();
+        claims_map.push((
+            ciborium::Value::Integer(1.into()),
+            ciborium::Value::Text("relay-server".to_string()),
+        ));
+        claims_map.push((
+            ciborium::Value::Integer(3.into()),
+            ciborium::Value::Text("https://api.example.com".to_string()),
+        ));
+        let raw_claims = ciborium::Value::Map(claims_map);
+        let mut raw_claims_bytes = Vec::new();
+        ciborium::ser::into_writer(&raw_claims, &mut raw_claims_bytes).unwrap();
+
+        // This should definitely be rejected
+        let raw_verification =
+            authenticator.verify_cwt(&raw_claims_bytes, "https://api.example.com");
+        assert!(
+            raw_verification.is_err(),
+            "Raw CBOR map should be rejected as invalid CWT"
+        );
     }
 }
