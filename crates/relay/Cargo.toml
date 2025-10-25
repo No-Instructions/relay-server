@@ -11,7 +11,7 @@ build = "build.rs"
 [dependencies]
 anyhow = "1.0.72"
 async-trait = "0.1.71"
-axum = { version = "0.7.4", features = ["ws"] }
+axum = { version = "0.7.4", features = ["ws", "multipart"] }
 axum-extra = { version = "0.9.2", features = ["typed-header"] }
 clap = { version = "4.3.12", features = ["derive", "env"] }
 colored = "2.0.4"
@@ -37,6 +37,8 @@ hex = "0.4.3"
 prometheus = "0.13"
 p256 = "0.13.2"
 ed25519-dalek = { version = "2.1.1", features = ["pkcs8", "pem"] }
+sha2 = "0.10"
+tempfile = "3.8.1"
 
 [dev-dependencies]
 http = "1.1.0"

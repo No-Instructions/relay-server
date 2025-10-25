@@ -6,6 +6,32 @@ use std::{
 };
 use y_sweet_core::store::{FileInfo, Result, Store, StoreError};
 
+fn extract_doc_id_from_key(key: &str) -> Result<String> {
+    if let Some(parts) = key.strip_prefix("files/") {
+        if let Some(doc_id) = parts.split('/').next() {
+            return Ok(doc_id.to_string());
+        }
+    }
+    Err(StoreError::NotAuthorized(format!(
+        "Invalid key format: {}",
+        key
+    )))
+}
+
+fn extract_hash_from_key(key: &str) -> Result<String> {
+    if let Some(parts) = key.strip_prefix("files/") {
+        let mut split_parts = parts.split('/');
+        split_parts.next(); // Skip doc_id
+        if let Some(hash) = split_parts.next() {
+            return Ok(hash.to_string());
+        }
+    }
+    Err(StoreError::NotAuthorized(format!(
+        "Invalid key format: {}",
+        key
+    )))
+}
+
 pub struct FileSystemStore {
     base_path: PathBuf,
 }
@@ -111,6 +137,26 @@ impl Store for FileSystemStore {
 
         Ok(files)
     }
+
+    async fn generate_upload_url(
+        &self,
+        key: &str,
+        _content_type: Option<&str>,
+        _content_length: Option<u64>,
+    ) -> Result<Option<String>> {
+        let doc_id = extract_doc_id_from_key(key)?;
+        Ok(Some(format!("/f/{}/upload", doc_id)))
+    }
+
+    async fn generate_download_url(&self, key: &str) -> Result<Option<String>> {
+        let doc_id = extract_doc_id_from_key(key)?;
+        let hash = extract_hash_from_key(key)?;
+        Ok(Some(format!("/f/{}/download?hash={}", doc_id, hash)))
+    }
+
+    fn supports_direct_uploads(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -189,5 +235,65 @@ mod tests {
 
         // Verify that we got an empty list
         assert_eq!(files.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_generate_upload_url() {
+        // Create a temporary directory for testing
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_path_buf();
+
+        // Create a store with the temp directory
+        let store = FileSystemStore::new(base_path).unwrap();
+
+        // Test generating upload URL - should return relative path for server to process
+        let key = "files/test-doc/abcdef1234567890";
+        let url = store
+            .generate_upload_url(&key, Some("image/png"), Some(1024))
+            .await
+            .unwrap();
+
+        assert_eq!(url, Some("/f/test-doc/upload".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_generate_download_url() {
+        // Create a temporary directory for testing
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_path_buf();
+
+        // Create a store with the temp directory
+        let store = FileSystemStore::new(base_path).unwrap();
+
+        // Test generating download URL - should return relative path for server to process
+        let key = "files/test-doc/abcdef1234567890";
+        let url = store.generate_download_url(&key).await.unwrap();
+
+        assert_eq!(
+            url,
+            Some("/f/test-doc/download?hash=abcdef1234567890".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_extract_doc_id_from_key() {
+        let key = "files/test-doc-123/abcdef1234567890";
+        let doc_id = extract_doc_id_from_key(key).unwrap();
+        assert_eq!(doc_id, "test-doc-123");
+
+        // Test invalid key format
+        let invalid_key = "invalid/key";
+        assert!(extract_doc_id_from_key(invalid_key).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_extract_hash_from_key() {
+        let key = "files/test-doc/abcdef1234567890";
+        let hash = extract_hash_from_key(key).unwrap();
+        assert_eq!(hash, "abcdef1234567890");
+
+        // Test invalid key format
+        let invalid_key = "files/test-doc"; // Missing hash
+        assert!(extract_hash_from_key(invalid_key).is_err());
     }
 }

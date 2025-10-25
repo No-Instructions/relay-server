@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use axum::{
     body::Bytes,
     extract::{
+        multipart::Multipart,
         ws::{CloseFrame, Message, WebSocket},
         Path, Query, Request, State, WebSocketUpgrade,
     },
@@ -16,13 +17,16 @@ use axum::{
 };
 use axum_extra::typed_header::TypedHeader;
 use dashmap::{mapref::one::MappedRef, DashMap};
-use futures::{SinkExt, StreamExt};
+use futures::{SinkExt, StreamExt, TryStreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
+    io::Write,
     sync::{Arc, RwLock},
     time::Duration,
 };
+use tempfile::NamedTempFile;
 use tokio::{
     net::TcpListener,
     sync::mpsc::{channel, Receiver},
@@ -69,6 +73,42 @@ fn current_time_epoch_millis() -> u64 {
     duration_since_epoch.as_millis() as u64
 }
 
+fn validate_file_token(
+    server_state: &Arc<Server>,
+    token: &str,
+    doc_id: &str,
+) -> Result<Permission, AppError> {
+    let authenticator = server_state.authenticator.as_ref().ok_or_else(|| {
+        AppError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            anyhow!("No authenticator configured"),
+        )
+    })?;
+
+    let permission = authenticator
+        .verify_token_auto(token, current_time_epoch_millis())
+        .map_err(|_| AppError(StatusCode::UNAUTHORIZED, anyhow!("Invalid token")))?;
+
+    match &permission {
+        Permission::File(file_permission) => {
+            if file_permission.doc_id != doc_id {
+                return Err(AppError(
+                    StatusCode::UNAUTHORIZED,
+                    anyhow!("Token not valid for this document"),
+                ));
+            }
+        }
+        _ => {
+            return Err(AppError(
+                StatusCode::BAD_REQUEST,
+                anyhow!("Token must be a file token"),
+            ));
+        }
+    }
+
+    Ok(permission)
+}
+
 #[derive(Debug)]
 pub struct AppError(StatusCode, anyhow::Error);
 impl std::error::Error for AppError {}
@@ -95,6 +135,17 @@ impl std::fmt::Display for AppError {
 #[derive(Deserialize)]
 struct FileDownloadQueryParams {
     hash: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FileUploadParams {
+    token: String,
+}
+
+#[derive(Deserialize)]
+struct FileDownloadParams {
+    token: String,
+    hash: String,
 }
 
 pub struct Server {
@@ -516,7 +567,7 @@ impl Server {
     }
 
     pub fn routes(self: &Arc<Self>) -> Router {
-        Router::new()
+        let mut router = Router::new()
             .route("/ready", get(ready))
             .route("/check_store", post(check_store))
             .route("/check_store", get(check_store_deprecated))
@@ -532,16 +583,32 @@ impl Server {
                 "/d/:doc_id/ws/:doc_id2",
                 get(handle_socket_upgrade_full_path),
             )
-            // File endpoints with doc_id in path
-            .route("/f/:doc_id/upload-url", post(handle_file_upload_url))
-            .route("/f/:doc_id/download-url", get(handle_file_download_url))
-            .route("/f/:doc_id/history", get(handle_file_history))
-            .route("/f/:doc_id", delete(handle_file_delete))
-            .route("/f/:doc_id/:hash", delete(handle_file_delete_by_hash))
-            .route("/f/:doc_id", head(handle_file_head))
             .route("/webhook/reload", post(reload_webhook_config_endpoint))
-            .route("/e/:prefix/ws", get(handle_event_websocket_upgrade))
-            .with_state(self.clone())
+            .route("/e/:prefix/ws", get(handle_event_websocket_upgrade));
+
+        // Only add file endpoints if a store is configured
+        if let Some(store) = &self.store {
+            // Add presigned URL endpoints for all stores
+            router = router
+                .route("/f/:doc_id/upload-url", post(handle_file_upload_url))
+                .route("/f/:doc_id/download-url", get(handle_file_download_url));
+
+            // Only add direct upload/download endpoints if store supports direct uploads
+            if store.supports_direct_uploads() {
+                router = router
+                    .route(
+                        "/f/:doc_id/upload",
+                        post(handle_file_upload).put(handle_file_upload_raw),
+                    )
+                    .route("/f/:doc_id/download", get(handle_file_download))
+                    .route("/f/:doc_id/history", get(handle_file_history))
+                    .route("/f/:doc_id", delete(handle_file_delete))
+                    .route("/f/:doc_id/:hash", delete(handle_file_delete_by_hash))
+                    .route("/f/:doc_id", head(handle_file_head));
+            }
+        }
+
+        router.with_state(self.clone())
     }
 
     pub fn single_doc_routes(self: &Arc<Self>) -> Router {
@@ -1198,6 +1265,33 @@ async fn new_doc(
     Ok(Json(NewDocResponse { doc_id }))
 }
 
+fn generate_base_url(
+    url: &Option<Url>,
+    allowed_hosts: &[AllowedHost],
+    request_host: &str,
+) -> Result<String, AppError> {
+    // Priority 1: Explicit URL prefix
+    if let Some(prefix) = url {
+        return Ok(prefix.as_str().trim_end_matches('/').to_string());
+    }
+
+    // Priority 2: Context-derived URL from Host header
+    if let Some(allowed) = allowed_hosts.iter().find(|h| h.host == request_host) {
+        return Ok(format!("{}://{}", allowed.scheme, request_host));
+    }
+
+    // Priority 3: Fallback to old behavior for backward compatibility
+    if allowed_hosts.is_empty() {
+        return Ok(format!("http://{}", request_host));
+    }
+
+    // Reject unknown hosts when allowed_hosts is configured
+    Err(AppError(
+        StatusCode::BAD_REQUEST,
+        anyhow!("Host '{}' not in allowed hosts list", request_host),
+    ))
+}
+
 fn generate_context_aware_urls(
     url: &Option<Url>,
     allowed_hosts: &[AllowedHost],
@@ -1315,8 +1409,11 @@ fn get_token_from_header(
 async fn handle_file_upload_url(
     State(server_state): State<Arc<Server>>,
     Path(doc_id): Path<String>,
+    TypedHeader(host): TypedHeader<headers::Host>,
     auth_header: Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>>,
 ) -> Result<Json<FileUploadUrlResponse>, AppError> {
+    tracing::info!(doc_id = %doc_id, "Generating file upload URL");
+
     // Get token and extract metadata
     let token = get_token_from_header(auth_header);
 
@@ -1375,7 +1472,21 @@ async fn handle_file_upload_url(
                     .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
 
                 if let Some(url) = upload_url {
-                    return Ok(Json(FileUploadUrlResponse { upload_url: url }));
+                    // Check if this is a local endpoint (relative path) and convert to full URL with token
+                    if !url.starts_with("http") {
+                        let base_url = generate_base_url(
+                            &server_state.url,
+                            &server_state.allowed_hosts,
+                            &host.to_string(),
+                        )?;
+                        let full_url = format!("{}{}?token={}", base_url, url, token);
+                        return Ok(Json(FileUploadUrlResponse {
+                            upload_url: full_url,
+                        }));
+                    } else {
+                        // S3/cloud storage URL - return as-is
+                        return Ok(Json(FileUploadUrlResponse { upload_url: url }));
+                    }
                 } else {
                     return Err(AppError(
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -1406,9 +1517,12 @@ async fn handle_file_upload_url(
 async fn handle_file_download_url(
     State(server_state): State<Arc<Server>>,
     Path(doc_id): Path<String>,
+    TypedHeader(host): TypedHeader<headers::Host>,
     Query(params): Query<FileDownloadQueryParams>,
     auth_header: Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>>,
 ) -> Result<Json<FileDownloadUrlResponse>, AppError> {
+    tracing::info!(doc_id = %doc_id, hash = ?params.hash, "Generating file download URL");
+
     // Get token
     let token = get_token_from_header(auth_header);
 
@@ -1455,7 +1569,21 @@ async fn handle_file_download_url(
                     }
 
                     // Generate download URL using hash from token
-                    return generate_file_download_url(&server_state, &doc_id, &file_hash).await;
+                    let Json(download_response) = generate_file_download_url(
+                        &server_state,
+                        &doc_id,
+                        &file_hash,
+                        &host.to_string(),
+                    )
+                    .await?;
+                    // Add token to the URL
+                    let mut download_url = download_response.download_url;
+                    if !download_url.starts_with("http") || download_url.contains("/f/") {
+                        // This is our local endpoint, add token
+                        let separator = if download_url.contains('?') { "&" } else { "?" };
+                        download_url = format!("{}{}token={}", download_url, separator, token);
+                    }
+                    return Ok(Json(FileDownloadUrlResponse { download_url }));
                 }
                 Permission::Server => {
                     // Server token is valid, use hash from query parameter
@@ -1469,7 +1597,21 @@ async fn handle_file_download_url(
                         }
 
                         // Generate download URL using hash from query parameter
-                        return generate_file_download_url(&server_state, &doc_id, &hash).await;
+                        let Json(download_response) = generate_file_download_url(
+                            &server_state,
+                            &doc_id,
+                            &hash,
+                            &host.to_string(),
+                        )
+                        .await?;
+                        // Add token to the URL
+                        let mut download_url = download_response.download_url;
+                        if !download_url.starts_with("http") || download_url.contains("/f/") {
+                            // This is our local endpoint, add token
+                            let separator = if download_url.contains('?') { "&" } else { "?" };
+                            download_url = format!("{}{}token={}", download_url, separator, token);
+                        }
+                        return Ok(Json(FileDownloadUrlResponse { download_url }));
                     } else {
                         return Err(AppError(
                             StatusCode::BAD_REQUEST,
@@ -1514,7 +1656,21 @@ async fn handle_file_download_url(
                         }
 
                         // Generate download URL using hash from query parameter
-                        return generate_file_download_url(&server_state, &doc_id, &hash).await;
+                        let Json(download_response) = generate_file_download_url(
+                            &server_state,
+                            &doc_id,
+                            &hash,
+                            &host.to_string(),
+                        )
+                        .await?;
+                        // Add token to the URL
+                        let mut download_url = download_response.download_url;
+                        if !download_url.starts_with("http") || download_url.contains("/f/") {
+                            // This is our local endpoint, add token
+                            let separator = if download_url.contains('?') { "&" } else { "?" };
+                            download_url = format!("{}{}token={}", download_url, separator, token);
+                        }
+                        return Ok(Json(FileDownloadUrlResponse { download_url }));
                     } else {
                         return Err(AppError(
                             StatusCode::BAD_REQUEST,
@@ -1542,6 +1698,7 @@ async fn generate_file_download_url(
     server_state: &Arc<Server>,
     doc_id: &str,
     file_hash: &str,
+    host: &str,
 ) -> Result<Json<FileDownloadUrlResponse>, AppError> {
     // Check if we have a store configured
     if server_state.store.is_none() {
@@ -1562,7 +1719,17 @@ async fn generate_file_download_url(
         .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
 
     if let Some(url) = download_url {
-        Ok(Json(FileDownloadUrlResponse { download_url: url }))
+        // Check if this is a local endpoint (relative path) and convert to full URL
+        if !url.starts_with("http") {
+            let base_url = generate_base_url(&server_state.url, &server_state.allowed_hosts, host)?;
+            let full_url = format!("{}{}", base_url, url);
+            Ok(Json(FileDownloadUrlResponse {
+                download_url: full_url,
+            }))
+        } else {
+            // S3/cloud storage URL - return as-is
+            Ok(Json(FileDownloadUrlResponse { download_url: url }))
+        }
     } else {
         Err(AppError(StatusCode::NOT_FOUND, anyhow!("File not found")))
     }
@@ -2629,5 +2796,425 @@ mod test {
             token.base_url,
             Some(format!("http://app.flycast/d/{}", doc_id))
         );
+    }
+
+    #[tokio::test]
+    async fn test_file_upload_url_with_filesystem_store() {
+        use crate::stores::filesystem::FileSystemStore;
+        use tempfile::TempDir;
+        use y_sweet_core::api_types::Authorization;
+        use y_sweet_core::auth::{Authenticator, ExpirationTimeEpochMillis};
+
+        // Create a test authenticator
+        let mut authenticator = Authenticator::gen_key().unwrap();
+        authenticator.set_expected_audience(Some("https://api.example.com".to_string()));
+
+        let allowed_hosts = vec![AllowedHost {
+            host: "api.example.com".to_string(),
+            scheme: "https".to_string(),
+        }];
+
+        // Create filesystem store
+        let temp_dir = TempDir::new().unwrap();
+        let store = FileSystemStore::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let server_state = Arc::new(
+            Server::new(
+                Some(Box::new(store)),
+                Duration::from_secs(60),
+                Some(authenticator.clone()),
+                None,
+                allowed_hosts,
+                CancellationToken::new(),
+                true,
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+
+        let doc_id = "test-doc";
+        let file_hash = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+
+        // Generate a file token
+        let token = authenticator
+            .gen_file_token_cwt(
+                file_hash,
+                doc_id,
+                Authorization::Full,
+                ExpirationTimeEpochMillis(u64::MAX),
+                Some("image/png"),
+                Some(1024),
+                None,
+                None,
+            )
+            .unwrap();
+
+        // Test upload URL generation
+        let host_header = TypedHeader(headers::Host::from(http::uri::Authority::from_static(
+            "api.example.com",
+        )));
+        let auth_header = Some(TypedHeader(headers::Authorization::bearer(&token).unwrap()));
+
+        let result = handle_file_upload_url(
+            State(server_state),
+            Path(doc_id.to_string()),
+            host_header,
+            auth_header,
+        )
+        .await
+        .unwrap();
+
+        let Json(response) = result;
+        // Should get full HTTPS URL with token
+        assert!(response
+            .upload_url
+            .starts_with("https://api.example.com/f/"));
+        assert!(response
+            .upload_url
+            .contains(&format!("/f/{}/upload", doc_id)));
+        assert!(response.upload_url.contains(&format!("token={}", token)));
+    }
+
+    #[tokio::test]
+    async fn test_file_download_url_with_filesystem_store() {
+        use crate::stores::filesystem::FileSystemStore;
+        use tempfile::TempDir;
+        use y_sweet_core::api_types::Authorization;
+        use y_sweet_core::auth::{Authenticator, ExpirationTimeEpochMillis};
+
+        // Create a test authenticator
+        let mut authenticator = Authenticator::gen_key().unwrap();
+        authenticator.set_expected_audience(Some("http://localhost".to_string()));
+
+        let allowed_hosts = vec![AllowedHost {
+            host: "localhost".to_string(),
+            scheme: "http".to_string(),
+        }];
+
+        // Create filesystem store
+        let temp_dir = TempDir::new().unwrap();
+        let store = FileSystemStore::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let server_state = Arc::new(
+            Server::new(
+                Some(Box::new(store)),
+                Duration::from_secs(60),
+                Some(authenticator.clone()),
+                None,
+                allowed_hosts,
+                CancellationToken::new(),
+                true,
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+
+        let doc_id = "test-doc";
+        let file_hash = "def456789012345678901234567890def456789012345678901234567890def4";
+
+        // Generate a file token
+        let token = authenticator
+            .gen_file_token_cwt(
+                file_hash,
+                doc_id,
+                Authorization::ReadOnly,
+                ExpirationTimeEpochMillis(u64::MAX),
+                Some("image/jpeg"),
+                Some(2048),
+                None,
+                None,
+            )
+            .unwrap();
+
+        // Test download URL generation
+        let host_header = TypedHeader(headers::Host::from(http::uri::Authority::from_static(
+            "localhost",
+        )));
+        let auth_header = Some(TypedHeader(headers::Authorization::bearer(&token).unwrap()));
+
+        let result = handle_file_download_url(
+            State(server_state),
+            Path(doc_id.to_string()),
+            host_header,
+            Query(FileDownloadQueryParams { hash: None }),
+            auth_header,
+        )
+        .await
+        .unwrap();
+
+        let Json(response) = result;
+        // Should get full HTTP URL with hash and token
+        assert!(response.download_url.starts_with("http://localhost/f/"));
+        assert!(response
+            .download_url
+            .contains(&format!("/f/{}/download", doc_id)));
+        assert!(response
+            .download_url
+            .contains(&format!("hash={}", file_hash)));
+        assert!(response.download_url.contains(&format!("token={}", token)));
+    }
+}
+
+async fn handle_file_upload(
+    State(server_state): State<Arc<Server>>,
+    Path(doc_id): Path<String>,
+    Query(params): Query<FileUploadParams>,
+    mut multipart: Multipart,
+) -> Result<StatusCode, AppError> {
+    tracing::info!(doc_id = %doc_id, "Handling file upload");
+
+    let permission = validate_file_token(&server_state, &params.token, &doc_id)?;
+
+    if let Permission::File(file_permission) = permission {
+        // Only allow Full permission to upload
+        if !matches!(file_permission.authorization, Authorization::Full) {
+            return Err(AppError(
+                StatusCode::FORBIDDEN,
+                anyhow!("Insufficient permissions to upload files"),
+            ));
+        }
+
+        // Get file field from multipart stream
+        let field = multipart
+            .next_field()
+            .await
+            .map_err(|e| AppError(StatusCode::BAD_REQUEST, e.into()))?
+            .ok_or_else(|| AppError(StatusCode::BAD_REQUEST, anyhow!("No file provided")))?;
+
+        // Validate content-type if specified in token
+        if let Some(expected_type) = &file_permission.content_type {
+            if field.content_type() != Some(expected_type) {
+                return Err(AppError(
+                    StatusCode::BAD_REQUEST,
+                    anyhow!("Content-Type mismatch: expected {}", expected_type),
+                ));
+            }
+        }
+
+        // Check if we have a store configured
+        let store = server_state.store.as_ref().ok_or_else(|| {
+            AppError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                anyhow!("No store configured for file uploads"),
+            )
+        })?;
+
+        // Prepare for streaming validation
+        let key = format!("files/{}/{}", doc_id, file_permission.file_hash);
+
+        // Create a temporary file for atomic writes
+        let temp_file = NamedTempFile::new()
+            .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
+
+        let mut hasher = Sha256::new();
+        let mut total_size = 0u64;
+        let mut file_writer = temp_file.as_file();
+
+        // Stream chunks while validating
+        let mut stream = field.into_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| AppError(StatusCode::BAD_REQUEST, e.into()))?;
+
+            // Update hash and size
+            hasher.update(&chunk);
+            total_size += chunk.len() as u64;
+
+            // Early size validation
+            if let Some(expected_length) = file_permission.content_length {
+                if total_size > expected_length {
+                    return Err(AppError(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        anyhow!("File exceeds expected size"),
+                    ));
+                }
+            }
+
+            // Write to temp file
+            file_writer
+                .write_all(&chunk)
+                .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
+        }
+
+        // Final validations
+        if let Some(expected_length) = file_permission.content_length {
+            if total_size != expected_length {
+                return Err(AppError(
+                    StatusCode::BAD_REQUEST,
+                    anyhow!(
+                        "Content-Length mismatch: expected {}, got {}",
+                        expected_length,
+                        total_size
+                    ),
+                ));
+            }
+        }
+
+        let actual_hash = format!("{:x}", hasher.finalize());
+        if actual_hash != file_permission.file_hash {
+            return Err(AppError(
+                StatusCode::BAD_REQUEST,
+                anyhow!(
+                    "File hash mismatch: expected {}, got {}",
+                    file_permission.file_hash,
+                    actual_hash
+                ),
+            ));
+        }
+
+        // Read the temp file contents and store using the store interface
+        let file_contents = std::fs::read(temp_file.path())
+            .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
+
+        store
+            .set(&key, file_contents)
+            .await
+            .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
+
+        Ok(StatusCode::OK)
+    } else {
+        Err(AppError(
+            StatusCode::BAD_REQUEST,
+            anyhow!("Invalid permission type"),
+        ))
+    }
+}
+
+async fn handle_file_upload_raw(
+    State(server_state): State<Arc<Server>>,
+    Path(doc_id): Path<String>,
+    Query(params): Query<FileUploadParams>,
+    body: axum::body::Bytes,
+) -> Result<StatusCode, AppError> {
+    tracing::info!(doc_id = %doc_id, "Handling raw file upload");
+
+    let permission = validate_file_token(&server_state, &params.token, &doc_id)?;
+
+    if let Permission::File(file_permission) = permission {
+        // Only allow Full permission to upload
+        if !matches!(file_permission.authorization, Authorization::Full) {
+            return Err(AppError(
+                StatusCode::FORBIDDEN,
+                anyhow!("Insufficient permissions to upload files"),
+            ));
+        }
+
+        // Check if we have a store configured
+        let store = server_state.store.as_ref().ok_or_else(|| {
+            AppError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                anyhow!("No store configured for file uploads"),
+            )
+        })?;
+
+        let key = format!("files/{}/{}", doc_id, file_permission.file_hash);
+
+        // Validate content length if specified in token
+        if let Some(expected_length) = file_permission.content_length {
+            if body.len() as u64 != expected_length {
+                return Err(AppError(
+                    StatusCode::BAD_REQUEST,
+                    anyhow!(
+                        "Content-Length mismatch: expected {}, got {}",
+                        expected_length,
+                        body.len()
+                    ),
+                ));
+            }
+        }
+
+        // Validate file hash
+        let mut hasher = Sha256::new();
+        hasher.update(&body);
+        let actual_hash = format!("{:x}", hasher.finalize());
+
+        if actual_hash != file_permission.file_hash {
+            return Err(AppError(
+                StatusCode::BAD_REQUEST,
+                anyhow!(
+                    "File hash mismatch: expected {}, got {}",
+                    file_permission.file_hash,
+                    actual_hash
+                ),
+            ));
+        }
+
+        // Store the file
+        store
+            .set(&key, body.to_vec())
+            .await
+            .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
+
+        Ok(StatusCode::OK)
+    } else {
+        Err(AppError(
+            StatusCode::BAD_REQUEST,
+            anyhow!("Invalid permission type"),
+        ))
+    }
+}
+
+async fn handle_file_download(
+    State(server_state): State<Arc<Server>>,
+    Path(doc_id): Path<String>,
+    Query(params): Query<FileDownloadParams>,
+) -> Result<Response, AppError> {
+    tracing::info!(doc_id = %doc_id, hash = %params.hash, "Handling file download");
+
+    let permission = validate_file_token(&server_state, &params.token, &doc_id)?;
+
+    if let Permission::File(file_permission) = permission {
+        // Both ReadOnly and Full can download files
+        if !matches!(
+            file_permission.authorization,
+            Authorization::ReadOnly | Authorization::Full
+        ) {
+            return Err(AppError(
+                StatusCode::FORBIDDEN,
+                anyhow!("Insufficient permissions to download file"),
+            ));
+        }
+
+        // Verify the hash parameter matches the token
+        if file_permission.file_hash != params.hash {
+            return Err(AppError(
+                StatusCode::BAD_REQUEST,
+                anyhow!("Hash parameter does not match token"),
+            ));
+        }
+
+        // Check if we have a store configured
+        let store = server_state.store.as_ref().ok_or_else(|| {
+            AppError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                anyhow!("No store configured for file downloads"),
+            )
+        })?;
+
+        // Retrieve file
+        let key = format!("files/{}/{}", doc_id, file_permission.file_hash);
+        let file_data = store
+            .get(&key)
+            .await
+            .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
+            .ok_or_else(|| AppError(StatusCode::NOT_FOUND, anyhow!("File not found")))?;
+
+        // Stream response
+        let content_type = file_permission
+            .content_type
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+
+        Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", content_type)
+            .header("content-length", file_data.len())
+            .body(axum::body::Body::from(file_data))
+            .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?)
+    } else {
+        Err(AppError(
+            StatusCode::BAD_REQUEST,
+            anyhow!("Invalid permission type"),
+        ))
     }
 }

@@ -74,6 +74,12 @@ pub trait Store: 'static {
             "This store does not support listing versions".to_string(),
         ))
     }
+
+    // Whether this store supports direct uploads through the server
+    // (as opposed to presigned URLs that bypass the server)
+    fn supports_direct_uploads(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -115,5 +121,11 @@ pub trait Store: Send + Sync {
         Err(StoreError::UnsupportedOperation(
             "This store does not support listing versions".to_string(),
         ))
+    }
+
+    // Whether this store supports direct uploads through the server
+    // (as opposed to presigned URLs that bypass the server)
+    fn supports_direct_uploads(&self) -> bool {
+        false
     }
 }
