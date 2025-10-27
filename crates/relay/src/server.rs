@@ -7,7 +7,7 @@ use axum::{
         Path, Query, Request, State, WebSocketUpgrade,
     },
     http::{
-        header::{HeaderMap, HeaderName, HeaderValue},
+        header::{HeaderName, HeaderValue},
         StatusCode,
     },
     middleware::{self, Next},
@@ -58,7 +58,6 @@ use y_sweet_core::{
     webhook_metrics::WebhookMetrics,
 };
 
-const PLANE_VERIFIED_USER_DATA_HEADER: &str = "x-verified-user-data";
 const RELAY_SERVER_VERSION: &str = env!("GIT_VERSION");
 
 #[derive(Clone, Debug)]
@@ -801,13 +800,12 @@ async fn update_doc_inner(
 
 async fn update_doc_single(
     State(server_state): State<Arc<Server>>,
-    headers: HeaderMap,
+    auth_header: Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>>,
     body: Bytes,
 ) -> Result<Response, AppError> {
     let doc_id = server_state.get_single_doc_id()?;
-    // the doc server is meant to be run in Plane, so we expect verified plane
-    // headers to be used for authorization.
-    let authorization = get_authorization_from_plane_header(headers)?;
+    let token = get_token_from_header(auth_header);
+    let authorization = server_state.verify_doc_token(token.as_deref(), &doc_id)?;
     update_doc_inner(doc_id, server_state, authorization, body).await
 }
 
@@ -1044,7 +1042,7 @@ async fn handle_socket_upgrade_full_path(
 async fn handle_socket_upgrade_single(
     ws: WebSocketUpgrade,
     Path(doc_id): Path<String>,
-    headers: HeaderMap,
+    auth_header: Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>>,
     State(server_state): State<Arc<Server>>,
 ) -> Result<Response, AppError> {
     let single_doc_id = server_state.get_single_doc_id()?;
@@ -1055,9 +1053,8 @@ async fn handle_socket_upgrade_single(
         ));
     }
 
-    // the doc server is meant to be run in Plane, so we expect verified plane
-    // headers to be used for authorization.
-    let authorization = get_authorization_from_plane_header(headers)?;
+    let token = get_token_from_header(auth_header);
+    let authorization = server_state.verify_doc_token(token.as_deref(), &doc_id)?;
     handle_socket_upgrade(ws, Path(single_doc_id), authorization, State(server_state)).await
 }
 
@@ -2124,22 +2121,6 @@ async fn handle_file_head(
             StatusCode::UNAUTHORIZED,
             anyhow!("Authentication is required for file operations"),
         ));
-    }
-}
-
-#[derive(Deserialize)]
-struct PlaneVerifiedUserData {
-    authorization: Authorization,
-}
-
-fn get_authorization_from_plane_header(headers: HeaderMap) -> Result<Authorization, AppError> {
-    if let Some(token) = headers.get(HeaderName::from_static(PLANE_VERIFIED_USER_DATA_HEADER)) {
-        let token_str = token.to_str().map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-        let user_data: PlaneVerifiedUserData =
-            serde_json::from_str(token_str).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-        Ok(user_data.authorization)
-    } else {
-        Err((StatusCode::UNAUTHORIZED, anyhow!("No token provided.")))?
     }
 }
 
