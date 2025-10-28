@@ -82,11 +82,24 @@ fn validate_file_token(
 
     let permission = authenticator
         .verify_token_auto(token, current_time_epoch_millis())
-        .map_err(|_| AppError(StatusCode::UNAUTHORIZED, anyhow!("Invalid token")))?;
+        .map_err(|auth_error| {
+            // Record auth failure metric
+            server_state.metrics.record_auth_failure(
+                auth_error.to_metric_label(),
+                "file_access",
+                "POST",
+            );
+            AppError(StatusCode::UNAUTHORIZED, anyhow!("Invalid token"))
+        })?;
 
     match &permission {
         Permission::File(file_permission) => {
             if file_permission.doc_id != doc_id {
+                server_state.metrics.record_permission_denied(
+                    "file",
+                    "access_wrong_document",
+                    "file_access",
+                );
                 return Err(AppError(
                     StatusCode::UNAUTHORIZED,
                     anyhow!("Token not valid for this document"),
@@ -94,6 +107,11 @@ fn validate_file_token(
             }
         }
         _ => {
+            server_state.metrics.record_permission_denied(
+                "file",
+                "wrong_token_type",
+                "file_access",
+            );
             return Err(AppError(
                 StatusCode::BAD_REQUEST,
                 anyhow!("Token must be a file token"),
@@ -1175,14 +1193,27 @@ async fn new_doc(
                 if let Some(doc_id) = &body.doc_id {
                     let permission = authenticator
                         .verify_token_auto(token, current_time_epoch_millis())
-                        .map_err(|e| {
-                            AppError(StatusCode::UNAUTHORIZED, anyhow!("Invalid token: {}", e))
+                        .map_err(|auth_error| {
+                            server_state.metrics.record_auth_failure(
+                                auth_error.to_metric_label(),
+                                "new_doc",
+                                "POST",
+                            );
+                            AppError(
+                                StatusCode::UNAUTHORIZED,
+                                anyhow!("Invalid token: {}", auth_error),
+                            )
                         })?;
 
                     match permission {
                         Permission::Prefix(prefix_perm) => {
                             // Check if the document ID starts with the prefix
                             if !doc_id.starts_with(&prefix_perm.prefix) {
+                                server_state.metrics.record_permission_denied(
+                                    "document",
+                                    "prefix_mismatch",
+                                    "new_doc",
+                                );
                                 return Err(AppError(
                                     StatusCode::FORBIDDEN,
                                     anyhow!(
@@ -1194,6 +1225,11 @@ async fn new_doc(
                             }
                             // Check if we have Full permissions (needed for creation)
                             if prefix_perm.authorization != Authorization::Full {
+                                server_state.metrics.record_permission_denied(
+                                    "document",
+                                    "insufficient_permissions",
+                                    "new_doc",
+                                );
                                 return Err(AppError(
                                     StatusCode::FORBIDDEN,
                                     anyhow!("Prefix token requires Full authorization to create documents")
@@ -1201,6 +1237,11 @@ async fn new_doc(
                             }
                         }
                         _ => {
+                            server_state.metrics.record_permission_denied(
+                                "document",
+                                "wrong_token_type",
+                                "new_doc",
+                            );
                             return Err(AppError(
                                 StatusCode::FORBIDDEN,
                                 anyhow!("Only server or prefix tokens can create documents"),
@@ -1216,6 +1257,7 @@ async fn new_doc(
                 }
             }
         } else {
+            server_state.metrics.record_missing_token("new_doc", "true");
             return Err(AppError(
                 StatusCode::UNAUTHORIZED,
                 anyhow!("No token provided"),

@@ -7,12 +7,8 @@ pub struct RelayMetrics {
     pub webhook_requests_total: CounterVec,
     pub webhook_request_duration_seconds: HistogramVec,
     pub webhook_queue_length: GaugeVec,
-    pub webhook_retry_attempts_total: CounterVec,
     pub webhook_active_dispatchers: GaugeVec,
     pub webhook_config_reloads_total: CounterVec,
-
-    // WebSocket system metrics (currently unused after /events/ws removal)
-    pub websocket_connections: GaugeVec,
 
     // Event system metrics
     pub events_created_total: CounterVec,
@@ -69,15 +65,6 @@ impl RelayMetrics {
         )?;
         registry.register(Box::new(webhook_queue_length.clone()))?;
 
-        let webhook_retry_attempts_total = CounterVec::new(
-            Opts::new(
-                "relay_server_webhook_retry_attempts_total",
-                "Total number of webhook retry attempts",
-            ),
-            &["prefix"],
-        )?;
-        registry.register(Box::new(webhook_retry_attempts_total.clone()))?;
-
         let webhook_active_dispatchers = GaugeVec::new(
             Opts::new(
                 "relay_server_webhook_active_dispatchers",
@@ -95,15 +82,6 @@ impl RelayMetrics {
             &["status"],
         )?;
         registry.register(Box::new(webhook_config_reloads_total.clone()))?;
-
-        let websocket_connections = GaugeVec::new(
-            Opts::new(
-                "relay_server_websocket_connections",
-                "Number of active WebSocket connections for event streaming",
-            ),
-            &["prefix", "channel"],
-        )?;
-        registry.register(Box::new(websocket_connections.clone()))?;
 
         // Event system metrics
         let events_created_total = CounterVec::new(
@@ -210,10 +188,8 @@ impl RelayMetrics {
             webhook_requests_total,
             webhook_request_duration_seconds,
             webhook_queue_length,
-            webhook_retry_attempts_total,
             webhook_active_dispatchers,
             webhook_config_reloads_total,
-            websocket_connections,
             events_created_total,
             events_dispatched_total,
             events_delivered_total,
@@ -250,12 +226,6 @@ impl RelayMetrics {
             .set(length as f64);
     }
 
-    pub fn record_retry_attempt(&self, prefix: &str) {
-        self.webhook_retry_attempts_total
-            .with_label_values(&[prefix])
-            .inc();
-    }
-
     pub fn set_active_dispatchers(&self, prefix: &str, count: usize) {
         self.webhook_active_dispatchers
             .with_label_values(&[prefix])
@@ -266,12 +236,6 @@ impl RelayMetrics {
         self.webhook_config_reloads_total
             .with_label_values(&[status])
             .inc();
-    }
-
-    pub fn set_websocket_connections(&self, prefix: &str, channel: &str, count: usize) {
-        self.websocket_connections
-            .with_label_values(&[prefix, channel])
-            .set(count as f64);
     }
 
     // Event system metrics methods
@@ -380,6 +344,15 @@ mod tests {
         // Record some auth failures
         metrics.record_auth_failure("invalid_signature", "websocket_upgrade", "GET");
         metrics.record_auth_failure("expired", "document_access", "POST");
+        metrics.record_auth_failure("invalid_format", "new_doc", "POST");
+
+        // Test permission denied metrics
+        metrics.record_permission_denied("document", "prefix_mismatch", "new_doc");
+        metrics.record_permission_denied("file", "wrong_token_type", "file_access");
+
+        // Test missing token metrics
+        metrics.record_missing_token("new_doc", "true");
+        metrics.record_missing_token("websocket_upgrade", "false");
 
         // Verify metrics were recorded
         let auth_failures = metrics

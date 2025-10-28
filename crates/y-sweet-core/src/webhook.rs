@@ -1,5 +1,4 @@
 use crate::api_types::NANOID_ALPHABET;
-use crate::event::ServerMessage;
 use crate::metrics::RelayMetrics;
 use crate::store::Store;
 use reqwest::Client;
