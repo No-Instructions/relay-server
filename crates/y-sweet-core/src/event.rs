@@ -794,15 +794,21 @@ impl SyncProtocolEventSender {
             // Clean up any dead weak references while we're here
             doc_connections.retain(|weak_conn| weak_conn.strong_count() > 0);
 
+            let current_doc_connections = doc_connections.len();
+
             // Update metrics
             if let Some(ref metrics) = self.metrics {
-                metrics.set_sync_protocol_connections(doc_connections.len());
+                // Calculate total connections across all documents
+                let total_connections: usize = connections.values().map(|v| v.len()).sum();
+                metrics.set_sync_protocol_connections(total_connections);
+                metrics
+                    .set_sync_protocol_subscriptions_by_channel(&doc_id, current_doc_connections);
             }
 
             tracing::debug!(
                 "Registered DocConnection for document {}. Total connections: {}",
                 doc_id,
-                doc_connections.len()
+                current_doc_connections
             );
         }
     }
@@ -812,9 +818,13 @@ impl SyncProtocolEventSender {
         if let Ok(mut connections) = self.doc_connections.write() {
             connections.remove(doc_id);
 
-            // Update metrics
+            // Update metrics - set this channel to 0 subscriptions
             if let Some(ref metrics) = self.metrics {
-                metrics.set_sync_protocol_connections(0);
+                metrics.set_sync_protocol_subscriptions_by_channel(doc_id, 0);
+
+                // Update total connections count across all documents
+                let total_connections: usize = connections.values().map(|v| v.len()).sum();
+                metrics.set_sync_protocol_connections(total_connections);
             }
 
             tracing::debug!("Unregistered all DocConnections for document {}", doc_id);
@@ -912,10 +922,48 @@ impl EventSender for SyncProtocolEventSender {
 
         // Clean up dead weak references periodically
         if let Ok(mut connections) = self.doc_connections.write() {
-            for doc_connections in connections.values_mut() {
+            let mut metrics_updates = Vec::new();
+
+            for (doc_id, doc_connections) in connections.iter_mut() {
+                let before_count = doc_connections.len();
                 doc_connections.retain(|weak_conn| weak_conn.strong_count() > 0);
+                let after_count = doc_connections.len();
+
+                // Track if this channel's count changed
+                if before_count != after_count {
+                    metrics_updates.push((doc_id.clone(), after_count));
+                }
             }
-            connections.retain(|_, doc_connections| !doc_connections.is_empty());
+
+            // Remove empty document entries and track them for metrics updates
+            let mut removed_docs = Vec::new();
+            connections.retain(|doc_id, doc_connections| {
+                if doc_connections.is_empty() {
+                    removed_docs.push(doc_id.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+
+            // Update metrics if we have changes
+            if !metrics_updates.is_empty() || !removed_docs.is_empty() {
+                if let Some(ref metrics) = self.metrics {
+                    // Update metrics for changed channels
+                    for (doc_id, count) in metrics_updates {
+                        metrics.set_sync_protocol_subscriptions_by_channel(&doc_id, count);
+                    }
+
+                    // Update metrics for removed channels
+                    for doc_id in removed_docs {
+                        metrics.set_sync_protocol_subscriptions_by_channel(&doc_id, 0);
+                    }
+
+                    // Update total connections count
+                    let total_connections: usize = connections.values().map(|v| v.len()).sum();
+                    metrics.set_sync_protocol_connections(total_connections);
+                }
+            }
         }
     }
 

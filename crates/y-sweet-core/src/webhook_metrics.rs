@@ -20,6 +20,7 @@ pub struct WebhookMetrics {
     pub events_delivered_total: CounterVec,
     pub event_updates_merged_total: CounterVec,
     pub sync_protocol_connections: GaugeVec,
+    pub sync_protocol_subscriptions_by_channel: GaugeVec,
     pub debounced_queue_length: GaugeVec,
 
     // Authentication & Security metrics
@@ -151,6 +152,15 @@ impl WebhookMetrics {
         )?;
         registry.register(Box::new(sync_protocol_connections.clone()))?;
 
+        let sync_protocol_subscriptions_by_channel = GaugeVec::new(
+            Opts::new(
+                "relay_server_sync_protocol_subscriptions_by_channel",
+                "Number of sync protocol event subscriptions per channel",
+            ),
+            &["channel"], // Track subscriptions per channel/document
+        )?;
+        registry.register(Box::new(sync_protocol_subscriptions_by_channel.clone()))?;
+
         let debounced_queue_length = GaugeVec::new(
             Opts::new(
                 "relay_server_debounced_queue_length",
@@ -210,6 +220,7 @@ impl WebhookMetrics {
             events_delivered_total,
             event_updates_merged_total,
             sync_protocol_connections,
+            sync_protocol_subscriptions_by_channel,
             debounced_queue_length,
             auth_failures_total,
             token_expired_total,
@@ -295,6 +306,12 @@ impl WebhookMetrics {
             .set(count as f64);
     }
 
+    pub fn set_sync_protocol_subscriptions_by_channel(&self, channel: &str, count: usize) {
+        self.sync_protocol_subscriptions_by_channel
+            .with_label_values(&[channel])
+            .set(count as f64);
+    }
+
     pub fn set_debounced_queue_length(&self, queue_type: &str, length: usize) {
         self.debounced_queue_length
             .with_label_values(&[queue_type])
@@ -339,6 +356,23 @@ impl Default for WebhookMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_sync_protocol_subscription_metrics() {
+        let metrics = WebhookMetrics::new_for_test().unwrap();
+
+        // Test setting subscriptions for different channels
+        metrics.set_sync_protocol_subscriptions_by_channel("doc_123", 2);
+        metrics.set_sync_protocol_subscriptions_by_channel("doc_456", 1);
+        metrics.set_sync_protocol_subscriptions_by_channel("doc_789", 3);
+
+        // Test removing subscriptions (setting to 0)
+        metrics.set_sync_protocol_subscriptions_by_channel("doc_456", 0);
+
+        // Test that we can call the metric method without panicking
+        // (In real usage, these would be retrieved by Prometheus)
+        assert!(true);
+    }
 
     #[test]
     fn test_auth_failure_metrics() {
