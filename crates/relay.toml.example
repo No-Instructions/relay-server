@@ -6,7 +6,8 @@ url = "https://api.example.com"  # RELAY_SERVER_URL
 host = "0.0.0.0"                 # RELAY_SERVER_HOST
 port = 8080                      # PORT
 
-metrics_port = 9090              # METRICS_PORT
+[metrics]
+port = 9090                      # METRICS_PORT
 
 [logging]
 level = "info"                   # RUST_LOG

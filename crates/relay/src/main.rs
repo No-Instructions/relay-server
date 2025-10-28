@@ -487,7 +487,7 @@ async fn main() -> Result<()> {
                 if let Some(ref url) = config.server.url {
                     tracing::info!("CWT audience validation enabled for: {}", url);
                 } else {
-                    tracing::warn!("No server URL configured - CWT tokens will be rejected");
+                    return Err(anyhow::anyhow!("Server URL is required"));
                 }
             }
 

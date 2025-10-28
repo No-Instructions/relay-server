@@ -1,0 +1,31 @@
+[server]
+host = "0.0.0.0"
+port = 8080
+
+
+# Set this to your private URL
+# url = "https://example.com"
+
+
+# Using S3-compatible storage is recommended for production.
+[store]
+type = "filesystem"
+path = "./data"
+
+
+# [logging]
+# level = "trace"
+# format = "pretty"
+
+
+# Relay.md public keys
+[[auth]]
+key_id = "relay_2025_10_22"
+public_key = "/6OgBTHaRdWLogewMdyE+7AxnI0/HP3WGqRs/bYBlFg="
+
+[[auth]]
+key_id = "relay_2025_10_23"
+public_key = "fbm9JLHrwPpST5HAYORTQR/i1VbZ1kdp2ZEy0XpMbf0="
+
+
+

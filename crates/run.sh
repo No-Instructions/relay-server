@@ -4,6 +4,11 @@ set -e  # Exit on error
 # Handle signals properly
 trap "exit" TERM INT
 
+# Check if URL is provided as first argument
+if [ -n "$1" ]; then
+    echo "🔗 Using URL from argument: $1"
+fi
+
 # Backwards compatibility for deprecated Y_SWEET_ variables
 use_legacy_var() {
     local new_var=$1
@@ -18,19 +23,6 @@ use_legacy_var RELAY_SERVER_URL Y_SWEET_URL_PREFIX
 use_legacy_var RELAY_SERVER_STORAGE Y_SWEET_STORE
 use_legacy_var RELAY_SERVER_AUTH Y_SWEET_AUTH
 
-# If RELAY_SERVER_URL is not set but FLY_APP_NAME is, construct the URL
-if [ -z "$RELAY_SERVER_URL" ] && [ -n "$FLY_APP_NAME" ]; then
-    export RELAY_SERVER_URL="https://$FLY_APP_NAME.fly.dev"
-    echo "🪽  Running on fly.io. Setting --url-prefix=$RELAY_SERVER_URL"
-fi
-
-# RELAY_SERVER_STORAGE is required
-if [ -z "$RELAY_SERVER_STORAGE" ]; then
-    echo "RELAY_SERVER_STORAGE environment variable is required" >&2
-    exit 1
-fi
-echo "💾 Persisting data to $RELAY_SERVER_STORAGE"
-
 if [ -n "$TAILSCALE_AUTHKEY" ]; then
     echo "🔑 Joining tailnet..."
     if [ -n "$TAILSCALE_USERSPACE_NETWORKING" ]; then
@@ -43,5 +35,11 @@ if [ -n "$TAILSCALE_AUTHKEY" ]; then
         tailscale serve --bg localhost:8080
     fi
 fi
+
 echo "🛰️  Starting Relay Server..."
-exec relay serve --host=0.0.0.0
+./relay config validate
+if [ -n "$1" ]; then
+    exec ./relay serve --host=0.0.0.0 --url="$1"
+else
+    exec ./relay serve --host=0.0.0.0
+fi
