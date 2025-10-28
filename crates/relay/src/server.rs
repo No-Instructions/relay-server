@@ -40,16 +40,12 @@ use y_sweet_core::{
         DocCreationRequest, DocumentVersionEntry, DocumentVersionResponse, FileDownloadUrlResponse,
         FileHistoryEntry, FileHistoryResponse, FileUploadUrlResponse, NewDocResponse,
     },
-    auth::{
-        Authenticator, ExpirationTimeEpochMillis, Permission, PrefixPermission,
-        DEFAULT_EXPIRATION_SECONDS,
-    },
+    auth::{Authenticator, ExpirationTimeEpochMillis, Permission, DEFAULT_EXPIRATION_SECONDS},
     doc_connection::DocConnection,
     doc_sync::DocWithSyncKv,
     event::{
         DebouncedSyncProtocolEventSender, DocumentUpdatedEvent, EventDispatcher, EventEnvelope,
-        EventSender, ServerMessage, SyncProtocolEventSender, UnifiedEventDispatcher,
-        WebSocketSender, WebhookSender,
+        EventSender, SyncProtocolEventSender, UnifiedEventDispatcher, WebhookSender,
     },
     store::Store,
     sync::awareness::Awareness,
@@ -160,7 +156,6 @@ pub struct Server {
     /// Disabled for single-doc mode, since we only have one doc.
     doc_gc: bool,
     event_dispatcher: Option<Arc<dyn EventDispatcher>>,
-    websocket_sender: Arc<WebSocketSender>,
     sync_protocol_event_sender: Arc<SyncProtocolEventSender>,
     metrics: Arc<WebhookMetrics>,
 }
@@ -180,7 +175,6 @@ impl Server {
         let metrics = WebhookMetrics::new()
             .map_err(|e| anyhow!("Failed to initialize webhook metrics: {}", e))?;
 
-        let websocket_sender = Arc::new(WebSocketSender::new());
         let sync_protocol_event_sender =
             Arc::new(SyncProtocolEventSender::new().with_metrics(metrics.clone()));
 
@@ -195,20 +189,18 @@ impl Server {
                     .map_err(|e| anyhow!("Failed to create webhook sender: {}", e))?,
             );
 
-            let senders: Vec<Arc<dyn EventSender>> = vec![
-                webhook_sender,
-                websocket_sender.clone(),
-                debounced_sync_sender.clone(),
-            ];
+            let senders: Vec<Arc<dyn EventSender>> =
+                vec![webhook_sender, debounced_sync_sender.clone()];
 
             Some(
                 Arc::new(UnifiedEventDispatcher::new(senders, metrics.clone()))
                     as Arc<dyn EventDispatcher>,
             )
         } else {
-            tracing::info!("No webhook configs provided, creating WebSocket-only event dispatcher");
-            let senders: Vec<Arc<dyn EventSender>> =
-                vec![websocket_sender.clone(), debounced_sync_sender.clone()];
+            tracing::info!(
+                "No webhook configs provided, creating sync protocol-only event dispatcher"
+            );
+            let senders: Vec<Arc<dyn EventSender>> = vec![debounced_sync_sender.clone()];
             Some(
                 Arc::new(UnifiedEventDispatcher::new(senders, metrics.clone()))
                     as Arc<dyn EventDispatcher>,
@@ -228,7 +220,6 @@ impl Server {
             cancellation_token,
             doc_gc,
             event_dispatcher,
-            websocket_sender,
             sync_protocol_event_sender,
             metrics,
         })
@@ -582,8 +573,7 @@ impl Server {
                 "/d/:doc_id/ws/:doc_id2",
                 get(handle_socket_upgrade_full_path),
             )
-            .route("/webhook/reload", post(reload_webhook_config_endpoint))
-            .route("/e/:prefix/ws", get(handle_event_websocket_upgrade));
+            .route("/webhook/reload", post(reload_webhook_config_endpoint));
 
         // Only add file endpoints if a store is configured
         if let Some(store) = &self.store {
@@ -711,11 +701,6 @@ impl Server {
 #[derive(Deserialize)]
 struct HandlerParams {
     token: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct EventWebSocketPath {
-    prefix: String,
 }
 
 async fn get_doc_as_update(
@@ -2182,221 +2167,6 @@ async fn metrics_endpoint(State(_server_state): State<Arc<Server>>) -> Result<St
             anyhow!("Failed to convert metrics to string: {}", e),
         )
     })?)
-}
-
-async fn handle_event_websocket_upgrade(
-    ws: WebSocketUpgrade,
-    Path(path): Path<EventWebSocketPath>,
-    Query(params): Query<HandlerParams>,
-    State(server_state): State<Arc<Server>>,
-) -> Result<Response, AppError> {
-    use y_sweet_core::auth::{detect_token_format, TokenFormat};
-
-    tracing::info!(
-        "WebSocket upgrade request received for prefix: {}",
-        path.prefix
-    );
-
-    if let Some(authenticator) = &server_state.authenticator {
-        if let Some(token) = params.token.as_deref() {
-            tracing::info!("Token provided, checking format...");
-
-            // Check token format - only accept CWT tokens
-            let token_format = detect_token_format(token);
-            tracing::info!("Token format detected: {:?}", token_format);
-
-            if token_format != TokenFormat::Cwt {
-                tracing::warn!("Rejecting non-CWT token");
-                return Err(AppError(
-                    StatusCode::UNAUTHORIZED,
-                    anyhow!("Only CWT tokens are supported for WebSocket event streaming"),
-                ));
-            }
-
-            // Verify the CWT token using the auto method (which will route to CWT verification)
-            tracing::info!("Verifying CWT token...");
-            let permission = authenticator
-                .verify_token_auto(token, current_time_epoch_millis())
-                .map_err(|e| {
-                    tracing::error!("Token verification failed: {}", e);
-                    AppError(
-                        StatusCode::UNAUTHORIZED,
-                        anyhow!("Invalid CWT token: {}", e),
-                    )
-                })?;
-
-            match permission {
-                Permission::Prefix(prefix_perm) => {
-                    tracing::info!("Valid prefix token for prefix: {}", prefix_perm.prefix);
-
-                    // Validate that the URL path prefix matches the token prefix
-                    if prefix_perm.prefix != path.prefix {
-                        tracing::warn!(
-                            "URL prefix '{}' does not match token prefix '{}'",
-                            path.prefix,
-                            prefix_perm.prefix
-                        );
-                        return Err(AppError(
-                            StatusCode::FORBIDDEN,
-                            anyhow!(
-                                "URL prefix '{}' does not match token prefix '{}'",
-                                path.prefix,
-                                prefix_perm.prefix
-                            ),
-                        ));
-                    }
-
-                    return Ok(ws.on_upgrade(move |socket| {
-                        handle_prefix_event_stream(socket, server_state, prefix_perm)
-                    }));
-                }
-                Permission::Server => {
-                    tracing::info!("Valid server token - creating synthetic prefix permission");
-
-                    // Server tokens have full access, so create a synthetic prefix permission
-                    // for the requested prefix with full authorization
-                    let synthetic_prefix_perm = PrefixPermission {
-                        prefix: path.prefix.clone(),
-                        authorization: Authorization::Full,
-                        user: None, // Server tokens don't have a user
-                    };
-
-                    return Ok(ws.on_upgrade(move |socket| {
-                        handle_prefix_event_stream(socket, server_state, synthetic_prefix_perm)
-                    }));
-                }
-                _ => {
-                    tracing::warn!("Token is neither a prefix nor server token");
-                    return Err(AppError(
-                        StatusCode::FORBIDDEN,
-                        anyhow!("Only CWT prefix tokens and server tokens are supported for event streaming"),
-                    ));
-                }
-            }
-        } else {
-            tracing::warn!("No token provided in request");
-            return Err(AppError(
-                StatusCode::UNAUTHORIZED,
-                anyhow!("No token provided"),
-            ));
-        }
-    } else {
-        tracing::error!("No authenticator configured");
-        return Err(AppError(
-            StatusCode::UNAUTHORIZED,
-            anyhow!("Authentication required"),
-        ));
-    }
-}
-
-async fn handle_prefix_event_stream(
-    socket: WebSocket,
-    server_state: Arc<Server>,
-    prefix_perm: PrefixPermission,
-) {
-    tracing::info!(
-        "WebSocket connection established for prefix: {}",
-        prefix_perm.prefix
-    );
-
-    let conn_id = nanoid::nanoid!();
-    let (mut sink, mut stream) = socket.split();
-    let (send, mut recv) = tokio::sync::mpsc::unbounded_channel();
-
-    // Get cancellation token for graceful shutdown
-    let cancellation_token = server_state.cancellation_token.clone();
-
-    // Register temporary prefix in websocket sender
-    server_state.websocket_sender.register_websocket_prefix(
-        prefix_perm.prefix.clone(),
-        conn_id.clone(),
-        send.clone(),
-        prefix_perm.authorization,
-    );
-
-    tracing::info!(
-        "Registered WebSocket connection {} for prefix: {}",
-        conn_id,
-        prefix_perm.prefix
-    );
-
-    // Clone what we need for the tasks
-    let send_clone = send.clone();
-    let cancellation_token_outgoing = cancellation_token.clone();
-    let cancellation_token_incoming = cancellation_token.clone();
-
-    // Handle outgoing messages (events)
-    let outgoing_task = tokio::spawn(async move {
-        tracing::info!("Outgoing task started");
-        loop {
-            tokio::select! {
-                _ = cancellation_token_outgoing.cancelled() => {
-                    // Server is shutting down, close the connection
-                    let _ = sink.send(Message::Close(None)).await;
-                    break;
-                }
-                msg = recv.recv() => {
-                    match msg {
-                        Some(msg) => {
-                            tracing::info!("Received message to send: {:?}", msg);
-                            let json = serde_json::to_string(&msg).unwrap();
-                            tracing::info!("Sending JSON to WebSocket: {}", json);
-                            if sink.send(Message::Text(json)).await.is_err() {
-                                tracing::error!("Failed to send message to WebSocket - connection closed");
-                                break; // Connection closed
-                            }
-                            tracing::info!("Message sent successfully");
-                        }
-                        None => {
-                            tracing::info!("Channel closed by sender - shutting down");
-                            break; // Channel closed by sender (cleanup/shutdown)
-                        }
-                    }
-                }
-            }
-        }
-    });
-
-    // Handle incoming messages (ping only)
-    let incoming_task = tokio::spawn(async move {
-        tracing::info!("Incoming task started");
-        loop {
-            tokio::select! {
-                _ = cancellation_token_incoming.cancelled() => {
-                    break; // Server is shutting down
-                }
-                msg = stream.next() => {
-                    match msg {
-                        Some(Ok(Message::Text(text))) => {
-                            if text.trim() == "ping" {
-                                if send_clone.send(ServerMessage::Pong).is_err() {
-                                    break;
-                                }
-                            }
-                            // Ignore all other messages
-                        }
-                        Some(Ok(Message::Close(_))) => break,
-                        None => break, // Stream ended
-                        _ => continue,
-                    }
-                }
-            }
-        }
-    });
-
-    // Wait for connection to close or shutdown signal
-    tokio::select! {
-        _ = cancellation_token.cancelled() => {
-            // Shutdown requested - tasks will detect this via their own cancellation tokens
-        }
-        _ = outgoing_task => {},
-        _ = incoming_task => {},
-    }
-
-    // Cleanup: unregister this specific connection
-    server_state
-        .websocket_sender
-        .unregister_websocket_connection(&prefix_perm.prefix, &conn_id);
 }
 
 #[cfg(test)]

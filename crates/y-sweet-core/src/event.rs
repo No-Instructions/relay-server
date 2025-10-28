@@ -1,4 +1,4 @@
-use crate::api_types::{Authorization, NANOID_ALPHABET};
+use crate::api_types::NANOID_ALPHABET;
 use crate::sync::EventMessage;
 use crate::sync_kv::SyncKv;
 use crate::webhook::WebhookConfig;
@@ -188,14 +188,6 @@ pub trait EventSender: Send + Sync + std::any::Any {
     fn shutdown(&self);
 }
 
-/// WebSocket connection for event streaming
-#[derive(Clone)]
-pub struct WebSocketConnection {
-    pub connection_id: String,
-    pub sender: mpsc::UnboundedSender<ServerMessage>,
-    pub authorization: Authorization,
-}
-
 /// Messages sent to WebSocket clients
 #[derive(Serialize, Debug, Clone)]
 #[serde(tag = "type")]
@@ -264,8 +256,6 @@ impl EventDispatcher for UnifiedEventDispatcher {
         for sender in &self.senders {
             let sender_type = if sender.type_id() == std::any::TypeId::of::<WebhookSender>() {
                 "webhook"
-            } else if sender.type_id() == std::any::TypeId::of::<WebSocketSender>() {
-                "websocket"
             } else if sender.type_id() == std::any::TypeId::of::<SyncProtocolEventSender>() {
                 "sync_protocol"
             } else if sender.type_id() == std::any::TypeId::of::<DebouncedSyncProtocolEventSender>()
@@ -511,106 +501,6 @@ impl EventSender for WebhookSender {
         );
         for sender in &self.shutdown_senders {
             let _ = sender.send(()); // Ignore errors if receiver already dropped
-        }
-    }
-}
-
-/// WebSocket event sender
-pub struct WebSocketSender {
-    temporary_prefixes: Arc<RwLock<HashMap<String, Vec<WebSocketConnection>>>>,
-}
-
-impl WebSocketSender {
-    pub fn new() -> Self {
-        Self {
-            temporary_prefixes: Arc::new(RwLock::new(HashMap::new())),
-        }
-    }
-
-    pub fn register_websocket_prefix(
-        &self,
-        prefix: String,
-        connection_id: String,
-        sender: mpsc::UnboundedSender<ServerMessage>,
-        authorization: Authorization,
-    ) {
-        if let Ok(mut temp_guard) = self.temporary_prefixes.try_write() {
-            let connections = temp_guard.entry(prefix.clone()).or_insert_with(Vec::new);
-            connections.push(WebSocketConnection {
-                connection_id: connection_id.clone(),
-                sender,
-                authorization,
-            });
-
-            debug!(
-                "Registered WebSocket connection {} for prefix: {} (total: {})",
-                connection_id,
-                prefix,
-                connections.len()
-            );
-        }
-    }
-
-    pub fn unregister_websocket_connection(&self, prefix: &str, connection_id: &str) {
-        if let Ok(mut temp_guard) = self.temporary_prefixes.try_write() {
-            if let Some(connections) = temp_guard.get_mut(prefix) {
-                connections.retain(|conn| conn.connection_id != connection_id);
-
-                if connections.is_empty() {
-                    temp_guard.remove(prefix);
-                    debug!("Removed empty WebSocket prefix: {}", prefix);
-                } else {
-                    debug!(
-                        "Unregistered WebSocket connection {} from prefix: {} (remaining: {})",
-                        connection_id,
-                        prefix,
-                        connections.len()
-                    );
-                }
-            }
-        }
-    }
-
-    fn find_matching_prefixes(&self, channel: &str) -> Vec<String> {
-        if let Ok(temp_guard) = self.temporary_prefixes.try_read() {
-            temp_guard
-                .keys()
-                .filter(|prefix| channel.starts_with(*prefix))
-                .cloned()
-                .collect()
-        } else {
-            Vec::new()
-        }
-    }
-}
-
-impl EventSender for WebSocketSender {
-    fn send_event(&self, envelope: EventEnvelope) {
-        let matching_prefixes = self.find_matching_prefixes(&envelope.channel);
-
-        if let Ok(connections_guard) = self.temporary_prefixes.try_read() {
-            for prefix in matching_prefixes {
-                if let Some(connections) = connections_guard.get(&prefix) {
-                    let message: ServerMessage = envelope.clone().into();
-                    for conn in connections {
-                        if let Err(e) = conn.sender.send(message.clone()) {
-                            error!(
-                                "Failed to send WebSocket event for prefix '{}' to connection '{}': {}",
-                                prefix, conn.connection_id, e
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    fn shutdown(&self) {
-        debug!("Shutting down WebSocketSender");
-        // WebSocket connections will be closed by their respective handlers
-        // We just need to clear our registry
-        if let Ok(mut temp_guard) = self.temporary_prefixes.try_write() {
-            temp_guard.clear();
         }
     }
 }
@@ -1216,142 +1106,6 @@ mod tests {
             sender2_envelopes.read().unwrap()[0].channel,
             envelope.channel
         );
-    }
-
-    #[tokio::test]
-    async fn test_websocket_sender() {
-        let sender = WebSocketSender::new();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-
-        // Register a WebSocket connection
-        sender.register_websocket_prefix(
-            "test_".to_string(),
-            "conn_123".to_string(),
-            tx,
-            Authorization::Full,
-        );
-
-        // Send an event
-        let event = DocumentUpdatedEvent::new("test_document".to_string());
-        let envelope = EventEnvelope::new("test_document".to_string(), event);
-        sender.send_event(envelope.clone());
-
-        // Should receive the event as a ServerMessage
-        let message = rx.recv().await.unwrap();
-        match message {
-            ServerMessage::Event {
-                event_type,
-                event_id,
-                channel,
-                timestamp: _,
-                payload,
-            } => {
-                assert_eq!(event_type, "document.updated");
-                assert_eq!(event_id, envelope.event_id);
-                assert_eq!(channel, envelope.channel);
-                assert_eq!(payload["doc_id"], "test_document");
-            }
-            _ => panic!("Expected Event message"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_websocket_sender_prefix_matching() {
-        let sender = WebSocketSender::new();
-        let (tx1, mut rx1) = tokio::sync::mpsc::unbounded_channel();
-        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
-
-        // Register connections for different prefixes
-        sender.register_websocket_prefix(
-            "user_".to_string(),
-            "conn_1".to_string(),
-            tx1,
-            Authorization::Full,
-        );
-        sender.register_websocket_prefix(
-            "admin_".to_string(),
-            "conn_2".to_string(),
-            tx2,
-            Authorization::Full,
-        );
-
-        // Send event that matches first prefix
-        let event1 = DocumentUpdatedEvent::new("user_alice_doc".to_string());
-        let envelope1 = EventEnvelope::new("user_alice_doc".to_string(), event1);
-        sender.send_event(envelope1.clone());
-
-        // Only first connection should receive it
-        let message1 = rx1.recv().await.unwrap();
-        if let ServerMessage::Event { channel, .. } = message1 {
-            assert_eq!(channel, envelope1.channel);
-        } else {
-            panic!("Expected Event message");
-        }
-
-        // Second connection should not receive anything
-        assert!(rx2.try_recv().is_err());
-
-        // Send event that matches second prefix
-        let event2 = DocumentUpdatedEvent::new("admin_settings".to_string());
-        let envelope2 = EventEnvelope::new("admin_settings".to_string(), event2);
-        sender.send_event(envelope2.clone());
-
-        // Only second connection should receive it
-        let message2 = rx2.recv().await.unwrap();
-        if let ServerMessage::Event { channel, .. } = message2 {
-            assert_eq!(channel, envelope2.channel);
-        } else {
-            panic!("Expected Event message");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_websocket_sender_connection_lifecycle() {
-        let sender = WebSocketSender::new();
-        let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
-        let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
-
-        let prefix = "test_".to_string();
-
-        // Register two connections for the same prefix
-        sender.register_websocket_prefix(
-            prefix.clone(),
-            "conn1".to_string(),
-            tx1,
-            Authorization::Full,
-        );
-        sender.register_websocket_prefix(
-            prefix.clone(),
-            "conn2".to_string(),
-            tx2,
-            Authorization::ReadOnly,
-        );
-
-        // Both connections should be registered
-        {
-            let temp_guard = sender.temporary_prefixes.read().unwrap();
-            let connections = temp_guard.get(&prefix).unwrap();
-            assert_eq!(connections.len(), 2);
-        }
-
-        // Unregister one connection
-        sender.unregister_websocket_connection(&prefix, "conn1");
-
-        // Should have one connection left
-        {
-            let temp_guard = sender.temporary_prefixes.read().unwrap();
-            let connections = temp_guard.get(&prefix).unwrap();
-            assert_eq!(connections.len(), 1);
-            assert_eq!(connections[0].connection_id, "conn2");
-        }
-
-        // Unregister the last connection - prefix should be removed
-        sender.unregister_websocket_connection(&prefix, "conn2");
-
-        {
-            let temp_guard = sender.temporary_prefixes.read().unwrap();
-            assert!(!temp_guard.contains_key(&prefix));
-        }
     }
 
     #[tokio::test]

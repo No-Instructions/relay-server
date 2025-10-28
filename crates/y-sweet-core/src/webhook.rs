@@ -1,4 +1,4 @@
-use crate::api_types::{Authorization, NANOID_ALPHABET};
+use crate::api_types::NANOID_ALPHABET;
 use crate::event::ServerMessage;
 use crate::store::Store;
 use crate::webhook_metrics::WebhookMetrics;
@@ -88,29 +88,10 @@ impl WebhookConfigDocument {
     }
 }
 
-#[derive(Clone)]
-pub struct WebSocketConnection {
-    pub connection_id: String,
-    pub sender: mpsc::UnboundedSender<ServerMessage>,
-    pub authorization: Authorization,
-}
-
-#[derive(Serialize, Debug, Clone)]
-pub struct WebSocketEvent {
-    pub event_type: String,
-    pub event_id: String,
-    pub doc_id: String,
-    pub timestamp: String,
-    pub payload: serde_json::Value,
-}
-
 pub struct WebhookDispatcher {
     pub configs: Vec<WebhookConfig>,
     queues: HashMap<String, mpsc::UnboundedSender<String>>,
     shutdown_senders: Vec<mpsc::UnboundedSender<()>>,
-
-    temporary_prefixes: Arc<RwLock<HashMap<String, Vec<WebSocketConnection>>>>,
-
     metrics: Arc<WebhookMetrics>,
 }
 
@@ -165,7 +146,6 @@ impl WebhookDispatcher {
             configs,
             queues,
             shutdown_senders,
-            temporary_prefixes: Arc::new(RwLock::new(HashMap::new())),
             metrics,
         })
     }
@@ -229,33 +209,10 @@ impl WebhookDispatcher {
         let matching_prefixes = self.find_matching_prefixes(&doc_id);
 
         for prefix in matching_prefixes {
-            // Send to HTTP webhook queues (existing logic)
+            // Send to HTTP webhook queues
             if let Some(sender) = self.queues.get(&prefix) {
                 if let Err(e) = sender.send(doc_id.clone()) {
                     error!("Failed to queue webhook for prefix '{}': {}", prefix, e);
-                }
-            }
-
-            if let Ok(temp_guard) = self.temporary_prefixes.try_read() {
-                if let Some(connections) = temp_guard.get(&prefix) {
-                    let message = ServerMessage::Event {
-                        event_type: "document.updated".to_string(),
-                        event_id: format!("evt_{}", nanoid::nanoid!(21, NANOID_ALPHABET)),
-                        channel: doc_id.clone(),
-                        timestamp: chrono::Utc::now().to_rfc3339(),
-                        payload: serde_json::json!({
-                            "doc_id": doc_id.clone(),
-                            "user": null
-                        }),
-                    };
-
-                    // Send to all connections for this prefix
-                    for conn in connections {
-                        if let Err(e) = conn.sender.send(message.clone()) {
-                            error!("Failed to send WebSocket event for prefix '{}' to connection '{}': {}", 
-                                   prefix, conn.connection_id, e);
-                        }
-                    }
                 }
             }
         }
@@ -311,27 +268,14 @@ impl WebhookDispatcher {
     }
 
     pub fn find_matching_prefixes(&self, doc_id: &str) -> Vec<String> {
-        let mut matches: Vec<String> = Vec::new();
+        let mut matches: Vec<String> = self
+            .configs
+            .iter()
+            .filter(|config| doc_id.starts_with(&config.prefix))
+            .map(|config| config.prefix.clone())
+            .collect();
 
-        // Existing logic: check persistent config prefixes
-        matches.extend(
-            self.configs
-                .iter()
-                .filter(|config| doc_id.starts_with(&config.prefix))
-                .map(|config| config.prefix.clone()),
-        );
-
-        // NEW: check temporary WebSocket prefixes
-        if let Ok(temp_guard) = self.temporary_prefixes.try_read() {
-            matches.extend(
-                temp_guard
-                    .keys()
-                    .filter(|prefix| doc_id.starts_with(*prefix))
-                    .cloned(),
-            );
-        }
-
-        // Remove duplicates and sort by prefix length (longest first) for consistent ordering
+        // Sort by prefix length (longest first) for consistent ordering
         matches.sort_by(|a, b| b.len().cmp(&a.len()));
         matches.dedup();
         matches
@@ -404,44 +348,6 @@ impl WebhookDispatcher {
             Err(e) => {
                 metrics.record_webhook_request(&config.prefix, "error", duration);
                 Err(e)
-            }
-        }
-    }
-
-    pub fn register_websocket_prefix(
-        &self,
-        prefix: String,
-        connection_id: String,
-        sender: mpsc::UnboundedSender<ServerMessage>,
-        authorization: Authorization,
-    ) {
-        if let Ok(mut temp_guard) = self.temporary_prefixes.try_write() {
-            let connections = temp_guard.entry(prefix.clone()).or_insert_with(Vec::new);
-            connections.push(WebSocketConnection {
-                connection_id: connection_id.clone(),
-                sender,
-                authorization,
-            });
-
-            // Update metrics
-            self.metrics
-                .set_websocket_connections(&prefix, "all", connections.len());
-        }
-    }
-
-    pub fn unregister_websocket_connection(&self, prefix: &str, connection_id: &str) {
-        if let Ok(mut temp_guard) = self.temporary_prefixes.try_write() {
-            if let Some(connections) = temp_guard.get_mut(prefix) {
-                connections.retain(|conn| conn.connection_id != connection_id);
-
-                // Remove empty prefix entries
-                if connections.is_empty() {
-                    temp_guard.remove(prefix);
-                    self.metrics.set_websocket_connections(prefix, "all", 0);
-                } else {
-                    self.metrics
-                        .set_websocket_connections(prefix, "all", connections.len());
-                }
             }
         }
     }
@@ -911,90 +817,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_websocket_prefix_registration() {
-        let configs = vec![WebhookConfig {
-            prefix: "user_".to_string(),
-            url: "https://example.com/user".to_string(),
-            timeout_ms: 5000,
-            auth_token: None,
-        }];
-
-        let dispatcher = WebhookDispatcher::new_for_test(configs).unwrap();
-        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
-
-        // Register a WebSocket connection
-        dispatcher.register_websocket_prefix(
-            "ws_user_".to_string(),
-            "conn_123".to_string(),
-            sender.clone(),
-            crate::api_types::Authorization::Full,
-        );
-
-        // Test that both HTTP and WebSocket prefixes are found
-        let matches = dispatcher.find_matching_prefixes("user_alice_document");
-        assert!(matches.contains(&"user_".to_string()));
-
-        let matches = dispatcher.find_matching_prefixes("ws_user_alice_document");
-        assert!(matches.contains(&"ws_user_".to_string()));
-
-        // Unregister the connection
-        dispatcher.unregister_websocket_connection("ws_user_", "conn_123");
-
-        // Should no longer match WebSocket prefix
-        let matches = dispatcher.find_matching_prefixes("ws_user_alice_document");
-        assert!(!matches.contains(&"ws_user_".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_websocket_connection_lifecycle() {
-        let dispatcher = WebhookDispatcher::new_for_test(vec![]).unwrap();
-        let (sender1, _receiver1) = tokio::sync::mpsc::unbounded_channel();
-        let (sender2, _receiver2) = tokio::sync::mpsc::unbounded_channel();
-
-        let prefix = "test_prefix_".to_string();
-
-        // Register two connections for the same prefix
-        dispatcher.register_websocket_prefix(
-            prefix.clone(),
-            "conn1".to_string(),
-            sender1,
-            crate::api_types::Authorization::Full,
-        );
-
-        dispatcher.register_websocket_prefix(
-            prefix.clone(),
-            "conn2".to_string(),
-            sender2,
-            crate::api_types::Authorization::ReadOnly,
-        );
-
-        // Both connections should be registered
-        let temp_guard = dispatcher.temporary_prefixes.read().await;
-        let connections = temp_guard.get(&prefix).unwrap();
-        assert_eq!(connections.len(), 2);
-
-        // Verify connection details
-        assert_eq!(connections[0].connection_id, "conn1");
-        assert_eq!(connections[1].connection_id, "conn2");
-        drop(temp_guard);
-
-        // Unregister one connection
-        dispatcher.unregister_websocket_connection(&prefix, "conn1");
-
-        let temp_guard = dispatcher.temporary_prefixes.read().await;
-        let connections = temp_guard.get(&prefix).unwrap();
-        assert_eq!(connections.len(), 1);
-        assert_eq!(connections[0].connection_id, "conn2");
-        drop(temp_guard);
-
-        // Unregister the last connection - prefix should be removed
-        dispatcher.unregister_websocket_connection(&prefix, "conn2");
-
-        let temp_guard = dispatcher.temporary_prefixes.read().await;
-        assert!(!temp_guard.contains_key(&prefix));
-    }
-
-    #[tokio::test]
     async fn test_document_queue_should_send_immediately() {
         let queue = DocumentQueue::new("test".to_string());
 
@@ -1013,42 +835,5 @@ mod tests {
 
         // Still shouldn't send (less than 1 second elapsed)
         assert!(!queue.should_send_immediately().await);
-    }
-
-    #[tokio::test]
-    async fn test_websocket_event_broadcasting() {
-        use tokio::sync::mpsc;
-
-        let dispatcher = WebhookDispatcher::new_for_test(vec![]).unwrap();
-        let (sender, mut receiver) = mpsc::unbounded_channel();
-
-        // Register WebSocket connection
-        dispatcher.register_websocket_prefix(
-            "test_".to_string(),
-            "conn_123".to_string(),
-            sender,
-            crate::api_types::Authorization::Full,
-        );
-
-        // Trigger webhook (which should also broadcast to WebSocket)
-        dispatcher.send_webhooks("test_document_456".to_string());
-
-        // Should receive WebSocket event
-        let message = receiver.recv().await.unwrap();
-        match message {
-            ServerMessage::Event {
-                event_type,
-                event_id,
-                channel,
-                timestamp: _,
-                payload,
-            } => {
-                assert_eq!(event_type, "document.updated");
-                assert_eq!(channel, "test_document_456");
-                assert!(event_id.starts_with("evt_"));
-                assert_eq!(payload["doc_id"], "test_document_456");
-            }
-            _ => panic!("Expected Event message"),
-        }
     }
 }
