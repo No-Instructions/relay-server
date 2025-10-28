@@ -1,8 +1,8 @@
 use crate::api_types::NANOID_ALPHABET;
+use crate::metrics::RelayMetrics;
 use crate::sync::EventMessage;
 use crate::sync_kv::SyncKv;
 use crate::webhook::WebhookConfig;
-use crate::webhook_metrics::WebhookMetrics;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -229,12 +229,12 @@ impl From<EventEnvelope> for ServerMessage {
 /// Unified event dispatcher that fans out events to all transport-specific senders
 pub struct UnifiedEventDispatcher {
     senders: Vec<Arc<dyn EventSender>>,
-    metrics: Arc<WebhookMetrics>,
+    metrics: Arc<RelayMetrics>,
 }
 
 impl UnifiedEventDispatcher {
     /// Create a new unified dispatcher with the given senders
-    pub fn new(senders: Vec<Arc<dyn EventSender>>, metrics: Arc<WebhookMetrics>) -> Self {
+    pub fn new(senders: Vec<Arc<dyn EventSender>>, metrics: Arc<RelayMetrics>) -> Self {
         debug!(
             "Created UnifiedEventDispatcher with {} senders",
             senders.len()
@@ -312,13 +312,13 @@ pub struct WebhookSender {
     configs: Vec<WebhookConfig>,
     queues: HashMap<String, mpsc::UnboundedSender<EventEnvelope>>,
     shutdown_senders: Vec<mpsc::UnboundedSender<()>>,
-    metrics: Arc<WebhookMetrics>,
+    metrics: Arc<RelayMetrics>,
 }
 
 impl WebhookSender {
     pub fn new(
         configs: Vec<WebhookConfig>,
-        metrics: Arc<WebhookMetrics>,
+        metrics: Arc<RelayMetrics>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut queues = HashMap::new();
         let mut shutdown_senders = Vec::new();
@@ -351,7 +351,7 @@ impl WebhookSender {
     }
 
     /// Get access to the metrics instance
-    pub fn metrics(&self) -> &Arc<WebhookMetrics> {
+    pub fn metrics(&self) -> &Arc<RelayMetrics> {
         &self.metrics
     }
 
@@ -373,7 +373,7 @@ impl WebhookSender {
         config: WebhookConfig,
         mut rx: mpsc::UnboundedReceiver<EventEnvelope>,
         mut shutdown_rx: mpsc::UnboundedReceiver<()>,
-        metrics: Arc<WebhookMetrics>,
+        metrics: Arc<RelayMetrics>,
     ) {
         let client = Client::builder()
             .timeout(Duration::from_millis(config.timeout_ms))
@@ -422,7 +422,7 @@ impl WebhookSender {
         client: &Client,
         config: &WebhookConfig,
         envelope: &EventEnvelope,
-        metrics: &WebhookMetrics,
+        metrics: &RelayMetrics,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let start_time = Instant::now();
 
@@ -510,7 +510,7 @@ pub struct DebouncedSyncProtocolEventSender {
     inner_sender: Arc<SyncProtocolEventSender>,
     user_queues: Arc<tokio::sync::RwLock<HashMap<String, Arc<UserEventQueue>>>>,
     cleanup_handle: Option<tokio::task::JoinHandle<()>>,
-    metrics: Arc<WebhookMetrics>,
+    metrics: Arc<RelayMetrics>,
 }
 
 struct UserEventQueue {
@@ -552,7 +552,7 @@ impl UserEventQueue {
 }
 
 impl DebouncedSyncProtocolEventSender {
-    pub fn new(inner_sender: Arc<SyncProtocolEventSender>, metrics: Arc<WebhookMetrics>) -> Self {
+    pub fn new(inner_sender: Arc<SyncProtocolEventSender>, metrics: Arc<RelayMetrics>) -> Self {
         let user_queues = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         let cleanup_interval = tokio::time::Duration::from_secs(60);
 
@@ -765,7 +765,7 @@ pub struct SyncProtocolEventSender {
     // Map from document ID to list of weak references to DocConnections
     doc_connections:
         Arc<RwLock<HashMap<String, Vec<std::sync::Weak<crate::doc_connection::DocConnection>>>>>,
-    metrics: Option<Arc<WebhookMetrics>>,
+    metrics: Option<Arc<RelayMetrics>>,
 }
 
 impl SyncProtocolEventSender {
@@ -776,7 +776,7 @@ impl SyncProtocolEventSender {
         }
     }
 
-    pub fn with_metrics(mut self, metrics: Arc<WebhookMetrics>) -> Self {
+    pub fn with_metrics(mut self, metrics: Arc<RelayMetrics>) -> Self {
         self.metrics = Some(metrics);
         self
     }
@@ -993,7 +993,7 @@ mod debounced_sync_tests {
 
     #[tokio::test]
     async fn test_per_user_queuing() {
-        let metrics = crate::webhook_metrics::WebhookMetrics::new_for_test().unwrap();
+        let metrics = RelayMetrics::new_for_test().unwrap();
         let sender = DebouncedSyncProtocolEventSender {
             inner_sender: Arc::new(SyncProtocolEventSender::new()),
             user_queues: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
@@ -1136,7 +1136,7 @@ mod tests {
             envelopes: sender2_envelopes.clone(),
         });
 
-        let metrics = crate::webhook_metrics::WebhookMetrics::new_for_test().unwrap();
+        let metrics = RelayMetrics::new_for_test().unwrap();
         let dispatcher = UnifiedEventDispatcher::new(vec![sender1, sender2], metrics);
 
         let event = DocumentUpdatedEvent::new("test_doc".to_string());
@@ -1175,7 +1175,7 @@ mod tests {
             },
         ];
 
-        let metrics = crate::webhook_metrics::WebhookMetrics::new_for_test().unwrap();
+        let metrics = RelayMetrics::new_for_test().unwrap();
         let sender = WebhookSender::new(configs, metrics).unwrap();
 
         // Test prefix matching

@@ -1,7 +1,7 @@
 use crate::api_types::NANOID_ALPHABET;
 use crate::event::ServerMessage;
+use crate::metrics::RelayMetrics;
 use crate::store::Store;
-use crate::webhook_metrics::WebhookMetrics;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -92,7 +92,7 @@ pub struct WebhookDispatcher {
     pub configs: Vec<WebhookConfig>,
     queues: HashMap<String, mpsc::UnboundedSender<String>>,
     shutdown_senders: Vec<mpsc::UnboundedSender<()>>,
-    metrics: Arc<WebhookMetrics>,
+    metrics: Arc<RelayMetrics>,
 }
 
 impl WebhookDispatcher {
@@ -102,7 +102,7 @@ impl WebhookDispatcher {
 
     #[cfg(test)]
     pub fn new_for_test(configs: Vec<WebhookConfig>) -> Result<Self, WebhookError> {
-        let metrics = WebhookMetrics::new_for_test().map_err(|e| {
+        let metrics = RelayMetrics::new_for_test().map_err(|e| {
             WebhookError::Configuration(format!("Failed to initialize test metrics: {}", e))
         })?;
         Self::new_with_metrics(configs, Some(metrics))
@@ -110,11 +110,11 @@ impl WebhookDispatcher {
 
     fn new_with_metrics(
         configs: Vec<WebhookConfig>,
-        metrics_override: Option<Arc<WebhookMetrics>>,
+        metrics_override: Option<Arc<RelayMetrics>>,
     ) -> Result<Self, WebhookError> {
         let metrics = match metrics_override {
             Some(m) => m,
-            None => WebhookMetrics::new().map_err(|e| {
+            None => RelayMetrics::new().map_err(|e| {
                 WebhookError::Configuration(format!("Failed to initialize metrics: {}", e))
             })?,
         };
@@ -222,7 +222,7 @@ impl WebhookDispatcher {
         config: WebhookConfig,
         mut rx: mpsc::UnboundedReceiver<String>,
         mut shutdown_rx: mpsc::UnboundedReceiver<()>,
-        metrics: Arc<WebhookMetrics>,
+        metrics: Arc<RelayMetrics>,
     ) {
         let client = Client::builder()
             .timeout(Duration::from_millis(config.timeout_ms))
@@ -285,7 +285,7 @@ impl WebhookDispatcher {
         client: &Client,
         config: &WebhookConfig,
         doc_id: String,
-        metrics: &WebhookMetrics,
+        metrics: &RelayMetrics,
     ) -> Result<(), WebhookError> {
         let start_time = Instant::now();
 
@@ -440,7 +440,7 @@ impl DebouncedWebhookQueue {
         &self.dispatcher.configs
     }
 
-    pub fn metrics(&self) -> &Arc<WebhookMetrics> {
+    pub fn metrics(&self) -> &Arc<RelayMetrics> {
         &self.dispatcher.metrics
     }
 

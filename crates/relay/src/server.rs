@@ -47,11 +47,11 @@ use y_sweet_core::{
         DebouncedSyncProtocolEventSender, DocumentUpdatedEvent, EventDispatcher, EventEnvelope,
         EventSender, SyncProtocolEventSender, UnifiedEventDispatcher, WebhookSender,
     },
+    metrics::RelayMetrics,
     store::Store,
     sync::awareness::Awareness,
     sync_kv::SyncKv,
     webhook::WebhookConfig,
-    webhook_metrics::WebhookMetrics,
 };
 
 const RELAY_SERVER_VERSION: &str = env!("GIT_VERSION");
@@ -157,7 +157,7 @@ pub struct Server {
     doc_gc: bool,
     event_dispatcher: Option<Arc<dyn EventDispatcher>>,
     sync_protocol_event_sender: Arc<SyncProtocolEventSender>,
-    metrics: Arc<WebhookMetrics>,
+    metrics: Arc<RelayMetrics>,
 }
 
 impl Server {
@@ -172,7 +172,7 @@ impl Server {
         webhook_configs: Option<Vec<WebhookConfig>>,
     ) -> Result<Self> {
         // Initialize metrics early so all senders can use them
-        let metrics = WebhookMetrics::new()
+        let metrics = RelayMetrics::new()
             .map_err(|e| anyhow!("Failed to initialize webhook metrics: {}", e))?;
 
         let sync_protocol_event_sender =
@@ -1051,7 +1051,7 @@ async fn handle_socket(
     cancellation_token: CancellationToken,
     sync_protocol_event_sender: Arc<SyncProtocolEventSender>,
     doc_id: String,
-    metrics: Arc<WebhookMetrics>,
+    metrics: Arc<RelayMetrics>,
 ) {
     let (mut sink, mut stream) = socket.split();
     let (send, mut recv) = channel(1024);

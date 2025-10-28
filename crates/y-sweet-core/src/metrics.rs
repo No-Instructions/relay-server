@@ -2,8 +2,8 @@ use prometheus::{CounterVec, GaugeVec, HistogramOpts, HistogramVec, Opts, Regist
 use std::sync::{Arc, OnceLock};
 
 #[derive(Clone)]
-pub struct WebhookMetrics {
-    // Webhook-specific metrics
+pub struct RelayMetrics {
+    // Webhook system metrics
     pub webhook_requests_total: CounterVec,
     pub webhook_request_duration_seconds: HistogramVec,
     pub webhook_queue_length: GaugeVec,
@@ -11,7 +11,7 @@ pub struct WebhookMetrics {
     pub webhook_active_dispatchers: GaugeVec,
     pub webhook_config_reloads_total: CounterVec,
 
-    // WebSocket metrics
+    // WebSocket system metrics (currently unused after /events/ws removal)
     pub websocket_connections: GaugeVec,
 
     // Event system metrics
@@ -23,19 +23,18 @@ pub struct WebhookMetrics {
     pub sync_protocol_subscriptions_by_channel: GaugeVec,
     pub debounced_queue_length: GaugeVec,
 
-    // Authentication & Security metrics
+    // Authentication & security metrics
     pub auth_failures_total: CounterVec,
     pub token_expired_total: CounterVec,
     pub permission_denied_total: CounterVec,
     pub missing_token_total: CounterVec,
 }
 
-static WEBHOOK_METRICS: OnceLock<Result<Arc<WebhookMetrics>, prometheus::Error>> = OnceLock::new();
+static RELAY_METRICS: OnceLock<Result<Arc<RelayMetrics>, prometheus::Error>> = OnceLock::new();
 
-impl WebhookMetrics {
+impl RelayMetrics {
     pub fn new() -> Result<Arc<Self>, prometheus::Error> {
-        match WEBHOOK_METRICS
-            .get_or_init(|| Self::new_with_registry(prometheus::default_registry()))
+        match RELAY_METRICS.get_or_init(|| Self::new_with_registry(prometheus::default_registry()))
         {
             Ok(metrics) => Ok(metrics.clone()),
             Err(e) => Err(prometheus::Error::Msg(e.to_string())),
@@ -344,10 +343,10 @@ impl WebhookMetrics {
     }
 }
 
-impl Default for WebhookMetrics {
+impl Default for RelayMetrics {
     fn default() -> Self {
         Self::new()
-            .expect("Failed to create webhook metrics")
+            .expect("Failed to create relay metrics")
             .as_ref()
             .clone()
     }
@@ -359,7 +358,7 @@ mod tests {
 
     #[test]
     fn test_sync_protocol_subscription_metrics() {
-        let metrics = WebhookMetrics::new_for_test().unwrap();
+        let metrics = RelayMetrics::new_for_test().unwrap();
 
         // Test setting subscriptions for different channels
         metrics.set_sync_protocol_subscriptions_by_channel("doc_123", 2);
@@ -376,7 +375,7 @@ mod tests {
 
     #[test]
     fn test_auth_failure_metrics() {
-        let metrics = WebhookMetrics::new_for_test().unwrap();
+        let metrics = RelayMetrics::new_for_test().unwrap();
 
         // Record some auth failures
         metrics.record_auth_failure("invalid_signature", "websocket_upgrade", "GET");
@@ -398,7 +397,7 @@ mod tests {
 
     #[test]
     fn test_token_expired_metrics() {
-        let metrics = WebhookMetrics::new_for_test().unwrap();
+        let metrics = RelayMetrics::new_for_test().unwrap();
 
         // Record token expiration
         metrics.record_token_expired("websocket_connection", "websocket_upgrade");
@@ -420,7 +419,7 @@ mod tests {
 
     #[test]
     fn test_permission_denied_metrics() {
-        let metrics = WebhookMetrics::new_for_test().unwrap();
+        let metrics = RelayMetrics::new_for_test().unwrap();
 
         // Record permission denied events
         metrics.record_permission_denied("document", "write", "document_upload");
@@ -442,7 +441,7 @@ mod tests {
 
     #[test]
     fn test_missing_token_metrics() {
-        let metrics = WebhookMetrics::new_for_test().unwrap();
+        let metrics = RelayMetrics::new_for_test().unwrap();
 
         // Record missing token events
         metrics.record_missing_token("websocket_upgrade", "true");
