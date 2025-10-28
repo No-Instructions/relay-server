@@ -97,7 +97,7 @@ enum ServSubcommand {
         auth: Option<String>,
 
         #[clap(long)]
-        url: Option<Url>,
+        url: Option<String>,
 
         #[clap(long, value_delimiter = ',')]
         allowed_hosts: Option<Vec<String>>,
@@ -184,7 +184,7 @@ fn load_config_for_serve_args(
     metrics_port: &Option<u16>,
     checkpoint_freq_seconds: &Option<u64>,
     auth: &Option<String>,
-    url: &Option<Url>,
+    url: &Option<String>,
     allowed_hosts: &Option<Vec<String>>,
 ) -> Result<Config> {
     // Load base configuration
@@ -257,7 +257,7 @@ fn load_config_for_serve_args(
     }
 
     if let Some(url) = url {
-        config.server.url = Some(url.to_string());
+        config.server.url = Some(url.clone());
     }
 
     if let Some(allowed_hosts) = allowed_hosts {
