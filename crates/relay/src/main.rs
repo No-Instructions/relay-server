@@ -249,6 +249,12 @@ fn load_config_for_serve_args(
                 key_id: None,
                 private_key: Some(auth_key.clone()),
                 public_key: None,
+                allowed_token_types: vec![
+                    y_sweet_core::config::TokenType::Document,
+                    y_sweet_core::config::TokenType::File,
+                    y_sweet_core::config::TokenType::Server,
+                    y_sweet_core::config::TokenType::Prefix,
+                ],
             });
         } else {
             // Update the first auth entry

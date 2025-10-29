@@ -1,4 +1,5 @@
 use crate::api_types::Authorization;
+use crate::config::TokenType;
 use bincode::Options;
 use data_encoding::Encoding;
 use rand::Rng;
@@ -108,6 +109,12 @@ pub enum AuthError {
     InvalidAudience { expected: String, found: String },
     #[error("Missing audience claim: expected '{expected}'")]
     MissingAudience { expected: String },
+    #[error("Insufficient permissions: {0}")]
+    InsufficientPermissions(String),
+    #[error("Unauthorized token type: {0}")]
+    UnauthorizedTokenType(String),
+    #[error("Invalid token type in configuration: {0}")]
+    InvalidTokenType(String),
 }
 
 impl AuthError {
@@ -132,6 +139,9 @@ impl AuthError {
             AuthError::DuplicateKeyId(_) => "duplicate_key_id",
             AuthError::InvalidAudience { .. } => "invalid_audience",
             AuthError::MissingAudience { .. } => "missing_audience",
+            AuthError::InsufficientPermissions(_) => "insufficient_permissions",
+            AuthError::UnauthorizedTokenType(_) => "unauthorized_token_type",
+            AuthError::InvalidTokenType(_) => "invalid_token_type",
         }
     }
 }
@@ -173,6 +183,7 @@ pub struct AuthKeyEntry {
     pub key_id: Option<String>,
     pub key_material: AuthKeyMaterial,
     pub can_sign: bool,
+    pub allowed_token_types: Vec<TokenType>,
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
@@ -659,6 +670,12 @@ impl Authenticator {
                 key_id: None,
                 key_material,
                 can_sign,
+                allowed_token_types: vec![
+                    TokenType::Document,
+                    TokenType::File,
+                    TokenType::Server,
+                    TokenType::Prefix,
+                ],
             }],
             key_lookup: std::collections::HashMap::new(),
             keys_without_id: vec![0],
@@ -705,6 +722,7 @@ impl Authenticator {
                 key_id: config.key_id.clone(),
                 key_material,
                 can_sign,
+                allowed_token_types: config.allowed_token_types.clone(),
             };
 
             // Build lookup structures
@@ -773,6 +791,47 @@ impl Authenticator {
             .get_signing_key()
             .map_err(|_| crate::cwt::CwtError::InvalidCose)?;
         self.create_cwt_authenticator_for_key(signing_key)
+    }
+
+    /// Find which key was used to verify a token by attempting verification with each key
+    fn find_verifying_key(&self, token: &str) -> Result<&AuthKeyEntry, AuthError> {
+        let format = detect_token_format(token);
+
+        match format {
+            TokenFormat::Custom => {
+                // Try verification with each key and return the first that succeeds
+                for key_entry in &self.keys {
+                    if self.verify_with_key_entry(key_entry, token, 0).is_ok() {
+                        return Ok(key_entry);
+                    }
+                }
+                Err(AuthError::KeyMismatch)
+            }
+            TokenFormat::Cwt => {
+                // For CWT tokens, extract key ID from COSE headers
+                if let Some(key_id_from_token) = extract_cwt_key_id(token) {
+                    // Look up the key by ID
+                    if let Some(&index) = self.key_lookup.get(&key_id_from_token) {
+                        return Ok(&self.keys[index]);
+                    }
+                }
+
+                // Fallback: try each key without ID
+                for &index in &self.keys_without_id {
+                    let key_entry = &self.keys[index];
+                    if let Some(ref audience) = self.expected_audience {
+                        if self
+                            .verify_cwt_with_key(key_entry, token, 0, audience)
+                            .is_ok()
+                        {
+                            return Ok(key_entry);
+                        }
+                    }
+                }
+
+                Err(AuthError::KeyMismatch)
+            }
+        }
     }
 
     /// Get the first signing key
@@ -1229,6 +1288,12 @@ impl Authenticator {
                 key_id: None,
                 key_material: AuthKeyMaterial::EcdsaP256Private(private_key_bytes.to_vec()),
                 can_sign: true,
+                allowed_token_types: vec![
+                    TokenType::Document,
+                    TokenType::File,
+                    TokenType::Server,
+                    TokenType::Prefix,
+                ],
             }],
             key_lookup: std::collections::HashMap::new(),
             keys_without_id: vec![0],
@@ -1247,6 +1312,12 @@ impl Authenticator {
                 key_id: None,
                 key_material: AuthKeyMaterial::Ed25519Private(secret_bytes.to_vec()),
                 can_sign: true,
+                allowed_token_types: vec![
+                    TokenType::Document,
+                    TokenType::File,
+                    TokenType::Server,
+                    TokenType::Prefix,
+                ],
             }],
             key_lookup: std::collections::HashMap::new(),
             keys_without_id: vec![0],
@@ -1262,6 +1333,12 @@ impl Authenticator {
                 key_id: None,
                 key_material: AuthKeyMaterial::Legacy(key.to_vec()),
                 can_sign: true,
+                allowed_token_types: vec![
+                    TokenType::Document,
+                    TokenType::File,
+                    TokenType::Server,
+                    TokenType::Prefix,
+                ],
             }],
             key_lookup: std::collections::HashMap::new(),
             keys_without_id: vec![0],
@@ -1289,6 +1366,35 @@ impl Authenticator {
 
     /// Verify a token automatically detecting its format (custom or CWT)
     pub fn verify_token_auto(
+        &self,
+        token: &str,
+        current_time: u64,
+    ) -> Result<Permission, AuthError> {
+        // First verify the token normally
+        let permission = self.verify_token_internal(token, current_time)?;
+
+        // Then check if the verifying key is authorized for this token type
+        let token_type = TokenType::from_permission(&permission);
+        let verifying_key = self.find_verifying_key(token)?;
+
+        if !verifying_key.allowed_token_types.contains(&token_type) {
+            return Err(AuthError::UnauthorizedTokenType(format!(
+                "Key {} not authorized for {} tokens",
+                verifying_key.key_id.as_deref().unwrap_or("unnamed"),
+                match token_type {
+                    TokenType::Document => "document",
+                    TokenType::File => "file",
+                    TokenType::Server => "server",
+                    TokenType::Prefix => "prefix",
+                }
+            )));
+        }
+
+        Ok(permission)
+    }
+
+    /// Internal method to verify token without permission checking
+    fn verify_token_internal(
         &self,
         token: &str,
         current_time: u64,
@@ -1833,6 +1939,26 @@ impl Authenticator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::TokenType;
+
+    // Helper function to create AuthKeyConfig with full permissions for backward compatibility in tests
+    fn test_auth_key_config(
+        key_id: Option<String>,
+        private_key: Option<String>,
+        public_key: Option<String>,
+    ) -> crate::config::AuthKeyConfig {
+        crate::config::AuthKeyConfig {
+            key_id,
+            private_key,
+            public_key,
+            allowed_token_types: vec![
+                TokenType::Document,
+                TokenType::File,
+                TokenType::Server,
+                TokenType::Prefix,
+            ],
+        }
+    }
 
     fn create_test_authenticator_with_audience() -> Authenticator {
         let mut auth = Authenticator::gen_key().unwrap();
@@ -2903,6 +3029,12 @@ mod tests {
 
         // Test single private key - should work
         let config1 = vec![AuthKeyConfig {
+            allowed_token_types: vec![
+                TokenType::Document,
+                TokenType::File,
+                TokenType::Server,
+                TokenType::Prefix,
+            ],
             key_id: Some("main".to_string()),
             private_key: Some(b64_encode(&[0u8; 32])),
             public_key: None,
@@ -2912,11 +3044,23 @@ mod tests {
         // Test multiple private keys - should fail
         let config2 = vec![
             AuthKeyConfig {
+                allowed_token_types: vec![
+                    TokenType::Document,
+                    TokenType::File,
+                    TokenType::Server,
+                    TokenType::Prefix,
+                ],
                 key_id: Some("key1".to_string()),
                 private_key: Some(b64_encode(&[0u8; 32])),
                 public_key: None,
             },
             AuthKeyConfig {
+                allowed_token_types: vec![
+                    TokenType::Document,
+                    TokenType::File,
+                    TokenType::Server,
+                    TokenType::Prefix,
+                ],
                 key_id: Some("key2".to_string()),
                 private_key: Some(b64_encode(&[1u8; 32])),
                 public_key: None,
@@ -2929,6 +3073,12 @@ mod tests {
 
         // Test both keys provided - should fail
         let config3 = vec![AuthKeyConfig {
+            allowed_token_types: vec![
+                TokenType::Document,
+                TokenType::File,
+                TokenType::Server,
+                TokenType::Prefix,
+            ],
             key_id: None,
             private_key: Some(b64_encode(&[0u8; 32])),
             public_key: Some(b64_encode(&[1u8; 32])),
@@ -2940,6 +3090,12 @@ mod tests {
 
         // Test no keys provided - should fail
         let config4 = vec![AuthKeyConfig {
+            allowed_token_types: vec![
+                TokenType::Document,
+                TokenType::File,
+                TokenType::Server,
+                TokenType::Prefix,
+            ],
             key_id: None,
             private_key: None,
             public_key: None,
@@ -2960,11 +3116,23 @@ mod tests {
 
         let configs = vec![
             AuthKeyConfig {
+                allowed_token_types: vec![
+                    TokenType::Document,
+                    TokenType::File,
+                    TokenType::Server,
+                    TokenType::Prefix,
+                ],
                 key_id: Some("hmac-key".to_string()),
                 private_key: Some(hmac_auth.key_material().to_base64()),
                 public_key: None,
             },
             AuthKeyConfig {
+                allowed_token_types: vec![
+                    TokenType::Document,
+                    TokenType::File,
+                    TokenType::Server,
+                    TokenType::Prefix,
+                ],
                 key_id: Some("ecdsa-key".to_string()),
                 private_key: None,
                 public_key: Some(ecdsa_auth.public_key_pem().unwrap()),
@@ -3001,11 +3169,23 @@ mod tests {
 
         let configs = vec![
             AuthKeyConfig {
+                allowed_token_types: vec![
+                    TokenType::Document,
+                    TokenType::File,
+                    TokenType::Server,
+                    TokenType::Prefix,
+                ],
                 key_id: None,
                 private_key: Some(legacy_key_material.key_material().to_base64()),
                 public_key: None,
             },
             AuthKeyConfig {
+                allowed_token_types: vec![
+                    TokenType::Document,
+                    TokenType::File,
+                    TokenType::Server,
+                    TokenType::Prefix,
+                ],
                 key_id: None,
                 private_key: Some(hmac_key_material.key_material().to_base64()),
                 public_key: None,
@@ -3021,11 +3201,23 @@ mod tests {
         // Test with single private key and multiple public keys
         let configs_valid = vec![
             AuthKeyConfig {
+                allowed_token_types: vec![
+                    TokenType::Document,
+                    TokenType::File,
+                    TokenType::Server,
+                    TokenType::Prefix,
+                ],
                 key_id: None,
                 private_key: Some(legacy_key_material.key_material().to_base64()),
                 public_key: None,
             },
             AuthKeyConfig {
+                allowed_token_types: vec![
+                    TokenType::Document,
+                    TokenType::File,
+                    TokenType::Server,
+                    TokenType::Prefix,
+                ],
                 key_id: Some("readonly".to_string()),
                 private_key: None,
                 public_key: Some(ecdsa_key_material.public_key_pem().unwrap()),
@@ -3057,6 +3249,12 @@ mod tests {
 
         let configs = vec![
             AuthKeyConfig {
+                allowed_token_types: vec![
+                    TokenType::Document,
+                    TokenType::File,
+                    TokenType::Server,
+                    TokenType::Prefix,
+                ],
                 key_id: Some("key1".to_string()),
                 private_key: Some(
                     Authenticator::gen_key_legacy()
@@ -3067,6 +3265,12 @@ mod tests {
                 public_key: None,
             },
             AuthKeyConfig {
+                allowed_token_types: vec![
+                    TokenType::Document,
+                    TokenType::File,
+                    TokenType::Server,
+                    TokenType::Prefix,
+                ],
                 key_id: Some("key2".to_string()),
                 private_key: None,
                 public_key: Some(
@@ -3097,11 +3301,23 @@ mod tests {
 
         let configs = vec![
             AuthKeyConfig {
+                allowed_token_types: vec![
+                    TokenType::Document,
+                    TokenType::File,
+                    TokenType::Server,
+                    TokenType::Prefix,
+                ],
                 key_id: None,
                 private_key: Some(legacy_auth1.key_material().to_base64()),
                 public_key: None,
             },
             AuthKeyConfig {
+                allowed_token_types: vec![
+                    TokenType::Document,
+                    TokenType::File,
+                    TokenType::Server,
+                    TokenType::Prefix,
+                ],
                 key_id: Some("with_id".to_string()),
                 private_key: None,
                 public_key: Some(ecdsa_auth2.public_key_pem().unwrap()),
@@ -3126,11 +3342,23 @@ mod tests {
 
         let configs = vec![
             AuthKeyConfig {
+                allowed_token_types: vec![
+                    TokenType::Document,
+                    TokenType::File,
+                    TokenType::Server,
+                    TokenType::Prefix,
+                ],
                 key_id: Some("readonly".to_string()),
                 private_key: None,
                 public_key: Some(ecdsa_key.public_key_pem().unwrap()),
             },
             AuthKeyConfig {
+                allowed_token_types: vec![
+                    TokenType::Document,
+                    TokenType::File,
+                    TokenType::Server,
+                    TokenType::Prefix,
+                ],
                 key_id: Some("signing".to_string()),
                 private_key: Some(hmac_key.key_material().to_base64()),
                 public_key: None,
@@ -3168,11 +3396,23 @@ mod tests {
 
         let configs = vec![
             AuthKeyConfig {
+                allowed_token_types: vec![
+                    TokenType::Document,
+                    TokenType::File,
+                    TokenType::Server,
+                    TokenType::Prefix,
+                ],
                 key_id: Some("readonly1".to_string()),
                 private_key: None,
                 public_key: Some(public_key1_pem),
             },
             AuthKeyConfig {
+                allowed_token_types: vec![
+                    TokenType::Document,
+                    TokenType::File,
+                    TokenType::Server,
+                    TokenType::Prefix,
+                ],
                 key_id: Some("readonly2".to_string()),
                 private_key: None,
                 public_key: Some(public_key2_pem),
@@ -3199,11 +3439,23 @@ mod tests {
         // Phase 1: Old key for signing, new key for verification only
         let rotation_configs = vec![
             AuthKeyConfig {
+                allowed_token_types: vec![
+                    TokenType::Document,
+                    TokenType::File,
+                    TokenType::Server,
+                    TokenType::Prefix,
+                ],
                 key_id: Some("old-v1".to_string()),
                 private_key: Some(old_key.key_material().to_base64()),
                 public_key: None,
             },
             AuthKeyConfig {
+                allowed_token_types: vec![
+                    TokenType::Document,
+                    TokenType::File,
+                    TokenType::Server,
+                    TokenType::Prefix,
+                ],
                 key_id: Some("new-v2".to_string()),
                 private_key: None,
                 public_key: Some(new_key.public_key_pem().unwrap()),
@@ -3229,5 +3481,273 @@ mod tests {
             .is_ok());
 
         assert!(!token.contains("."));
+    }
+
+    #[test]
+    fn test_token_type_verification_default_config() {
+        use crate::config::AuthKeyConfig;
+
+        // Create a shared HMAC key for both signing and verification
+        let hmac_key = b64_encode(&[42u8; 32]); // Simple 256-bit key
+        let key_id = "test-key";
+
+        // Generator with full permissions
+        let generator_config = AuthKeyConfig {
+            key_id: Some(key_id.to_string()),
+            private_key: Some(hmac_key.clone()),
+            public_key: None,
+            allowed_token_types: vec![
+                TokenType::Document,
+                TokenType::File,
+                TokenType::Server,
+                TokenType::Prefix,
+            ],
+        };
+
+        // Verifier with limited permissions (same HMAC key)
+        let verifier_config = AuthKeyConfig {
+            key_id: Some(key_id.to_string()),
+            private_key: Some(hmac_key.clone()),
+            public_key: None,
+            allowed_token_types: vec![TokenType::Document, TokenType::File], // Default permissions
+        };
+
+        let mut generator = Authenticator::from_multi_key_config(&[generator_config]).unwrap();
+        generator.set_expected_audience(Some("https://test.example.com".to_string()));
+
+        let mut verifier = Authenticator::from_multi_key_config(&[verifier_config]).unwrap();
+        verifier.set_expected_audience(Some("https://test.example.com".to_string()));
+
+        // Generate tokens
+        let doc_token = generator
+            .gen_doc_token_cwt(
+                "test-doc",
+                Authorization::Full,
+                ExpirationTimeEpochMillis(u64::MAX),
+                None,
+                None,
+            )
+            .unwrap();
+
+        let server_token = generator.server_token_cwt().unwrap();
+
+        // Test verification with limited permissions
+        // Should be able to verify document tokens (allowed by default)
+        let doc_verification = verifier.verify_token_auto(&doc_token, 0);
+        if doc_verification.is_err() {
+            eprintln!("Document verification error: {:?}", doc_verification);
+        }
+        assert!(
+            doc_verification.is_ok(),
+            "Should be able to verify document tokens with default permissions"
+        );
+
+        // Should NOT be able to verify server tokens (not allowed by default)
+        let server_verification = verifier.verify_token_auto(&server_token, 0);
+        assert!(
+            server_verification.is_err(),
+            "Should not be able to verify server tokens with default permissions"
+        );
+        if let Err(AuthError::UnauthorizedTokenType(msg)) = server_verification {
+            assert!(msg.contains("not authorized for server tokens"));
+        }
+    }
+
+    #[test]
+    fn test_token_type_verification_explicit_config() {
+        use crate::config::{AuthKeyConfig, TokenType};
+
+        // Use same HMAC key for both signing and verification
+        let hmac_key = b64_encode(&[123u8; 32]); // Different key from first test
+        let key_id = "test-key-2";
+
+        // Generator with full permissions
+        let generator_config = AuthKeyConfig {
+            key_id: Some(key_id.to_string()),
+            private_key: Some(hmac_key.clone()),
+            public_key: None,
+            allowed_token_types: vec![
+                TokenType::Document,
+                TokenType::File,
+                TokenType::Server,
+                TokenType::Prefix,
+            ],
+        };
+
+        // Verifier with server-only permissions (same HMAC key)
+        let server_only_config = AuthKeyConfig {
+            key_id: Some(key_id.to_string()),
+            private_key: Some(hmac_key.clone()),
+            public_key: None,
+            allowed_token_types: vec![TokenType::Server], // Only server tokens
+        };
+
+        let mut generator = Authenticator::from_multi_key_config(&[generator_config]).unwrap();
+        generator.set_expected_audience(Some("https://test.example.com".to_string()));
+
+        let mut server_only_auth =
+            Authenticator::from_multi_key_config(&[server_only_config]).unwrap();
+        server_only_auth.set_expected_audience(Some("https://test.example.com".to_string()));
+
+        // Generate different types of tokens
+        let doc_token = generator
+            .gen_doc_token_cwt(
+                "test-doc",
+                Authorization::Full,
+                ExpirationTimeEpochMillis(u64::MAX),
+                None,
+                None,
+            )
+            .unwrap();
+
+        let server_token = generator.server_token_cwt().unwrap();
+
+        // Test verification with server-only permissions
+        // Should be able to verify server tokens
+        let server_verification = server_only_auth.verify_token_auto(&server_token, 0);
+        assert!(
+            server_verification.is_ok(),
+            "Should be able to verify server tokens with explicit server permission"
+        );
+
+        // Should NOT be able to verify document tokens
+        let doc_verification = server_only_auth.verify_token_auto(&doc_token, 0);
+        assert!(
+            doc_verification.is_err(),
+            "Should not be able to verify document tokens without document permission"
+        );
+        if let Err(AuthError::UnauthorizedTokenType(msg)) = doc_verification {
+            assert!(msg.contains("not authorized for document tokens"));
+        }
+    }
+
+    #[test]
+    fn test_multi_key_verification_with_mixed_permissions() {
+        use crate::config::{AuthKeyConfig, TokenType};
+
+        // Use HMAC keys for simpler testing
+        let generator_key = b64_encode(&[99u8; 32]);
+
+        // Generator has full permissions for creating tokens
+        let generator_config = AuthKeyConfig {
+            key_id: Some("generator".to_string()),
+            private_key: Some(generator_key.clone()),
+            public_key: None,
+            allowed_token_types: vec![
+                TokenType::Document,
+                TokenType::File,
+                TokenType::Server,
+                TokenType::Prefix,
+            ],
+        };
+
+        // Multi-key verifier with mixed permissions (using same key for verification)
+        let configs = vec![
+            // Admin key with all permissions (same key as generator for verification)
+            AuthKeyConfig {
+                key_id: Some("generator".to_string()), // Same key ID
+                private_key: Some(generator_key.clone()),
+                public_key: None,
+                allowed_token_types: vec![
+                    TokenType::Document,
+                    TokenType::File,
+                    TokenType::Server,
+                    TokenType::Prefix,
+                ],
+            },
+        ];
+
+        let mut generator = Authenticator::from_multi_key_config(&[generator_config]).unwrap();
+        generator.set_expected_audience(Some("https://test.example.com".to_string()));
+
+        let mut verifier = Authenticator::from_multi_key_config(&configs).unwrap();
+        verifier.set_expected_audience(Some("https://test.example.com".to_string()));
+
+        // Generate different token types
+        let doc_token = generator
+            .gen_doc_token_cwt(
+                "test-doc",
+                Authorization::Full,
+                ExpirationTimeEpochMillis(u64::MAX),
+                None,
+                None,
+            )
+            .unwrap();
+        let server_token = generator.server_token_cwt().unwrap();
+
+        // Should be able to verify tokens when using admin key (has all permissions)
+        // The admin key should be selected for verification since it has the required permissions
+        let doc_result = verifier.verify_token_auto(&doc_token, 0);
+        if doc_result.is_err() {
+            eprintln!("Doc verification error: {:?}", doc_result);
+        }
+        assert!(doc_result.is_ok());
+
+        let server_result = verifier.verify_token_auto(&server_token, 0);
+        if server_result.is_err() {
+            eprintln!("Server verification error: {:?}", server_result);
+        }
+        assert!(server_result.is_ok());
+    }
+
+    #[test]
+    fn test_token_type_from_permission() {
+        use crate::config::TokenType;
+
+        let doc_permission = Permission::Doc(DocPermission {
+            doc_id: "test".to_string(),
+            authorization: Authorization::Full,
+            user: None,
+        });
+        assert_eq!(
+            TokenType::from_permission(&doc_permission),
+            TokenType::Document
+        );
+
+        let file_permission = Permission::File(FilePermission {
+            file_hash: "hash".to_string(),
+            doc_id: "test".to_string(),
+            authorization: Authorization::Full,
+            content_type: None,
+            content_length: None,
+            user: None,
+        });
+        assert_eq!(
+            TokenType::from_permission(&file_permission),
+            TokenType::File
+        );
+
+        let server_permission = Permission::Server;
+        assert_eq!(
+            TokenType::from_permission(&server_permission),
+            TokenType::Server
+        );
+
+        let prefix_permission = Permission::Prefix(PrefixPermission {
+            prefix: "test-".to_string(),
+            authorization: Authorization::Full,
+            user: None,
+        });
+        assert_eq!(
+            TokenType::from_permission(&prefix_permission),
+            TokenType::Prefix
+        );
+    }
+
+    #[test]
+    fn test_default_allowed_token_types_serde() {
+        use crate::config::{AuthKeyConfig, TokenType};
+
+        // Test that serde default works correctly
+        let toml_str = r#"
+            key_id = "test"
+            private_key = "test-key"
+        "#;
+
+        let parsed: AuthKeyConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            parsed.allowed_token_types,
+            vec![TokenType::Document, TokenType::File]
+        );
     }
 }

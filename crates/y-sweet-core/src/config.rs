@@ -132,12 +132,14 @@ static ENV_OVERRIDES: &[EnvOverride] = &[
                     key_id,
                     private_key: Some(value.to_string()),
                     public_key: None,
+                    allowed_token_types: default_allowed_token_types(),
                 });
             } else {
                 config.auth.push(AuthKeyConfig {
                     key_id,
                     private_key: Some(value.to_string()),
                     public_key: None,
+                    allowed_token_types: default_allowed_token_types(),
                 });
             }
             Ok(())
@@ -329,11 +331,38 @@ pub struct AuthConfig {
     pub default_expiration_seconds: u64,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TokenType {
+    Document,
+    File,
+    Server,
+    Prefix,
+}
+
+fn default_allowed_token_types() -> Vec<TokenType> {
+    vec![TokenType::Document, TokenType::File]
+}
+
+impl TokenType {
+    pub fn from_permission(permission: &crate::auth::Permission) -> Self {
+        match permission {
+            crate::auth::Permission::Server => TokenType::Server,
+            crate::auth::Permission::Doc(_) => TokenType::Document,
+            crate::auth::Permission::File(_) => TokenType::File,
+            crate::auth::Permission::Prefix(_) => TokenType::Prefix,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AuthKeyConfig {
     pub key_id: Option<String>,
     pub private_key: Option<String>,
     pub public_key: Option<String>,
+
+    #[serde(default = "default_allowed_token_types")]
+    pub allowed_token_types: Vec<TokenType>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
