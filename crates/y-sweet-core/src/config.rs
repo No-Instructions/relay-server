@@ -421,8 +421,8 @@ pub struct AwsStoreConfig {
     #[serde(default = "default_s3_region")]
     pub region: String,
 
-    pub access_key_id: String,
-    pub secret_access_key: String,
+    pub access_key_id: Option<String>,
+    pub secret_access_key: Option<String>,
 
     #[serde(default)]
     pub prefix: String,
@@ -435,8 +435,8 @@ pub struct AwsStoreConfig {
 pub struct CloudflareStoreConfig {
     pub bucket: String,
     pub account_id: String,
-    pub access_key_id: String,
-    pub secret_access_key: String,
+    pub access_key_id: Option<String>,
+    pub secret_access_key: Option<String>,
 
     #[serde(default)]
     pub prefix: String,
@@ -448,8 +448,8 @@ pub struct CloudflareStoreConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BackblazeStoreConfig {
     pub bucket: String,
-    pub key_id: String,
-    pub application_key: String,
+    pub key_id: Option<String>,
+    pub application_key: Option<String>,
 
     #[serde(default)]
     pub prefix: String,
@@ -462,8 +462,8 @@ pub struct BackblazeStoreConfig {
 pub struct MinioStoreConfig {
     pub bucket: String,
     pub endpoint: String,
-    pub access_key: String,
-    pub secret_key: String,
+    pub access_key: Option<String>,
+    pub secret_key: Option<String>,
 
     #[serde(default)]
     pub prefix: String,
@@ -475,8 +475,8 @@ pub struct MinioStoreConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TigrisStoreConfig {
     pub bucket: String,
-    pub access_key_id: String,
-    pub secret_access_key: String,
+    pub access_key_id: Option<String>,
+    pub secret_access_key: Option<String>,
 
     #[serde(default)]
     pub prefix: String,
@@ -582,8 +582,8 @@ impl StoreConfig {
                 path_style: false,
                 presigned_url_expiration: aws.presigned_url_expiration,
                 prefix: aws.prefix.clone(),
-                access_key_id: Some(aws.access_key_id.clone()),
-                secret_access_key: Some(aws.secret_access_key.clone()),
+                access_key_id: aws.access_key_id.clone(),
+                secret_access_key: aws.secret_access_key.clone(),
             }),
             StoreConfig::Cloudflare(cf) => Some(S3StoreConfig {
                 bucket: cf.bucket.clone(),
@@ -592,8 +592,8 @@ impl StoreConfig {
                 path_style: true,
                 presigned_url_expiration: cf.presigned_url_expiration,
                 prefix: cf.prefix.clone(),
-                access_key_id: Some(cf.access_key_id.clone()),
-                secret_access_key: Some(cf.secret_access_key.clone()),
+                access_key_id: cf.access_key_id.clone(),
+                secret_access_key: cf.secret_access_key.clone(),
             }),
             StoreConfig::Backblaze(b2) => Some(S3StoreConfig {
                 bucket: b2.bucket.clone(),
@@ -602,8 +602,8 @@ impl StoreConfig {
                 path_style: false,
                 presigned_url_expiration: b2.presigned_url_expiration,
                 prefix: b2.prefix.clone(),
-                access_key_id: Some(b2.key_id.clone()),
-                secret_access_key: Some(b2.application_key.clone()),
+                access_key_id: b2.key_id.clone(),
+                secret_access_key: b2.application_key.clone(),
             }),
             StoreConfig::Minio(minio) => Some(S3StoreConfig {
                 bucket: minio.bucket.clone(),
@@ -612,8 +612,8 @@ impl StoreConfig {
                 path_style: true,
                 presigned_url_expiration: minio.presigned_url_expiration,
                 prefix: minio.prefix.clone(),
-                access_key_id: Some(minio.access_key.clone()),
-                secret_access_key: Some(minio.secret_key.clone()),
+                access_key_id: minio.access_key.clone(),
+                secret_access_key: minio.secret_key.clone(),
             }),
             StoreConfig::Tigris(tigris) => Some(S3StoreConfig {
                 bucket: tigris.bucket.clone(),
@@ -622,8 +622,8 @@ impl StoreConfig {
                 path_style: false,
                 presigned_url_expiration: tigris.presigned_url_expiration,
                 prefix: tigris.prefix.clone(),
-                access_key_id: Some(tigris.access_key_id.clone()),
-                secret_access_key: Some(tigris.secret_access_key.clone()),
+                access_key_id: tigris.access_key_id.clone(),
+                secret_access_key: tigris.secret_access_key.clone(),
             }),
             _ => None,
         }
