@@ -23,3 +23,10 @@ kill_timeout = "5m0s"
   memory = '256mb'
   cpu_kind = 'shared'
   cpus = 1
+
+[env]
+  METRICS_PORT=9091
+
+[metrics]
+  port = 9091
+  path = "/metrics"
