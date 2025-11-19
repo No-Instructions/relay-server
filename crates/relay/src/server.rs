@@ -600,6 +600,13 @@ impl Server {
                 .route("/f/:doc_id/upload-url", post(handle_file_upload_url))
                 .route("/f/:doc_id/download-url", get(handle_file_download_url));
 
+            // Add file operations that work with any store
+            router = router
+                .route("/f/:doc_id/history", get(handle_file_history))
+                .route("/f/:doc_id", delete(handle_file_delete))
+                .route("/f/:doc_id/:hash", delete(handle_file_delete_by_hash))
+                .route("/f/:doc_id", head(handle_file_head));
+
             // Only add direct upload/download endpoints if store supports direct uploads
             if store.supports_direct_uploads() {
                 router = router
@@ -607,11 +614,7 @@ impl Server {
                         "/f/:doc_id/upload",
                         post(handle_file_upload).put(handle_file_upload_raw),
                     )
-                    .route("/f/:doc_id/download", get(handle_file_download))
-                    .route("/f/:doc_id/history", get(handle_file_history))
-                    .route("/f/:doc_id", delete(handle_file_delete))
-                    .route("/f/:doc_id/:hash", delete(handle_file_delete_by_hash))
-                    .route("/f/:doc_id", head(handle_file_head));
+                    .route("/f/:doc_id/download", get(handle_file_download));
             }
         }
 
