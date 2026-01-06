@@ -4,6 +4,41 @@
 
 Relay Server is a fork of [jamsocket/y-sweet](https://github.com/jamsocket/y-sweet). It exposes the same CRDT-based document store under a new name and integrates with Relay's Control Plane for authentication and permissions.
 
+
+## Self-hosting
+
+> :information_source: **Note:** The Relay Server and Relay Obsidian Plugin are open source, but the Relay Control Plane is not open source. Using a Self-Hosted Relay Server with more than 3 collaborators requires a paid license to support the development of Relay.
+
+
+Self-hosting within your private network gives you complete privacy for your documents and attachments. Relay's Control Plane handles login and permissions, but cannot read your content.
+
+### Quick-start
+
+```
+# mounts local volume, see production deployment guide for S3-compatible storage
+docker run \
+  -v data:/app/data \
+  -p 8080:8080 \
+  docker.system3.md/relay-server \
+  http://relay-server.my-network.internal:8080  # Your internal network URL
+```
+
+Register your server using the Relay Obsidian plugin:
+
+1. Log in
+2. Run the command `Relay: Register self-hosted Relay Server`
+3. Enter the relay-server URL (must match above)
+
+
+Don't expose the Relay Server to the public internet.
+
+### Production deployment
+
+The recommended setup uses Docker with Cloudflare R2 for persistence.
+
+See [relay-server-template](https://github.com/no-instructions/relay-server-template) for detailed hosting instructions and deployment templates.
+
+
 ## Features
 
  - Real‑time collaboration engine built atop y-crdt, enabling high-performance conflict‑free shared editing
@@ -45,15 +80,6 @@ access_key_id = "AKIA..."        # or set AWS_ACCESS_KEY_ID
 secret_access_key = "secret..."  # or set AWS_SECRET_ACCESS_KEY
 prefix = ""
 ```
-
-## Self-hosting
-
-> :information_source: **Note:** The Relay Server and Relay Obsidian Plugin are open source, but the Relay Control Plane is not open source. Using a Self-Hosted Relay Server with more than 3 collaborators requires a paid license to support the development of Relay.
-
-
-Self-hosting gives you complete privacy for your notes and attachments. Relay's Control Plane handles login and permissions, but cannot read your content. The recommended setup uses Docker with Cloudflare R2 for persistence.
-
-See [relay-server-template](https://github.com/no-instructions/relay-server-template) for detailed hosting instructions and deployment templates.
 
 
 ## Contact
