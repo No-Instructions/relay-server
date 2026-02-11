@@ -424,6 +424,9 @@ impl Server {
 
                     if checkpoints_without_refs >= 2 {
                         tracing::info!("GCing doc");
+                        if let Some(doc) = docs.get(&doc_id) {
+                            doc.sync_kv().shutdown();
+                        }
                         docs.remove(&doc_id);
                         break;
                     }
@@ -449,6 +452,9 @@ impl Server {
             let is_done = tokio::select! {
                 v = recv.recv() => v.is_none(),
                 _ = cancellation_token.cancelled() => true,
+                _ = tokio::time::sleep(checkpoint_freq) => {
+                    sync_kv.is_shutdown()
+                }
             };
 
             tracing::info!("Received signal. done: {}", is_done);
@@ -2750,6 +2756,58 @@ mod test {
             .download_url
             .contains(&format!("hash={}", file_hash)));
         assert!(response.download_url.contains(&format!("token={}", token)));
+    }
+
+    /// Test that persistence workers terminate when docs are garbage collected.
+    /// This is a regression test for the memory leak fixed in PR #401.
+    #[tokio::test]
+    async fn test_persistence_worker_terminates_on_gc() {
+        // Use a very short checkpoint frequency to speed up the test
+        let checkpoint_freq = Duration::from_millis(50);
+
+        let server = Arc::new(
+            Server::new(
+                None,
+                checkpoint_freq,
+                None,
+                None,
+                vec![],
+                CancellationToken::new(),
+                true, // doc_gc enabled
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+
+        // Create a doc - this spawns persistence and GC workers
+        let doc_id = server.create_doc().await.unwrap();
+
+        // Verify the doc exists
+        assert!(server.docs.contains_key(&doc_id));
+
+        // The doc has no external references (we're not holding an awareness Arc),
+        // so it should be eligible for GC after 2 checkpoint intervals.
+        // Wait for GC to happen (2 intervals + some buffer)
+        tokio::time::sleep(checkpoint_freq * 5).await;
+
+        // Doc should be removed by GC
+        assert!(
+            !server.docs.contains_key(&doc_id),
+            "Doc should have been garbage collected"
+        );
+
+        // Close the tracker and wait for all workers to finish.
+        // If persistence workers don't terminate (the bug), this will hang.
+        server.doc_worker_tracker.close();
+
+        let wait_result =
+            tokio::time::timeout(Duration::from_secs(2), server.doc_worker_tracker.wait()).await;
+
+        assert!(
+            wait_result.is_ok(),
+            "Persistence workers should terminate after GC, but they hung"
+        );
     }
 }
 

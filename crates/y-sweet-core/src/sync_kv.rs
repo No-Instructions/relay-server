@@ -113,6 +113,7 @@ pub struct SyncKv {
     key: String,
     dirty: AtomicBool,
     dirty_callback: Box<dyn Fn() + Send + Sync>,
+    shutdown: AtomicBool,
     created_at: Option<u64>,
     metadata: Arc<Mutex<Option<BTreeMap<String, ciborium::value::Value>>>>,
 }
@@ -169,13 +170,14 @@ impl SyncKv {
             key,
             dirty: AtomicBool::new(false),
             dirty_callback: Box::new(callback),
+            shutdown: AtomicBool::new(false),
             created_at,
             metadata: Arc::new(Mutex::new(metadata)),
         })
     }
 
     fn mark_dirty(&self) {
-        if !self.dirty.load(Ordering::Relaxed) {
+        if !self.dirty.load(Ordering::Relaxed) && !self.shutdown.load(Ordering::SeqCst) {
             self.dirty.store(true, Ordering::Relaxed);
             (self.dirty_callback)();
         }
@@ -228,6 +230,16 @@ impl SyncKv {
 
     pub fn is_empty(&self) -> bool {
         self.data.lock().unwrap().is_empty()
+    }
+
+    pub fn is_shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::SeqCst)
+    }
+
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        // Call the callback one last time to wake up the persistence worker
+        (self.dirty_callback)();
     }
 
     /// Set metadata for this document
