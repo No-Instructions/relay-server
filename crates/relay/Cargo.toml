@@ -1,6 +1,6 @@
 [package]
 name = "relay"
-version = "0.9.0"
+version = "0.9.3"
 edition = "2021"
 description = "Self-hosted document collaboration server for the Relay.md network"
 license = "MIT"
