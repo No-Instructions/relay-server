@@ -33,6 +33,8 @@ y-sweet-core = { version = "0.8.2", path = "../y-sweet-core", features=["sync"] 
 yrs = { version = "0.19.1" }
 yrs-kvstore = "0.3.0"
 bincode = "1.3.3"
+chrono = "0.4.31"
+ciborium = "0.2.2"
 hex = "0.4.3"
 prometheus = "0.13"
 p256 = "0.13.2"
