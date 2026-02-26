@@ -2,3 +2,5 @@ target
 .auth.staging.env
 .auth.env
 y-sweet-worker/dist
+fly.toml
+fly.staging.toml
