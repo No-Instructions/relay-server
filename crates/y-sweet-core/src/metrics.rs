@@ -20,10 +20,7 @@ pub struct RelayMetrics {
     pub debounced_queue_length: GaugeVec,
 
     // Authentication & security metrics
-    pub auth_failures_total: CounterVec,
-    pub token_expired_total: CounterVec,
-    pub permission_denied_total: CounterVec,
-    pub missing_token_total: CounterVec,
+    pub http_auth_errors_total: CounterVec,
 }
 
 static RELAY_METRICS: OnceLock<Result<Arc<RelayMetrics>, prometheus::Error>> = OnceLock::new();
@@ -148,41 +145,14 @@ impl RelayMetrics {
         registry.register(Box::new(debounced_queue_length.clone()))?;
 
         // Authentication & Security metrics
-        let auth_failures_total = CounterVec::new(
+        let http_auth_errors_total = CounterVec::new(
             Opts::new(
-                "relay_server_auth_failures_total",
-                "Total number of authentication failures",
+                "relay_server_http_auth_errors_total",
+                "Total number of HTTP authentication/authorization errors",
             ),
-            &["error_type", "endpoint", "method"],
+            &["error_type", "status_code", "path", "method"],
         )?;
-        registry.register(Box::new(auth_failures_total.clone()))?;
-
-        let token_expired_total = CounterVec::new(
-            Opts::new(
-                "relay_server_token_expired_total",
-                "Total number of token expiration events",
-            ),
-            &["token_type", "endpoint"],
-        )?;
-        registry.register(Box::new(token_expired_total.clone()))?;
-
-        let permission_denied_total = CounterVec::new(
-            Opts::new(
-                "relay_server_permission_denied_total",
-                "Total number of authorization failures after successful token verification",
-            ),
-            &["resource_type", "action", "endpoint"],
-        )?;
-        registry.register(Box::new(permission_denied_total.clone()))?;
-
-        let missing_token_total = CounterVec::new(
-            Opts::new(
-                "relay_server_missing_token_total",
-                "Total number of requests with missing authentication tokens",
-            ),
-            &["endpoint", "auth_required"],
-        )?;
-        registry.register(Box::new(missing_token_total.clone()))?;
+        registry.register(Box::new(http_auth_errors_total.clone()))?;
 
         Ok(Arc::new(Self {
             webhook_requests_total,
@@ -197,10 +167,7 @@ impl RelayMetrics {
             sync_protocol_connections,
             sync_protocol_subscriptions_by_channel,
             debounced_queue_length,
-            auth_failures_total,
-            token_expired_total,
-            permission_denied_total,
-            missing_token_total,
+            http_auth_errors_total,
         }))
     }
 
@@ -282,27 +249,15 @@ impl RelayMetrics {
     }
 
     // Authentication & Security metrics methods
-    pub fn record_auth_failure(&self, error_type: &str, endpoint: &str, method: &str) {
-        self.auth_failures_total
-            .with_label_values(&[error_type, endpoint, method])
-            .inc();
-    }
-
-    pub fn record_token_expired(&self, token_type: &str, endpoint: &str) {
-        self.token_expired_total
-            .with_label_values(&[token_type, endpoint])
-            .inc();
-    }
-
-    pub fn record_permission_denied(&self, resource_type: &str, action: &str, endpoint: &str) {
-        self.permission_denied_total
-            .with_label_values(&[resource_type, action, endpoint])
-            .inc();
-    }
-
-    pub fn record_missing_token(&self, endpoint: &str, auth_required: &str) {
-        self.missing_token_total
-            .with_label_values(&[endpoint, auth_required])
+    pub fn record_http_auth_error(
+        &self,
+        error_type: &str,
+        status_code: &str,
+        path: &str,
+        method: &str,
+    ) {
+        self.http_auth_errors_total
+            .with_label_values(&[error_type, status_code, path, method])
             .inc();
     }
 }
@@ -338,100 +293,39 @@ mod tests {
     }
 
     #[test]
-    fn test_auth_failure_metrics() {
+    fn test_http_auth_error_metrics() {
         let metrics = RelayMetrics::new_for_test().unwrap();
 
-        // Record some auth failures
-        metrics.record_auth_failure("invalid_signature", "websocket_upgrade", "GET");
-        metrics.record_auth_failure("expired", "document_access", "POST");
-        metrics.record_auth_failure("invalid_format", "new_doc", "POST");
-
-        // Test permission denied metrics
-        metrics.record_permission_denied("document", "prefix_mismatch", "new_doc");
-        metrics.record_permission_denied("file", "wrong_token_type", "file_access");
-
-        // Test missing token metrics
-        metrics.record_missing_token("new_doc", "true");
-        metrics.record_missing_token("websocket_upgrade", "false");
+        // Record various auth errors
+        metrics.record_http_auth_error("invalid_signature", "401", "/doc/ws/:doc_id", "GET");
+        metrics.record_http_auth_error("expired", "401", "/d/:doc_id/update", "POST");
+        metrics.record_http_auth_error("missing_token", "401", "/doc/new", "POST");
+        metrics.record_http_auth_error("prefix_mismatch", "403", "/doc/new", "POST");
 
         // Verify metrics were recorded
-        let auth_failures = metrics
-            .auth_failures_total
-            .with_label_values(&["invalid_signature", "websocket_upgrade", "GET"])
+        let sig_failures = metrics
+            .http_auth_errors_total
+            .with_label_values(&["invalid_signature", "401", "/doc/ws/:doc_id", "GET"])
             .get();
-        assert_eq!(auth_failures, 1.0);
+        assert_eq!(sig_failures, 1.0);
 
-        let expired_failures = metrics
-            .auth_failures_total
-            .with_label_values(&["expired", "document_access", "POST"])
+        let expired = metrics
+            .http_auth_errors_total
+            .with_label_values(&["expired", "401", "/d/:doc_id/update", "POST"])
             .get();
-        assert_eq!(expired_failures, 1.0);
-    }
+        assert_eq!(expired, 1.0);
 
-    #[test]
-    fn test_token_expired_metrics() {
-        let metrics = RelayMetrics::new_for_test().unwrap();
-
-        // Record token expiration
-        metrics.record_token_expired("websocket_connection", "websocket_upgrade");
-        metrics.record_token_expired("api_token", "file_download");
-
-        // Verify metrics were recorded
-        let websocket_expired = metrics
-            .token_expired_total
-            .with_label_values(&["websocket_connection", "websocket_upgrade"])
+        let missing = metrics
+            .http_auth_errors_total
+            .with_label_values(&["missing_token", "401", "/doc/new", "POST"])
             .get();
-        assert_eq!(websocket_expired, 1.0);
+        assert_eq!(missing, 1.0);
 
-        let api_expired = metrics
-            .token_expired_total
-            .with_label_values(&["api_token", "file_download"])
+        let prefix = metrics
+            .http_auth_errors_total
+            .with_label_values(&["prefix_mismatch", "403", "/doc/new", "POST"])
             .get();
-        assert_eq!(api_expired, 1.0);
-    }
-
-    #[test]
-    fn test_permission_denied_metrics() {
-        let metrics = RelayMetrics::new_for_test().unwrap();
-
-        // Record permission denied events
-        metrics.record_permission_denied("document", "write", "document_upload");
-        metrics.record_permission_denied("file", "read", "file_download");
-
-        // Verify metrics were recorded
-        let doc_denied = metrics
-            .permission_denied_total
-            .with_label_values(&["document", "write", "document_upload"])
-            .get();
-        assert_eq!(doc_denied, 1.0);
-
-        let file_denied = metrics
-            .permission_denied_total
-            .with_label_values(&["file", "read", "file_download"])
-            .get();
-        assert_eq!(file_denied, 1.0);
-    }
-
-    #[test]
-    fn test_missing_token_metrics() {
-        let metrics = RelayMetrics::new_for_test().unwrap();
-
-        // Record missing token events
-        metrics.record_missing_token("websocket_upgrade", "true");
-        metrics.record_missing_token("document_access", "false");
-
-        // Verify metrics were recorded
-        let required_missing = metrics
-            .missing_token_total
-            .with_label_values(&["websocket_upgrade", "true"])
-            .get();
-        assert_eq!(required_missing, 1.0);
-
-        let optional_missing = metrics
-            .missing_token_total
-            .with_label_values(&["document_access", "false"])
-            .get();
-        assert_eq!(optional_missing, 1.0);
+        assert_eq!(prefix, 1.0);
     }
 
     #[test]

@@ -4,7 +4,7 @@ use axum::{
     extract::{
         multipart::Multipart,
         ws::{CloseFrame, Message, WebSocket},
-        Path, Query, Request, State, WebSocketUpgrade,
+        MatchedPath, Path, Query, Request, State, WebSocketUpgrade,
     },
     http::{
         header::{HeaderName, HeaderValue},
@@ -68,13 +68,43 @@ fn current_time_epoch_millis() -> u64 {
     duration_since_epoch.as_millis() as u64
 }
 
+async fn auth_metrics_middleware(
+    State(server_state): State<Arc<Server>>,
+    matched_path: Option<MatchedPath>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let method = req.method().to_string();
+    let resp = next.run(req).await;
+    let status = resp.status();
+
+    if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        let path = matched_path
+            .as_ref()
+            .map(|m| m.as_str())
+            .unwrap_or("unknown");
+        let error_type = resp
+            .extensions()
+            .get::<AuthErrorType>()
+            .map(|e| e.0)
+            .unwrap_or("unknown");
+        let status_str = status.as_u16().to_string();
+
+        server_state
+            .metrics
+            .record_http_auth_error(error_type, &status_str, path, &method);
+    }
+
+    resp
+}
+
 fn validate_file_token(
     server_state: &Arc<Server>,
     token: &str,
     doc_id: &str,
 ) -> Result<Permission, AppError> {
     let authenticator = server_state.authenticator.as_ref().ok_or_else(|| {
-        AppError(
+        AppError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             anyhow!("No authenticator configured"),
         )
@@ -83,38 +113,28 @@ fn validate_file_token(
     let permission = authenticator
         .verify_token_auto(token, current_time_epoch_millis())
         .map_err(|auth_error| {
-            // Record auth failure metric
-            server_state.metrics.record_auth_failure(
+            AppError::auth(
+                StatusCode::UNAUTHORIZED,
+                anyhow!("Invalid token"),
                 auth_error.to_metric_label(),
-                "file_access",
-                "POST",
-            );
-            AppError(StatusCode::UNAUTHORIZED, anyhow!("Invalid token"))
+            )
         })?;
 
     match &permission {
         Permission::File(file_permission) => {
             if file_permission.doc_id != doc_id {
-                server_state.metrics.record_permission_denied(
-                    "file",
-                    "access_wrong_document",
-                    "file_access",
-                );
-                return Err(AppError(
+                return Err(AppError::auth(
                     StatusCode::UNAUTHORIZED,
                     anyhow!("Token not valid for this document"),
+                    "access_wrong_document",
                 ));
             }
         }
         _ => {
-            server_state.metrics.record_permission_denied(
-                "file",
-                "wrong_token_type",
-                "file_access",
-            );
-            return Err(AppError(
+            return Err(AppError::auth(
                 StatusCode::BAD_REQUEST,
                 anyhow!("Token must be a file token"),
+                "wrong_token_type",
             ));
         }
     }
@@ -122,12 +142,44 @@ fn validate_file_token(
     Ok(permission)
 }
 
+/// Newtype for passing auth error context through response extensions.
+#[derive(Clone, Debug)]
+pub struct AuthErrorType(pub &'static str);
+
 #[derive(Debug)]
-pub struct AppError(StatusCode, anyhow::Error);
+pub struct AppError {
+    pub status: StatusCode,
+    pub error: anyhow::Error,
+    auth_error_type: Option<&'static str>,
+}
+
+impl AppError {
+    fn new(status: StatusCode, error: anyhow::Error) -> Self {
+        Self {
+            status,
+            error,
+            auth_error_type: None,
+        }
+    }
+
+    pub fn auth(status: StatusCode, error: anyhow::Error, error_type: &'static str) -> Self {
+        Self {
+            status,
+            error,
+            auth_error_type: Some(error_type),
+        }
+    }
+}
+
 impl std::error::Error for AppError {}
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        (self.0, format!("Something went wrong: {}", self.1)).into_response()
+        let mut response =
+            (self.status, format!("Something went wrong: {}", self.error)).into_response();
+        if let Some(error_type) = self.auth_error_type {
+            response.extensions_mut().insert(AuthErrorType(error_type));
+        }
+        response
     }
 }
 impl<E> From<(StatusCode, E)> for AppError
@@ -135,12 +187,16 @@ where
     E: Into<anyhow::Error>,
 {
     fn from((status_code, err): (StatusCode, E)) -> Self {
-        Self(status_code, err.into())
+        Self {
+            status: status_code,
+            error: err.into(),
+            auth_error_type: None,
+        }
     }
 }
 impl std::fmt::Display for AppError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Status code: {} {}", self.0, self.1)?;
+        write!(f, "Status code: {} {}", self.status, self.error)?;
         Ok(())
     }
 }
@@ -554,8 +610,17 @@ impl Server {
                 {
                     return Ok(());
                 }
+                return Err(AppError::auth(
+                    StatusCode::UNAUTHORIZED,
+                    anyhow!("Unauthorized."),
+                    "invalid_server_token",
+                ));
             }
-            Err((StatusCode::UNAUTHORIZED, anyhow!("Unauthorized.")))?
+            Err(AppError::auth(
+                StatusCode::UNAUTHORIZED,
+                anyhow!("Unauthorized."),
+                "missing_token",
+            ))
         } else {
             Ok(())
         }
@@ -578,6 +643,21 @@ impl Server {
             HeaderValue::from_static(RELAY_SERVER_VERSION),
         );
         resp
+    }
+
+    pub fn routes_with_metrics(self: &Arc<Self>) -> Router {
+        self.routes().layer(middleware::from_fn_with_state(
+            self.clone(),
+            auth_metrics_middleware,
+        ))
+    }
+
+    pub fn single_doc_routes_with_metrics(self: &Arc<Self>) -> Router {
+        self.single_doc_routes()
+            .layer(middleware::from_fn_with_state(
+                self.clone(),
+                auth_metrics_middleware,
+            ))
     }
 
     pub fn routes(self: &Arc<Self>) -> Router {
@@ -685,13 +765,13 @@ impl Server {
 
     pub async fn serve(self, listener: TcpListener, redact_errors: bool) -> Result<()> {
         let s = Arc::new(self);
-        let routes = s.routes();
+        let routes = s.routes_with_metrics();
         s.serve_internal(listener, redact_errors, routes).await
     }
 
     pub async fn serve_doc(self, listener: TcpListener, redact_errors: bool) -> Result<()> {
         let s = Arc::new(self);
-        let routes = s.single_doc_routes();
+        let routes = s.single_doc_routes_with_metrics();
         s.serve_internal(listener, redact_errors, routes).await
     }
 
@@ -706,10 +786,16 @@ impl Server {
             if let Some(token) = token {
                 let authorization = authenticator
                     .verify_doc_token(token, doc, current_time_epoch_millis())
-                    .map_err(|e| (StatusCode::UNAUTHORIZED, e))?;
+                    .map_err(|e| {
+                        AppError::auth(StatusCode::UNAUTHORIZED, e.into(), "invalid_doc_token")
+                    })?;
                 Ok(authorization)
             } else {
-                Err((StatusCode::UNAUTHORIZED, anyhow!("No token provided.")))?
+                Err(AppError::auth(
+                    StatusCode::UNAUTHORIZED,
+                    anyhow!("No token provided."),
+                    "missing_token",
+                ))
             }
         } else {
             Ok(Authorization::Full)
@@ -721,7 +807,7 @@ impl Server {
             .iter()
             .next()
             .map(|entry| entry.key().clone())
-            .ok_or_else(|| AppError(StatusCode::NOT_FOUND, anyhow!("No document found")))
+            .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, anyhow!("No document found")))
     }
 }
 
@@ -794,7 +880,11 @@ async fn update_doc_inner(
     body: Bytes,
 ) -> Result<Response, AppError> {
     if !matches!(authorization, Authorization::Full) {
-        return Err(AppError(StatusCode::FORBIDDEN, anyhow!("Unauthorized.")));
+        return Err(AppError::auth(
+            StatusCode::FORBIDDEN,
+            anyhow!("Unauthorized."),
+            "insufficient_permissions",
+        ));
     }
 
     let dwskv = server_state
@@ -804,7 +894,7 @@ async fn update_doc_inner(
 
     if let Err(err) = dwskv.apply_update(&body) {
         tracing::error!(?err, "Failed to apply update");
-        return Err(AppError(StatusCode::INTERNAL_SERVER_ERROR, err));
+        return Err(AppError::new(StatusCode::INTERNAL_SERVER_ERROR, err));
     }
 
     Ok(StatusCode::OK.into_response())
@@ -860,7 +950,7 @@ async fn handle_socket_upgrade_with_channel_and_user(
     State(server_state): State<Arc<Server>>,
 ) -> Result<Response, AppError> {
     if !matches!(authorization, Authorization::Full) && !server_state.docs.contains_key(&doc_id) {
-        return Err(AppError(
+        return Err(AppError::new(
             StatusCode::NOT_FOUND,
             anyhow!("Doc {} not found", doc_id),
         ));
@@ -918,20 +1008,8 @@ async fn handle_socket_upgrade_deprecated(
         if let Some(token) = params.token.as_deref() {
             authenticator
                 .verify_token_with_channel(token, current_time_epoch_millis())
-                .map_err(|e| {
-                    // Record authentication failure metric
-                    server_state.metrics.record_auth_failure(
-                        e.to_metric_label(),
-                        "websocket_upgrade_deprecated",
-                        "GET",
-                    );
-                    (StatusCode::UNAUTHORIZED, e)
-                })?
+                .map_err(|e| AppError::auth(StatusCode::UNAUTHORIZED, e.into(), "invalid_token"))?
         } else {
-            // Record missing token when authenticator is present but no token provided
-            server_state
-                .metrics
-                .record_missing_token("websocket_upgrade_deprecated", "true");
             (y_sweet_core::auth::Permission::Server, None)
         }
     } else {
@@ -941,9 +1019,10 @@ async fn handle_socket_upgrade_deprecated(
     let (authorization, user) = match permission {
         y_sweet_core::auth::Permission::Doc(doc_perm) => {
             if doc_perm.doc_id != doc_id {
-                return Err(AppError(
+                return Err(AppError::auth(
                     StatusCode::FORBIDDEN,
                     anyhow!("Token not valid for this document"),
+                    "access_wrong_document",
                 ));
             }
             (doc_perm.authorization, doc_perm.user)
@@ -951,17 +1030,19 @@ async fn handle_socket_upgrade_deprecated(
         y_sweet_core::auth::Permission::Server => (Authorization::Full, None),
         y_sweet_core::auth::Permission::Prefix(prefix_perm) => {
             if !doc_id.starts_with(&prefix_perm.prefix) {
-                return Err(AppError(
+                return Err(AppError::auth(
                     StatusCode::FORBIDDEN,
                     anyhow!("Token not valid for this document"),
+                    "prefix_mismatch",
                 ));
             }
             (prefix_perm.authorization, prefix_perm.user)
         }
         y_sweet_core::auth::Permission::File(_) => {
-            return Err(AppError(
+            return Err(AppError::auth(
                 StatusCode::FORBIDDEN,
                 anyhow!("File token not valid for document access"),
+                "wrong_token_type",
             ));
         }
     };
@@ -988,7 +1069,7 @@ async fn handle_socket_upgrade_full_path(
 
     if doc_id != doc_id2 {
         tracing::debug!("Doc ID mismatch: {} != {}", doc_id, doc_id2);
-        return Err(AppError(
+        return Err(AppError::new(
             StatusCode::BAD_REQUEST,
             anyhow!("For Yjs compatibility, the doc_id appears twice in the URL. It must be the same in both places, but we got {} and {}.", doc_id, doc_id2),
         ));
@@ -1002,7 +1083,7 @@ async fn handle_socket_upgrade_full_path(
                 .verify_token_with_channel(token, current_time)
                 .map_err(|e| {
                     tracing::debug!("Token verification failed: {:?}", e);
-                    (StatusCode::UNAUTHORIZED, e)
+                    AppError::auth(StatusCode::UNAUTHORIZED, e.into(), "invalid_token")
                 })?
         } else {
             (y_sweet_core::auth::Permission::Server, None)
@@ -1014,9 +1095,10 @@ async fn handle_socket_upgrade_full_path(
     let (authorization, user) = match permission {
         y_sweet_core::auth::Permission::Doc(doc_perm) => {
             if doc_perm.doc_id != doc_id {
-                return Err(AppError(
+                return Err(AppError::auth(
                     StatusCode::FORBIDDEN,
                     anyhow!("Token not valid for this document"),
+                    "access_wrong_document",
                 ));
             }
             (doc_perm.authorization, doc_perm.user)
@@ -1024,17 +1106,19 @@ async fn handle_socket_upgrade_full_path(
         y_sweet_core::auth::Permission::Server => (Authorization::Full, None),
         y_sweet_core::auth::Permission::Prefix(prefix_perm) => {
             if !doc_id.starts_with(&prefix_perm.prefix) {
-                return Err(AppError(
+                return Err(AppError::auth(
                     StatusCode::FORBIDDEN,
                     anyhow!("Token not valid for this document"),
+                    "prefix_mismatch",
                 ));
             }
             (prefix_perm.authorization, prefix_perm.user)
         }
         y_sweet_core::auth::Permission::File(_) => {
-            return Err(AppError(
+            return Err(AppError::auth(
                 StatusCode::FORBIDDEN,
                 anyhow!("File token not valid for document access"),
+                "wrong_token_type",
             ));
         }
     };
@@ -1059,7 +1143,7 @@ async fn handle_socket_upgrade_single(
 ) -> Result<Response, AppError> {
     let single_doc_id = server_state.get_single_doc_id()?;
     if doc_id != single_doc_id {
-        return Err(AppError(
+        return Err(AppError::new(
             StatusCode::NOT_FOUND,
             anyhow!("Document not found"),
         ));
@@ -1124,10 +1208,11 @@ async fn handle_socket(
                 match connection.send(&msg).await {
                     Ok(_) => {},
                     Err(e) if e.to_string().contains("Token expired") => {
-                        // Record token expiration metric
-                        metrics.record_token_expired(
+                        metrics.record_http_auth_error(
+                            "expired",
+                            "1008",
                             "websocket_connection",
-                            "websocket_message_handler"
+                            "WS",
                         );
                         tracing::warn!(
                             doc_id = %doc_id,
@@ -1203,14 +1288,10 @@ async fn new_doc(
                     let permission = authenticator
                         .verify_token_auto(token, current_time_epoch_millis())
                         .map_err(|auth_error| {
-                            server_state.metrics.record_auth_failure(
-                                auth_error.to_metric_label(),
-                                "new_doc",
-                                "POST",
-                            );
-                            AppError(
+                            AppError::auth(
                                 StatusCode::UNAUTHORIZED,
                                 anyhow!("Invalid token: {}", auth_error),
+                                auth_error.to_metric_label(),
                             )
                         })?;
 
@@ -1218,58 +1299,47 @@ async fn new_doc(
                         Permission::Prefix(prefix_perm) => {
                             // Check if the document ID starts with the prefix
                             if !doc_id.starts_with(&prefix_perm.prefix) {
-                                server_state.metrics.record_permission_denied(
-                                    "document",
-                                    "prefix_mismatch",
-                                    "new_doc",
-                                );
-                                return Err(AppError(
+                                return Err(AppError::auth(
                                     StatusCode::FORBIDDEN,
                                     anyhow!(
                                         "Document ID '{}' does not match prefix '{}'",
                                         doc_id,
                                         prefix_perm.prefix
                                     ),
+                                    "prefix_mismatch",
                                 ));
                             }
                             // Check if we have Full permissions (needed for creation)
                             if prefix_perm.authorization != Authorization::Full {
-                                server_state.metrics.record_permission_denied(
-                                    "document",
-                                    "insufficient_permissions",
-                                    "new_doc",
-                                );
-                                return Err(AppError(
+                                return Err(AppError::auth(
                                     StatusCode::FORBIDDEN,
-                                    anyhow!("Prefix token requires Full authorization to create documents")
+                                    anyhow!("Prefix token requires Full authorization to create documents"),
+                                    "insufficient_permissions",
                                 ));
                             }
                         }
                         _ => {
-                            server_state.metrics.record_permission_denied(
-                                "document",
-                                "wrong_token_type",
-                                "new_doc",
-                            );
-                            return Err(AppError(
+                            return Err(AppError::auth(
                                 StatusCode::FORBIDDEN,
                                 anyhow!("Only server or prefix tokens can create documents"),
+                                "wrong_token_type",
                             ));
                         }
                     }
                 } else {
                     // No doc_id provided - only server tokens can create with auto-generated ID
-                    return Err(AppError(
+                    return Err(AppError::auth(
                         StatusCode::FORBIDDEN,
                         anyhow!("Prefix tokens must specify a docId that matches their prefix"),
+                        "wrong_token_type",
                     ));
                 }
             }
         } else {
-            server_state.metrics.record_missing_token("new_doc", "true");
-            return Err(AppError(
+            return Err(AppError::auth(
                 StatusCode::UNAUTHORIZED,
                 anyhow!("No token provided"),
+                "missing_token",
             ));
         }
     }
@@ -1319,7 +1389,7 @@ fn generate_base_url(
     }
 
     // Reject unknown hosts when allowed_hosts is configured
-    Err(AppError(
+    Err(AppError::new(
         StatusCode::BAD_REQUEST,
         anyhow!("Host '{}' not in allowed hosts list", request_host),
     ))
@@ -1370,7 +1440,7 @@ fn generate_context_aware_urls(
     }
 
     // Reject unknown hosts when allowed_hosts is configured
-    Err(AppError(
+    Err(AppError::new(
         StatusCode::BAD_REQUEST,
         anyhow!("Host '{}' not in allowed hosts list", request_host),
     ))
@@ -1403,7 +1473,7 @@ async fn auth_doc(
         let token = auth
             .gen_doc_token(&doc_id, authorization, expiration_time, None)
             .map_err(|e| {
-                AppError(
+                AppError::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     anyhow!("Failed to generate token: {}", e),
                 )
@@ -1456,27 +1526,40 @@ async fn handle_file_upload_url(
             // Verify token is for this doc_id
             let auth = authenticator
                 .verify_file_token_for_doc(token, &doc_id, current_time_epoch_millis())
-                .map_err(|e| AppError(StatusCode::UNAUTHORIZED, anyhow!("Invalid token: {}", e)))?;
+                .map_err(|e| {
+                    AppError::auth(
+                        StatusCode::UNAUTHORIZED,
+                        anyhow!("Invalid token: {}", e),
+                        "invalid_token",
+                    )
+                })?;
 
             // Only allow Full permission to upload
             if !matches!(auth, Authorization::Full) {
-                return Err(AppError(
+                return Err(AppError::auth(
                     StatusCode::FORBIDDEN,
                     anyhow!("Insufficient permissions to upload files"),
+                    "insufficient_permissions",
                 ));
             }
 
             // Verify the token and get the file metadata
             let permission = authenticator
                 .verify_token_auto(token, current_time_epoch_millis())
-                .map_err(|_| AppError(StatusCode::UNAUTHORIZED, anyhow!("Invalid token")))?;
+                .map_err(|_| {
+                    AppError::auth(
+                        StatusCode::UNAUTHORIZED,
+                        anyhow!("Invalid token"),
+                        "invalid_token",
+                    )
+                })?;
 
             if let Permission::File(file_permission) = permission {
                 let file_hash = file_permission.file_hash;
 
                 // Validate the file hash
                 if !validate_file_hash(&file_hash) {
-                    return Err(AppError(
+                    return Err(AppError::new(
                         StatusCode::BAD_REQUEST,
                         anyhow!("Invalid file hash format in token"),
                     ));
@@ -1484,7 +1567,7 @@ async fn handle_file_upload_url(
 
                 // Check if we have a store configured
                 if server_state.store.is_none() {
-                    return Err(AppError(
+                    return Err(AppError::new(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         anyhow!("No store configured for file uploads"),
                     ));
@@ -1502,7 +1585,7 @@ async fn handle_file_upload_url(
                     .unwrap()
                     .generate_upload_url(&key, content_type, content_length)
                     .await
-                    .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
+                    .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
 
                 if let Some(url) = upload_url {
                     // Check if this is a local endpoint (relative path) and convert to full URL with token
@@ -1521,28 +1604,30 @@ async fn handle_file_upload_url(
                         return Ok(Json(FileUploadUrlResponse { upload_url: url }));
                     }
                 } else {
-                    return Err(AppError(
+                    return Err(AppError::new(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         anyhow!("Failed to generate upload URL"),
                     ));
                 }
             } else {
-                return Err(AppError(
+                return Err(AppError::new(
                     StatusCode::BAD_REQUEST,
                     anyhow!("Token is not a file token"),
                 ));
             }
         } else {
-            return Err(AppError(
+            return Err(AppError::auth(
                 StatusCode::UNAUTHORIZED,
                 anyhow!("No token provided"),
+                "missing_token",
             ));
         }
     } else {
         // No auth configured, anyone can upload
-        return Err(AppError(
+        return Err(AppError::auth(
             StatusCode::UNAUTHORIZED,
             anyhow!("Authentication is required for file operations"),
+            "no_authenticator",
         ));
     }
 }
@@ -1568,15 +1653,22 @@ async fn handle_file_download_url(
             // Verify the token and determine its type
             let permission = authenticator
                 .verify_token_auto(token, current_time_epoch_millis())
-                .map_err(|_| AppError(StatusCode::UNAUTHORIZED, anyhow!("Invalid token")))?;
+                .map_err(|_| {
+                    AppError::auth(
+                        StatusCode::UNAUTHORIZED,
+                        anyhow!("Invalid token"),
+                        "invalid_token",
+                    )
+                })?;
 
             match permission {
                 Permission::File(file_permission) => {
                     // Check if file token is for this doc_id
                     if file_permission.doc_id != doc_id {
-                        return Err(AppError(
+                        return Err(AppError::auth(
                             StatusCode::UNAUTHORIZED,
                             anyhow!("Token not valid for this document"),
+                            "access_wrong_document",
                         ));
                     }
 
@@ -1585,9 +1677,10 @@ async fn handle_file_download_url(
                         file_permission.authorization,
                         Authorization::ReadOnly | Authorization::Full
                     ) {
-                        return Err(AppError(
+                        return Err(AppError::auth(
                             StatusCode::FORBIDDEN,
                             anyhow!("Insufficient permissions to download file"),
+                            "insufficient_permissions",
                         ));
                     }
 
@@ -1595,7 +1688,7 @@ async fn handle_file_download_url(
 
                     // Validate the file hash
                     if !validate_file_hash(&file_hash) {
-                        return Err(AppError(
+                        return Err(AppError::new(
                             StatusCode::BAD_REQUEST,
                             anyhow!("Invalid file hash format in token"),
                         ));
@@ -1623,7 +1716,7 @@ async fn handle_file_download_url(
                     if let Some(hash) = query_hash {
                         // Validate the file hash from query parameter
                         if !validate_file_hash(&hash) {
-                            return Err(AppError(
+                            return Err(AppError::new(
                                 StatusCode::BAD_REQUEST,
                                 anyhow!("Invalid file hash format in query parameter"),
                             ));
@@ -1646,14 +1739,14 @@ async fn handle_file_download_url(
                         }
                         return Ok(Json(FileDownloadUrlResponse { download_url }));
                     } else {
-                        return Err(AppError(
+                        return Err(AppError::new(
                             StatusCode::BAD_REQUEST,
                             anyhow!("Hash query parameter required when using server token"),
                         ));
                     }
                 }
                 Permission::Doc(_) => {
-                    return Err(AppError(
+                    return Err(AppError::new(
                         StatusCode::BAD_REQUEST,
                         anyhow!("Document tokens cannot be used for file operations"),
                     ));
@@ -1661,9 +1754,10 @@ async fn handle_file_download_url(
                 Permission::Prefix(prefix_perm) => {
                     // Check if doc_id matches the prefix
                     if !doc_id.starts_with(&prefix_perm.prefix) {
-                        return Err(AppError(
+                        return Err(AppError::auth(
                             StatusCode::FORBIDDEN,
                             anyhow!("Token not valid for this document"),
+                            "prefix_mismatch",
                         ));
                     }
 
@@ -1672,9 +1766,10 @@ async fn handle_file_download_url(
                         prefix_perm.authorization,
                         Authorization::ReadOnly | Authorization::Full
                     ) {
-                        return Err(AppError(
+                        return Err(AppError::auth(
                             StatusCode::FORBIDDEN,
                             anyhow!("Insufficient permissions to download file"),
+                            "insufficient_permissions",
                         ));
                     }
 
@@ -1682,7 +1777,7 @@ async fn handle_file_download_url(
                     if let Some(hash) = query_hash {
                         // Validate the file hash from query parameter
                         if !validate_file_hash(&hash) {
-                            return Err(AppError(
+                            return Err(AppError::new(
                                 StatusCode::BAD_REQUEST,
                                 anyhow!("Invalid file hash format in query parameter"),
                             ));
@@ -1705,7 +1800,7 @@ async fn handle_file_download_url(
                         }
                         return Ok(Json(FileDownloadUrlResponse { download_url }));
                     } else {
-                        return Err(AppError(
+                        return Err(AppError::new(
                             StatusCode::BAD_REQUEST,
                             anyhow!("Hash query parameter required when using prefix token"),
                         ));
@@ -1713,16 +1808,18 @@ async fn handle_file_download_url(
                 }
             }
         } else {
-            return Err(AppError(
+            return Err(AppError::auth(
                 StatusCode::UNAUTHORIZED,
                 anyhow!("No token provided"),
+                "missing_token",
             ));
         }
     } else {
         // No auth configured
-        return Err(AppError(
+        return Err(AppError::auth(
             StatusCode::UNAUTHORIZED,
             anyhow!("Authentication is required for file operations"),
+            "no_authenticator",
         ));
     }
 }
@@ -1735,7 +1832,7 @@ async fn generate_file_download_url(
 ) -> Result<Json<FileDownloadUrlResponse>, AppError> {
     // Check if we have a store configured
     if server_state.store.is_none() {
-        return Err(AppError(
+        return Err(AppError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             anyhow!("No store configured for file downloads"),
         ));
@@ -1749,7 +1846,7 @@ async fn generate_file_download_url(
         .unwrap()
         .generate_download_url(&key)
         .await
-        .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
+        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
 
     if let Some(url) = download_url {
         // Check if this is a local endpoint (relative path) and convert to full URL
@@ -1764,7 +1861,10 @@ async fn generate_file_download_url(
             Ok(Json(FileDownloadUrlResponse { download_url: url }))
         }
     } else {
-        Err(AppError(StatusCode::NOT_FOUND, anyhow!("File not found")))
+        Err(AppError::new(
+            StatusCode::NOT_FOUND,
+            anyhow!("File not found"),
+        ))
     }
 }
 
@@ -1790,19 +1890,26 @@ async fn handle_file_delete(
             // Verify token is for this doc_id
             let auth = authenticator
                 .verify_file_token_for_doc(token, &doc_id, current_time_epoch_millis())
-                .map_err(|e| AppError(StatusCode::UNAUTHORIZED, anyhow!("Invalid token: {}", e)))?;
+                .map_err(|e| {
+                    AppError::auth(
+                        StatusCode::UNAUTHORIZED,
+                        anyhow!("Invalid token: {}", e),
+                        "invalid_token",
+                    )
+                })?;
 
             // Only Full permission can delete files
             if !matches!(auth, Authorization::Full) {
-                return Err(AppError(
+                return Err(AppError::auth(
                     StatusCode::FORBIDDEN,
                     anyhow!("Insufficient permissions to delete files"),
+                    "insufficient_permissions",
                 ));
             }
 
             // Check if we have a store configured
             if server_state.store.is_none() {
-                return Err(AppError(
+                return Err(AppError::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     anyhow!("No store configured for file operations"),
                 ));
@@ -1815,7 +1922,7 @@ async fn handle_file_delete(
             let file_infos = store
                 .list(&prefix)
                 .await
-                .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
+                .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
 
             if file_infos.is_empty() {
                 tracing::info!("No files to delete for document: {}", doc_id);
@@ -1836,16 +1943,18 @@ async fn handle_file_delete(
             tracing::info!("Deleted {} files for document: {}", deleted_count, doc_id);
             return Ok(StatusCode::NO_CONTENT);
         } else {
-            return Err(AppError(
+            return Err(AppError::auth(
                 StatusCode::UNAUTHORIZED,
                 anyhow!("No token provided"),
+                "missing_token",
             ));
         }
     } else {
         // No auth configured
-        return Err(AppError(
+        return Err(AppError::auth(
             StatusCode::UNAUTHORIZED,
             anyhow!("Authentication is required for file operations"),
+            "no_authenticator",
         ));
     }
 }
@@ -1873,19 +1982,26 @@ async fn handle_file_delete_by_hash(
             // Verify token is for this doc_id
             let auth = authenticator
                 .verify_file_token_for_doc(token, &doc_id, current_time_epoch_millis())
-                .map_err(|e| AppError(StatusCode::UNAUTHORIZED, anyhow!("Invalid token: {}", e)))?;
+                .map_err(|e| {
+                    AppError::auth(
+                        StatusCode::UNAUTHORIZED,
+                        anyhow!("Invalid token: {}", e),
+                        "invalid_token",
+                    )
+                })?;
 
             // Only Full permission can delete files
             if !matches!(auth, Authorization::Full) {
-                return Err(AppError(
+                return Err(AppError::auth(
                     StatusCode::FORBIDDEN,
                     anyhow!("Insufficient permissions to delete file"),
+                    "insufficient_permissions",
                 ));
             }
 
             // Validate the file hash format
             if !validate_file_hash(&file_hash) {
-                return Err(AppError(
+                return Err(AppError::new(
                     StatusCode::BAD_REQUEST,
                     anyhow!("Invalid file hash format"),
                 ));
@@ -1893,7 +2009,7 @@ async fn handle_file_delete_by_hash(
 
             // Check if we have a store configured
             if server_state.store.is_none() {
-                return Err(AppError(
+                return Err(AppError::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     anyhow!("No store configured for file operations"),
                 ));
@@ -1909,7 +2025,7 @@ async fn handle_file_delete_by_hash(
                 .unwrap()
                 .exists(&key)
                 .await
-                .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
+                .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
 
             if !exists {
                 // If the file is already gone, return 204 No Content since DELETE is idempotent
@@ -1924,21 +2040,23 @@ async fn handle_file_delete_by_hash(
                 .unwrap()
                 .remove(&key)
                 .await
-                .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
+                .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
 
             tracing::info!("Deleted file: {}/{}", doc_id, file_hash);
             return Ok(StatusCode::NO_CONTENT);
         } else {
-            return Err(AppError(
+            return Err(AppError::auth(
                 StatusCode::UNAUTHORIZED,
                 anyhow!("No token provided"),
+                "missing_token",
             ));
         }
     } else {
         // No auth configured
-        return Err(AppError(
+        return Err(AppError::auth(
             StatusCode::UNAUTHORIZED,
             anyhow!("Authentication is required for file operations"),
+            "no_authenticator",
         ));
     }
 }
@@ -1970,26 +2088,34 @@ async fn handle_file_history(
             // Verify token is for this doc_id - this now accepts both doc and file tokens
             let auth = authenticator
                 .verify_file_token_for_doc(token, &doc_id, current_time_epoch_millis())
-                .map_err(|e| AppError(StatusCode::UNAUTHORIZED, anyhow!("Invalid token: {}", e)))?;
+                .map_err(|e| {
+                    AppError::auth(
+                        StatusCode::UNAUTHORIZED,
+                        anyhow!("Invalid token: {}", e),
+                        "invalid_token",
+                    )
+                })?;
 
             // Both ReadOnly and Full can view file history
             if !matches!(auth, Authorization::ReadOnly | Authorization::Full) {
-                return Err(AppError(
+                return Err(AppError::auth(
                     StatusCode::FORBIDDEN,
                     anyhow!("Insufficient permissions to view file history"),
+                    "insufficient_permissions",
                 ));
             }
         } else {
-            return Err(AppError(
+            return Err(AppError::auth(
                 StatusCode::UNAUTHORIZED,
                 anyhow!("No token provided"),
+                "missing_token",
             ));
         }
     }
 
     // Check if we have a store configured
     if server_state.store.is_none() {
-        return Err(AppError(
+        return Err(AppError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             anyhow!("No store configured for file operations"),
         ));
@@ -2002,7 +2128,7 @@ async fn handle_file_history(
     let file_infos = store
         .list(&prefix)
         .await
-        .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
+        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
 
     // Convert the raw file info into the API response format
     let files = file_infos
@@ -2028,18 +2154,26 @@ async fn handle_doc_versions(
         if let Some(token) = token.as_deref() {
             let auth = authenticator
                 .verify_doc_token(token, &doc_id, current_time_epoch_millis())
-                .map_err(|e| AppError(StatusCode::UNAUTHORIZED, anyhow!("Invalid token: {}", e)))?;
+                .map_err(|e| {
+                    AppError::auth(
+                        StatusCode::UNAUTHORIZED,
+                        anyhow!("Invalid token: {}", e),
+                        "invalid_token",
+                    )
+                })?;
 
             if !matches!(auth, Authorization::ReadOnly | Authorization::Full) {
-                return Err(AppError(
+                return Err(AppError::auth(
                     StatusCode::FORBIDDEN,
                     anyhow!("Insufficient permissions to view document versions"),
+                    "insufficient_permissions",
                 ));
             }
         } else {
-            return Err(AppError(
+            return Err(AppError::auth(
                 StatusCode::UNAUTHORIZED,
                 anyhow!("No token provided"),
+                "missing_token",
             ));
         }
     }
@@ -2047,7 +2181,7 @@ async fn handle_doc_versions(
     let store = match &server_state.store {
         Some(s) => s,
         None => {
-            return Err(AppError(
+            return Err(AppError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 anyhow!("No store configured for operations"),
             ))
@@ -2058,7 +2192,7 @@ async fn handle_doc_versions(
     let versions = store
         .list_versions(&key)
         .await
-        .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
+        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
 
     let entries = versions
         .into_iter()
@@ -2086,27 +2220,40 @@ async fn handle_file_head(
             // Verify token is for this doc_id
             let auth = authenticator
                 .verify_file_token_for_doc(token, &doc_id, current_time_epoch_millis())
-                .map_err(|e| AppError(StatusCode::UNAUTHORIZED, anyhow!("Invalid token: {}", e)))?;
+                .map_err(|e| {
+                    AppError::auth(
+                        StatusCode::UNAUTHORIZED,
+                        anyhow!("Invalid token: {}", e),
+                        "invalid_token",
+                    )
+                })?;
 
             // Both ReadOnly and Full can check if a file exists
             if !matches!(auth, Authorization::ReadOnly | Authorization::Full) {
-                return Err(AppError(
+                return Err(AppError::auth(
                     StatusCode::FORBIDDEN,
                     anyhow!("Insufficient permissions to access file"),
+                    "insufficient_permissions",
                 ));
             }
 
             // Verify the token and get the file hash
             let permission = authenticator
                 .verify_token_auto(token, current_time_epoch_millis())
-                .map_err(|_| AppError(StatusCode::UNAUTHORIZED, anyhow!("Invalid token")))?;
+                .map_err(|_| {
+                    AppError::auth(
+                        StatusCode::UNAUTHORIZED,
+                        anyhow!("Invalid token"),
+                        "invalid_token",
+                    )
+                })?;
 
             if let Permission::File(file_permission) = permission {
                 let file_hash = file_permission.file_hash;
 
                 // Validate the file hash
                 if !validate_file_hash(&file_hash) {
-                    return Err(AppError(
+                    return Err(AppError::new(
                         StatusCode::BAD_REQUEST,
                         anyhow!("Invalid file hash format in token"),
                     ));
@@ -2114,7 +2261,7 @@ async fn handle_file_head(
 
                 // Check if we have a store configured
                 if server_state.store.is_none() {
-                    return Err(AppError(
+                    return Err(AppError::new(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         anyhow!("No store configured for file operations"),
                     ));
@@ -2130,32 +2277,37 @@ async fn handle_file_head(
                     .unwrap()
                     .exists(&key)
                     .await
-                    .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
+                    .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
 
                 if exists {
                     tracing::debug!("File exists: {}/{}", doc_id, file_hash);
                     return Ok(StatusCode::OK);
                 } else {
                     tracing::debug!("File not found: {}/{}", doc_id, file_hash);
-                    return Err(AppError(StatusCode::NOT_FOUND, anyhow!("File not found")));
+                    return Err(AppError::new(
+                        StatusCode::NOT_FOUND,
+                        anyhow!("File not found"),
+                    ));
                 }
             } else {
-                return Err(AppError(
+                return Err(AppError::new(
                     StatusCode::BAD_REQUEST,
                     anyhow!("Token is not a file token"),
                 ));
             }
         } else {
-            return Err(AppError(
+            return Err(AppError::auth(
                 StatusCode::UNAUTHORIZED,
                 anyhow!("No token provided"),
+                "missing_token",
             ));
         }
     } else {
         // No auth configured
-        return Err(AppError(
+        return Err(AppError::auth(
             StatusCode::UNAUTHORIZED,
             anyhow!("Authentication is required for file operations"),
+            "no_authenticator",
         ));
     }
 }
@@ -2173,11 +2325,18 @@ async fn reload_webhook_config_endpoint(
             // Verify this is a server admin token
             authenticator
                 .verify_server_token(token, current_time_epoch_millis())
-                .map_err(|e| AppError(StatusCode::UNAUTHORIZED, anyhow!("Invalid token: {}", e)))?;
+                .map_err(|e| {
+                    AppError::auth(
+                        StatusCode::UNAUTHORIZED,
+                        anyhow!("Invalid token: {}", e),
+                        "invalid_token",
+                    )
+                })?;
         } else {
-            return Err(AppError(
+            return Err(AppError::auth(
                 StatusCode::UNAUTHORIZED,
                 anyhow!("No token provided"),
+                "missing_token",
             ));
         }
     }
@@ -2190,7 +2349,7 @@ async fn reload_webhook_config_endpoint(
         }))),
         Err(e) => {
             tracing::error!("Failed to reload webhook config: {}", e);
-            Err(AppError(
+            Err(AppError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 anyhow!("Failed to reload webhook configuration: {}", e),
             ))
@@ -2442,7 +2601,7 @@ mod test {
             "HEAD request should fail for non-existent file"
         );
         match result {
-            Err(AppError(status, _)) => assert_eq!(status, StatusCode::NOT_FOUND),
+            Err(ref e) => assert_eq!(e.status, StatusCode::NOT_FOUND),
             _ => panic!("Expected NOT_FOUND status for non-existent file"),
         };
     }
@@ -2501,7 +2660,7 @@ mod test {
 
         assert!(result.is_err());
         match result {
-            Err(AppError(StatusCode::BAD_REQUEST, _)) => {} // Expected
+            Err(ref e) if e.status == StatusCode::BAD_REQUEST => {} // Expected
             _ => panic!("Expected BAD_REQUEST for unknown host"),
         }
     }
@@ -2824,9 +2983,10 @@ async fn handle_file_upload(
     if let Permission::File(file_permission) = permission {
         // Only allow Full permission to upload
         if !matches!(file_permission.authorization, Authorization::Full) {
-            return Err(AppError(
+            return Err(AppError::auth(
                 StatusCode::FORBIDDEN,
                 anyhow!("Insufficient permissions to upload files"),
+                "insufficient_permissions",
             ));
         }
 
@@ -2834,13 +2994,13 @@ async fn handle_file_upload(
         let field = multipart
             .next_field()
             .await
-            .map_err(|e| AppError(StatusCode::BAD_REQUEST, e.into()))?
-            .ok_or_else(|| AppError(StatusCode::BAD_REQUEST, anyhow!("No file provided")))?;
+            .map_err(|e| AppError::new(StatusCode::BAD_REQUEST, e.into()))?
+            .ok_or_else(|| AppError::new(StatusCode::BAD_REQUEST, anyhow!("No file provided")))?;
 
         // Validate content-type if specified in token
         if let Some(expected_type) = &file_permission.content_type {
             if field.content_type() != Some(expected_type) {
-                return Err(AppError(
+                return Err(AppError::new(
                     StatusCode::BAD_REQUEST,
                     anyhow!("Content-Type mismatch: expected {}", expected_type),
                 ));
@@ -2849,7 +3009,7 @@ async fn handle_file_upload(
 
         // Check if we have a store configured
         let store = server_state.store.as_ref().ok_or_else(|| {
-            AppError(
+            AppError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 anyhow!("No store configured for file uploads"),
             )
@@ -2860,7 +3020,7 @@ async fn handle_file_upload(
 
         // Create a temporary file for atomic writes
         let temp_file = NamedTempFile::new()
-            .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
+            .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
 
         let mut hasher = Sha256::new();
         let mut total_size = 0u64;
@@ -2869,7 +3029,7 @@ async fn handle_file_upload(
         // Stream chunks while validating
         let mut stream = field.into_stream();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| AppError(StatusCode::BAD_REQUEST, e.into()))?;
+            let chunk = chunk.map_err(|e| AppError::new(StatusCode::BAD_REQUEST, e.into()))?;
 
             // Update hash and size
             hasher.update(&chunk);
@@ -2878,7 +3038,7 @@ async fn handle_file_upload(
             // Early size validation
             if let Some(expected_length) = file_permission.content_length {
                 if total_size > expected_length {
-                    return Err(AppError(
+                    return Err(AppError::new(
                         StatusCode::PAYLOAD_TOO_LARGE,
                         anyhow!("File exceeds expected size"),
                     ));
@@ -2888,13 +3048,13 @@ async fn handle_file_upload(
             // Write to temp file
             file_writer
                 .write_all(&chunk)
-                .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
+                .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
         }
 
         // Final validations
         if let Some(expected_length) = file_permission.content_length {
             if total_size != expected_length {
-                return Err(AppError(
+                return Err(AppError::new(
                     StatusCode::BAD_REQUEST,
                     anyhow!(
                         "Content-Length mismatch: expected {}, got {}",
@@ -2907,7 +3067,7 @@ async fn handle_file_upload(
 
         let actual_hash = format!("{:x}", hasher.finalize());
         if actual_hash != file_permission.file_hash {
-            return Err(AppError(
+            return Err(AppError::new(
                 StatusCode::BAD_REQUEST,
                 anyhow!(
                     "File hash mismatch: expected {}, got {}",
@@ -2919,16 +3079,16 @@ async fn handle_file_upload(
 
         // Read the temp file contents and store using the store interface
         let file_contents = std::fs::read(temp_file.path())
-            .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
+            .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
 
         store
             .set(&key, file_contents)
             .await
-            .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
+            .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
 
         Ok(StatusCode::OK)
     } else {
-        Err(AppError(
+        Err(AppError::new(
             StatusCode::BAD_REQUEST,
             anyhow!("Invalid permission type"),
         ))
@@ -2948,15 +3108,16 @@ async fn handle_file_upload_raw(
     if let Permission::File(file_permission) = permission {
         // Only allow Full permission to upload
         if !matches!(file_permission.authorization, Authorization::Full) {
-            return Err(AppError(
+            return Err(AppError::auth(
                 StatusCode::FORBIDDEN,
                 anyhow!("Insufficient permissions to upload files"),
+                "insufficient_permissions",
             ));
         }
 
         // Check if we have a store configured
         let store = server_state.store.as_ref().ok_or_else(|| {
-            AppError(
+            AppError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 anyhow!("No store configured for file uploads"),
             )
@@ -2967,7 +3128,7 @@ async fn handle_file_upload_raw(
         // Validate content length if specified in token
         if let Some(expected_length) = file_permission.content_length {
             if body.len() as u64 != expected_length {
-                return Err(AppError(
+                return Err(AppError::new(
                     StatusCode::BAD_REQUEST,
                     anyhow!(
                         "Content-Length mismatch: expected {}, got {}",
@@ -2984,7 +3145,7 @@ async fn handle_file_upload_raw(
         let actual_hash = format!("{:x}", hasher.finalize());
 
         if actual_hash != file_permission.file_hash {
-            return Err(AppError(
+            return Err(AppError::new(
                 StatusCode::BAD_REQUEST,
                 anyhow!(
                     "File hash mismatch: expected {}, got {}",
@@ -2998,11 +3159,11 @@ async fn handle_file_upload_raw(
         store
             .set(&key, body.to_vec())
             .await
-            .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
+            .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
 
         Ok(StatusCode::OK)
     } else {
-        Err(AppError(
+        Err(AppError::new(
             StatusCode::BAD_REQUEST,
             anyhow!("Invalid permission type"),
         ))
@@ -3024,15 +3185,16 @@ async fn handle_file_download(
             file_permission.authorization,
             Authorization::ReadOnly | Authorization::Full
         ) {
-            return Err(AppError(
+            return Err(AppError::auth(
                 StatusCode::FORBIDDEN,
                 anyhow!("Insufficient permissions to download file"),
+                "insufficient_permissions",
             ));
         }
 
         // Verify the hash parameter matches the token
         if file_permission.file_hash != params.hash {
-            return Err(AppError(
+            return Err(AppError::new(
                 StatusCode::BAD_REQUEST,
                 anyhow!("Hash parameter does not match token"),
             ));
@@ -3040,7 +3202,7 @@ async fn handle_file_download(
 
         // Check if we have a store configured
         let store = server_state.store.as_ref().ok_or_else(|| {
-            AppError(
+            AppError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 anyhow!("No store configured for file downloads"),
             )
@@ -3051,8 +3213,8 @@ async fn handle_file_download(
         let file_data = store
             .get(&key)
             .await
-            .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
-            .ok_or_else(|| AppError(StatusCode::NOT_FOUND, anyhow!("File not found")))?;
+            .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
+            .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, anyhow!("File not found")))?;
 
         // Stream response
         let content_type = file_permission
@@ -3064,9 +3226,9 @@ async fn handle_file_download(
             .header("content-type", content_type)
             .header("content-length", file_data.len())
             .body(axum::body::Body::from(file_data))
-            .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?)
+            .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?)
     } else {
-        Err(AppError(
+        Err(AppError::new(
             StatusCode::BAD_REQUEST,
             anyhow!("Invalid permission type"),
         ))
