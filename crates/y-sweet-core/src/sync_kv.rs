@@ -184,6 +184,10 @@ impl SyncKv {
     }
 
     pub async fn persist(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if !self.dirty.swap(false, Ordering::Relaxed) {
+            return Ok(());
+        }
+
         if let Some(store) = &self.store {
             let now = current_timestamp_ms();
 
@@ -205,9 +209,12 @@ impl SyncKv {
             };
 
             tracing::info!(size=?snapshot.len(), "Persisting CBOR snapshot");
-            store.set(&self.key, snapshot).await?;
+            if let Err(e) = store.set(&self.key, snapshot).await {
+                // Re-mark as dirty so the next cycle retries.
+                self.dirty.store(true, Ordering::Relaxed);
+                return Err(e.into());
+            }
         }
-        self.dirty.store(false, Ordering::Relaxed);
         Ok(())
     }
 
