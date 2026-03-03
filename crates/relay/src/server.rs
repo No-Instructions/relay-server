@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use axum::{
     body::Bytes,
+    extract::DefaultBodyLimit,
     extract::{
         multipart::Multipart,
         ws::{CloseFrame, Message, WebSocket},
@@ -695,12 +696,14 @@ impl Server {
 
             // Only add direct upload/download endpoints if store supports direct uploads
             if store.supports_direct_uploads() {
-                router = router
+                let upload_routes = Router::new()
                     .route(
                         "/f/:doc_id/upload",
                         post(handle_file_upload).put(handle_file_upload_raw),
                     )
-                    .route("/f/:doc_id/download", get(handle_file_download));
+                    .route("/f/:doc_id/download", get(handle_file_download))
+                    .layer(DefaultBodyLimit::max(250 * 1024 * 1024));
+                router = router.merge(upload_routes);
             }
         }
 
