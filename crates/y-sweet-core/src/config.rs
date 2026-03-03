@@ -121,6 +121,7 @@ static ENV_OVERRIDES: &[EnvOverride] = &[
         config_path: "auth",
         apply: |config, value| {
             let key_id = std::env::var("RELAY_SERVER_KEY_ID").ok();
+            let (key, allowed_token_types) = parse_auth_env_value(value)?;
             let has_private_key = config
                 .auth
                 .iter()
@@ -128,20 +129,13 @@ static ENV_OVERRIDES: &[EnvOverride] = &[
 
             if has_private_key {
                 config.auth.retain(|config| config.private_key.is_none());
-                config.auth.push(AuthKeyConfig {
-                    key_id,
-                    private_key: Some(value.to_string()),
-                    public_key: None,
-                    allowed_token_types: default_allowed_token_types(),
-                });
-            } else {
-                config.auth.push(AuthKeyConfig {
-                    key_id,
-                    private_key: Some(value.to_string()),
-                    public_key: None,
-                    allowed_token_types: default_allowed_token_types(),
-                });
             }
+            config.auth.push(AuthKeyConfig {
+                key_id,
+                private_key: Some(key),
+                public_key: None,
+                allowed_token_types,
+            });
             Ok(())
         },
     },
@@ -342,6 +336,53 @@ pub enum TokenType {
 
 fn default_allowed_token_types() -> Vec<TokenType> {
     vec![TokenType::Document, TokenType::File]
+}
+
+fn all_token_types() -> Vec<TokenType> {
+    vec![
+        TokenType::Document,
+        TokenType::File,
+        TokenType::Server,
+        TokenType::Prefix,
+    ]
+}
+
+/// Parse a `RELAY_SERVER_AUTH` value which may include a scope suffix.
+///
+/// Format: `<base64_key>` or `<base64_key>:<scope>`
+///
+/// Where `<scope>` is a comma-separated list of token types (e.g. `server,document,file`).
+/// The scope `server` implies all token types.
+///
+/// If no scope is provided, falls back to `default_allowed_token_types()`.
+fn parse_auth_env_value(value: &str) -> Result<(String, Vec<TokenType>), ConfigError> {
+    match value.rsplit_once(':') {
+        Some((key, scope)) if !scope.is_empty() => {
+            let mut token_types = Vec::new();
+            for s in scope.split(',') {
+                match s.trim() {
+                    "server" => token_types.push(TokenType::Server),
+                    "document" => token_types.push(TokenType::Document),
+                    "file" => token_types.push(TokenType::File),
+                    "prefix" => token_types.push(TokenType::Prefix),
+                    other => {
+                        return Err(ConfigError::InvalidConfiguration(format!(
+                            "Unknown token type '{}' in RELAY_SERVER_AUTH scope. Valid types: server, document, file, prefix",
+                            other
+                        )));
+                    }
+                }
+            }
+
+            if token_types.contains(&TokenType::Server) {
+                // server implies all token types
+                Ok((key.to_string(), all_token_types()))
+            } else {
+                Ok((key.to_string(), token_types))
+            }
+        }
+        _ => Ok((value.to_string(), default_allowed_token_types())),
+    }
 }
 
 impl TokenType {
@@ -1130,5 +1171,48 @@ public_key = "test-public-key"
 
         // Clean up
         std::fs::remove_file(&config_path).ok();
+    }
+
+    #[test]
+    fn test_parse_auth_env_value_no_scope() {
+        let (key, types) = parse_auth_env_value("abc123base64key").unwrap();
+        assert_eq!(key, "abc123base64key");
+        assert_eq!(types, default_allowed_token_types());
+    }
+
+    #[test]
+    fn test_parse_auth_env_value_server_scope() {
+        let (key, types) = parse_auth_env_value("abc123base64key:server").unwrap();
+        assert_eq!(key, "abc123base64key");
+        assert_eq!(types, all_token_types());
+    }
+
+    #[test]
+    fn test_parse_auth_env_value_server_implies_all() {
+        // server,document should still expand to all types
+        let (key, types) = parse_auth_env_value("abc123base64key:server,document").unwrap();
+        assert_eq!(key, "abc123base64key");
+        assert_eq!(types, all_token_types());
+    }
+
+    #[test]
+    fn test_parse_auth_env_value_document_file() {
+        let (key, types) = parse_auth_env_value("abc123base64key:document,file").unwrap();
+        assert_eq!(key, "abc123base64key");
+        assert_eq!(types, vec![TokenType::Document, TokenType::File]);
+    }
+
+    #[test]
+    fn test_parse_auth_env_value_unrecognized_scope() {
+        let result = parse_auth_env_value("abc123base64key:garbage");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_auth_env_value_base64_with_equals() {
+        // Base64 padding doesn't contain colons, so this should parse as no scope
+        let (key, types) = parse_auth_env_value("abc123base64key==").unwrap();
+        assert_eq!(key, "abc123base64key==");
+        assert_eq!(types, default_allowed_token_types());
     }
 }
