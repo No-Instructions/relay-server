@@ -305,10 +305,12 @@ fn get_store_from_config(
                     .or_else(|| env::var("AWS_SECRET_ACCESS_KEY").ok())
                     .ok_or_else(|| anyhow::anyhow!("AWS_SECRET_ACCESS_KEY is required"))?,
                 token: env::var("AWS_SESSION_TOKEN").ok(),
-                endpoint: if s3_config.endpoint.is_empty() {
-                    format!("https://s3.dualstack.{}.amazonaws.com", s3_config.region)
-                } else {
+                endpoint: if !s3_config.endpoint.is_empty() {
                     s3_config.endpoint.clone()
+                } else if let Ok(ep) = env::var("AWS_ENDPOINT_URL_S3") {
+                    ep
+                } else {
+                    format!("https://s3.dualstack.{}.amazonaws.com", s3_config.region)
                 },
                 region: s3_config.region.clone(),
                 bucket: s3_config.bucket.clone(),
@@ -346,10 +348,12 @@ fn get_store_from_config(
                     .or_else(|| env::var("AWS_SECRET_ACCESS_KEY").ok())
                     .ok_or_else(|| anyhow::anyhow!("AWS_SECRET_ACCESS_KEY is required"))?,
                 token: env::var("AWS_SESSION_TOKEN").ok(),
-                endpoint: if s3_config.endpoint.is_empty() {
-                    format!("https://s3.dualstack.{}.amazonaws.com", s3_config.region)
-                } else {
+                endpoint: if !s3_config.endpoint.is_empty() {
                     s3_config.endpoint.clone()
+                } else if let Ok(ep) = env::var("AWS_ENDPOINT_URL_S3") {
+                    ep
+                } else {
+                    format!("https://s3.dualstack.{}.amazonaws.com", s3_config.region)
                 },
                 region: s3_config.region.clone(),
                 bucket: s3_config.bucket.clone(),
