@@ -298,11 +298,13 @@ pub struct WebhookPayload {
 
 impl From<EventEnvelope> for WebhookPayload {
     fn from(envelope: EventEnvelope) -> Self {
+        let mut payload = serde_json::to_value(envelope.event)
+            .expect("DocumentUpdatedEvent should always serialize");
+        payload["timestamp"] = serde_json::Value::String(envelope.timestamp.to_rfc3339());
         WebhookPayload {
             event_type: envelope.event_type,
             event_id: envelope.event_id,
-            payload: serde_json::to_value(envelope.event)
-                .expect("DocumentUpdatedEvent should always serialize"),
+            payload,
         }
     }
 }
