@@ -482,6 +482,18 @@ impl Server {
                     if checkpoints_without_refs >= 2 {
                         tracing::info!("GCing doc");
                         if let Some(doc) = docs.get(&doc_id) {
+                            // Compact PUD before shutdown: dedup ids, clear ds.
+                            // The mutations create tombstones which yrs GC will
+                            // clean up, and the update observer marks SyncKv
+                            // dirty so the compacted state gets persisted.
+                            let result = doc.compact_user_data();
+                            if !result.is_empty() {
+                                tracing::debug!(
+                                    ids_removed = result.ids_removed,
+                                    ds_removed = result.ds_removed,
+                                    "Compacted PermanentUserData"
+                                );
+                            }
                             doc.sync_kv().shutdown();
                         }
                         docs.remove(&doc_id);

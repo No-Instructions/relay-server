@@ -1,6 +1,6 @@
 use crate::{
-    doc_connection::DOC_NAME, event::DocumentUpdatedEvent, store::Store,
-    sync::awareness::Awareness, sync_kv::SyncKv, webhook::WebhookCallback,
+    doc_connection::DOC_NAME, event::DocumentUpdatedEvent, permanent_user_data::CompactionResult,
+    store::Store, sync::awareness::Awareness, sync_kv::SyncKv, webhook::WebhookCallback,
 };
 use anyhow::{anyhow, Context, Result};
 use std::sync::{Arc, RwLock};
@@ -117,5 +117,15 @@ impl DocWithSyncKv {
                 None
             }
         })
+    }
+
+    /// Compact the "users" PermanentUserData map: deduplicate ids, clear ds.
+    ///
+    /// The mutations trigger the update observer, which marks SyncKv dirty so
+    /// the compacted state will be persisted on the next flush.
+    pub fn compact_user_data(&self) -> CompactionResult {
+        let awareness_guard = self.awareness.read().unwrap();
+        let doc = &awareness_guard.doc;
+        crate::permanent_user_data::compact_user_data(doc)
     }
 }
