@@ -246,20 +246,24 @@ impl S3Store {
             return Ok(());
         }
 
-        let action = self.bucket.head_bucket(Some(&self.credentials));
-        let result = self.store_request(Method::HEAD, action, None).await;
+        // Use ListObjectsV2 with max-keys=0 so that prefix-scoped IAM
+        // policies (s3:ListBucket with s3:prefix condition) are sufficient.
+        let mut action = self.bucket.list_objects_v2(Some(&self.credentials));
+        action.with_max_keys(0);
+        if let Some(prefix) = &self.prefix {
+            action.with_prefix(prefix.as_str());
+        }
+        let result = self.store_request(Method::GET, action, None).await;
 
         match result {
-            // Normally a 404 indicates that we are attempting to fetch an object that does
-            // not exist, but we have only attempted to retrieve a bucket, so here it
-            // indicates that the bucket does not exist.
             Err(StoreError::DoesNotExist(_)) => {
                 return Err(StoreError::BucketDoesNotExist(
-                    "Bucket does not exist.".to_string(),
+                    "Bucket does not exist or not accessible with the configured prefix."
+                        .to_string(),
                 ))
             }
             Err(e) => return Err(e),
-            Ok(response) => response,
+            Ok(_) => {}
         };
 
         self._bucket_checked.set(()).unwrap();
