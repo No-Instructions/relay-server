@@ -215,6 +215,10 @@ pub const MSG_EVENT: u8 = 4;
 pub const MSG_EVENT_SUBSCRIBE: u8 = 5;
 /// Tag id for [Message::EventUnsubscribe].
 pub const MSG_EVENT_UNSUBSCRIBE: u8 = 6;
+/// Tag id for [Message::QuerySubdocs].
+pub const MSG_QUERY_SUBDOCS: u8 = 7;
+/// Tag id for [Message::Subdocs].
+pub const MSG_SUBDOCS: u8 = 8;
 
 pub const PERMISSION_DENIED: u8 = 0;
 pub const PERMISSION_GRANTED: u8 = 1;
@@ -228,6 +232,8 @@ pub enum Message {
     Event(Vec<u8>),                // CBOR-encoded EventMessage
     EventSubscribe(Vec<String>),   // List of event types to subscribe to
     EventUnsubscribe(Vec<String>), // List of event types to unsubscribe from
+    QuerySubdocs,                  // Client → server: request subdoc state vector index
+    Subdocs(Vec<u8>),              // Server → client: CBOR map of {doc_id: state_vector_bytes}
     Custom(u8, Vec<u8>),
 }
 
@@ -271,6 +277,13 @@ impl Encode for Message {
                 for event_type in event_types {
                     encoder.write_string(event_type);
                 }
+            }
+            Message::QuerySubdocs => {
+                encoder.write_var(MSG_QUERY_SUBDOCS);
+            }
+            Message::Subdocs(cbor_data) => {
+                encoder.write_var(MSG_SUBDOCS);
+                encoder.write_buf(cbor_data);
             }
             Message::Custom(tag, data) => {
                 encoder.write_u8(*tag);
@@ -323,6 +336,11 @@ impl Decode for Message {
                     event_types.push(event_type);
                 }
                 Ok(Message::EventUnsubscribe(event_types))
+            }
+            MSG_QUERY_SUBDOCS => Ok(Message::QuerySubdocs),
+            MSG_SUBDOCS => {
+                let data = decoder.read_buf()?;
+                Ok(Message::Subdocs(data.to_vec()))
             }
             tag => {
                 let data = decoder.read_buf()?;
@@ -768,6 +786,8 @@ mod test {
         assert_eq!(MSG_EVENT, 4);
         assert_eq!(MSG_EVENT_SUBSCRIBE, 5);
         assert_eq!(MSG_EVENT_UNSUBSCRIBE, 6);
+        assert_eq!(super::MSG_QUERY_SUBDOCS, 7);
+        assert_eq!(super::MSG_SUBDOCS, 8);
     }
 
     #[test]
@@ -810,6 +830,8 @@ mod test {
                 "user.joined".to_string(),
             ]),
             Message::EventUnsubscribe(vec!["user.left".to_string()]),
+            Message::QuerySubdocs,
+            Message::Subdocs(vec![0xa0]), // empty CBOR map
             Message::Custom(100, vec![1, 2, 3, 4]),
         ];
 
@@ -818,6 +840,46 @@ mod test {
             let decoded = Message::decode_v1(&encoded)
                 .unwrap_or_else(|_| panic!("failed to decode {:?}", msg));
             assert_eq!(decoded, msg);
+        }
+    }
+
+    #[test]
+    fn test_query_subdocs_message_encoding() {
+        let msg = Message::QuerySubdocs;
+        let encoded = msg.encode_v1();
+        let decoded = Message::decode_v1(&encoded).unwrap();
+        assert_eq!(decoded, Message::QuerySubdocs);
+    }
+
+    #[test]
+    fn test_subdocs_message_encoding() {
+        // Build a CBOR map with subdoc state vectors
+        let cbor_map = ciborium::value::Value::Map(vec![
+            (
+                ciborium::value::Value::Text("subdoc-abc".to_string()),
+                ciborium::value::Value::Bytes(vec![1, 2, 3, 4]),
+            ),
+            (
+                ciborium::value::Value::Text("subdoc-def".to_string()),
+                ciborium::value::Value::Bytes(vec![5, 6, 7, 8]),
+            ),
+        ]);
+        let mut cbor_bytes = Vec::new();
+        ciborium::ser::into_writer(&cbor_map, &mut cbor_bytes).unwrap();
+
+        let msg = Message::Subdocs(cbor_bytes.clone());
+        let encoded = msg.encode_v1();
+        let decoded = Message::decode_v1(&encoded).unwrap();
+
+        if let Message::Subdocs(decoded_cbor) = decoded {
+            assert_eq!(decoded_cbor, cbor_bytes);
+
+            // Verify CBOR can be deserialized back
+            let decoded_map: ciborium::value::Value =
+                ciborium::de::from_reader(&decoded_cbor[..]).unwrap();
+            assert_eq!(decoded_map, cbor_map);
+        } else {
+            panic!("Expected Subdocs message");
         }
     }
 }

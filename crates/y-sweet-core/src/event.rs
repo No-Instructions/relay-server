@@ -85,6 +85,8 @@ pub struct DocumentUpdatedEvent {
     pub metadata: BTreeMap<String, serde_json::Value>,
     #[serde(skip)] // Don't serialize the raw update data to JSON
     pub update: Option<Vec<u8>>,
+    #[serde(skip)] // Internal use only: encoded state vector after this update
+    pub state_vector: Option<Vec<u8>>,
 }
 
 impl DocumentUpdatedEvent {
@@ -95,6 +97,7 @@ impl DocumentUpdatedEvent {
             user: None,
             metadata: BTreeMap::new(),
             update: None,
+            state_vector: None,
         }
     }
 
@@ -107,6 +110,12 @@ impl DocumentUpdatedEvent {
     /// Builder method to add Yjs update data
     pub fn with_update(mut self, update: Vec<u8>) -> Self {
         self.update = Some(update);
+        self
+    }
+
+    /// Builder method to add encoded state vector
+    pub fn with_state_vector(mut self, state_vector: Vec<u8>) -> Self {
+        self.state_vector = Some(state_vector);
         self
     }
 

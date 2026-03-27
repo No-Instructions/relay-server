@@ -344,8 +344,12 @@ impl Server {
         Ok(())
     }
 
-    pub async fn load_doc(&self, doc_id: &str, routing_channel: Option<String>) -> Result<()> {
-        self.load_doc_with_user(doc_id, routing_channel, None).await
+    pub fn load_doc<'a>(
+        &'a self,
+        doc_id: &'a str,
+        routing_channel: Option<String>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(self.load_doc_with_user(doc_id, routing_channel, None))
     }
 
     pub async fn load_doc_with_user(
@@ -362,17 +366,48 @@ impl Server {
             .clone()
             .unwrap_or_else(|| doc_id.to_string());
 
+        // If this doc routes to a different channel (i.e., it's a subdoc),
+        // ensure the parent is loaded and hold a reference to prevent GC.
+        let parent_awareness_guard = if routing_channel_name != doc_id {
+            if !self.docs.contains_key(&routing_channel_name) {
+                self.load_doc(&routing_channel_name, None).await?;
+            }
+            self.docs
+                .get(&routing_channel_name)
+                .map(|parent| parent.awareness())
+        } else {
+            None
+        };
+
         // Create event callback with the determined routing channel and user
         let event_callback = {
             let event_dispatcher = self.event_dispatcher.clone();
             let routing_channel_for_callback = routing_channel_name.clone();
             let user_for_callback = user.clone();
+            let docs = self.docs.clone();
+            let doc_id_for_callback = doc_id.to_string();
+            // Capture parent awareness to keep it alive (prevents GC while subdoc exists)
+            let _parent_awareness = parent_awareness_guard;
 
             if let Some(dispatcher) = event_dispatcher {
                 Some(Arc::new(move |mut event: DocumentUpdatedEvent| {
+                    // Keep parent awareness alive by referencing it in the closure
+                    let _ = &_parent_awareness;
                     // Add user to event if available
                     if let Some(ref user) = user_for_callback {
                         event.user = Some(user.clone());
+                    }
+
+                    // Update parent's subdoc state vector index
+                    if routing_channel_for_callback != doc_id_for_callback {
+                        if let Some(state_vector) = &event.state_vector {
+                            if let Some(parent) = docs.get(&routing_channel_for_callback) {
+                                parent.update_subdoc_state_vector(
+                                    &doc_id_for_callback,
+                                    state_vector.clone(),
+                                );
+                            }
+                        }
                     }
 
                     // Log the full event payload as JSON after user assignment
@@ -991,6 +1026,7 @@ async fn handle_socket_upgrade_with_channel_and_user(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let awareness = dwskv.awareness();
+    let sync_kv = dwskv.sync_kv();
     let cancellation_token = server_state.cancellation_token.clone();
     let sync_protocol_event_sender = server_state.sync_protocol_event_sender.clone();
     let metrics = server_state.metrics.clone();
@@ -1000,6 +1036,7 @@ async fn handle_socket_upgrade_with_channel_and_user(
         handle_socket(
             socket,
             awareness,
+            sync_kv,
             authorization,
             expiration_time,
             cancellation_token,
@@ -1172,6 +1209,7 @@ async fn handle_socket_upgrade_single(
 async fn handle_socket(
     socket: WebSocket,
     awareness: Arc<RwLock<Awareness>>,
+    sync_kv: Arc<SyncKv>,
     authorization: Authorization,
     expiration_time: Option<u64>,
     cancellation_token: CancellationToken,
@@ -1189,7 +1227,7 @@ async fn handle_socket(
     });
 
     let send_clone = send.clone();
-    let connection = Arc::new(DocConnection::new_with_expiration(
+    let mut conn = DocConnection::new_with_expiration(
         awareness,
         authorization,
         expiration_time,
@@ -1198,7 +1236,9 @@ async fn handle_socket(
                 tracing::warn!(?e, "Error sending message");
             }
         },
-    ));
+    );
+    conn.set_sync_kv(sync_kv);
+    let connection = Arc::new(conn);
 
     // Register the connection with the sync protocol event sender
     sync_protocol_event_sender.register_doc_connection(doc_id.clone(), Arc::downgrade(&connection));

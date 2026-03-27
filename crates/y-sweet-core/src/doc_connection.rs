@@ -3,6 +3,7 @@ use crate::sync::{
     self, awareness::Awareness, DefaultProtocol, EventMessage, Message, Protocol, SyncMessage,
     MSG_SYNC, MSG_SYNC_UPDATE,
 };
+use crate::sync_kv::SyncKv;
 use std::collections::HashSet;
 use std::sync::{Arc, OnceLock, RwLock};
 use yrs::{
@@ -52,6 +53,9 @@ pub struct DocConnection {
     /// Expiration time for the authentication token in milliseconds since epoch.
     /// If None, the token never expires.
     expiration_time: Option<u64>,
+
+    /// Optional reference to the document's SyncKv for reading subdoc state vectors
+    sync_kv: Option<Arc<SyncKv>>,
 }
 
 impl DocConnection {
@@ -198,7 +202,13 @@ impl DocConnection {
             closed,
             event_subscriptions: Arc::new(RwLock::new(HashSet::new())),
             expiration_time,
+            sync_kv: None,
         }
+    }
+
+    /// Set the SyncKv reference for subdoc state vector queries
+    pub fn set_sync_kv(&mut self, sync_kv: Arc<SyncKv>) {
+        self.sync_kv = Some(sync_kv);
     }
 
     /// Check if the token associated with this connection has expired
@@ -320,6 +330,30 @@ impl DocConnection {
                 } else {
                     tracing::warn!("Failed to acquire event subscriptions lock for unsubscribe");
                 }
+                Ok(None)
+            }
+            Message::QuerySubdocs => {
+                let sv_value = self
+                    .sync_kv
+                    .as_ref()
+                    .and_then(|kv| kv.get_metadata())
+                    .and_then(|m| m.get("subdoc_state_vectors").cloned())
+                    .unwrap_or_else(|| ciborium::value::Value::Map(Vec::new()));
+
+                let mut cbor_bytes = Vec::new();
+                ciborium::ser::into_writer(&sv_value, &mut cbor_bytes).unwrap_or_else(|_| {
+                    cbor_bytes.clear();
+                    ciborium::ser::into_writer(
+                        &ciborium::value::Value::Map(Vec::new()),
+                        &mut cbor_bytes,
+                    )
+                    .unwrap();
+                });
+                Ok(Some(Message::Subdocs(cbor_bytes)))
+            }
+            Message::Subdocs(_) => {
+                // Server shouldn't receive Subdocs from clients
+                tracing::warn!("Client sent Subdocs message to server, ignoring");
                 Ok(None)
             }
             Message::Event(_event_data) => {

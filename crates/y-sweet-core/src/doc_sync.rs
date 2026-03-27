@@ -4,7 +4,10 @@ use crate::{
 };
 use anyhow::{anyhow, Context, Result};
 use std::sync::{Arc, RwLock};
-use yrs::{updates::decoder::Decode, Doc, ReadTxn, StateVector, Subscription, Transact, Update};
+use yrs::{
+    updates::decoder::Decode, updates::encoder::Encode, Doc, ReadTxn, StateVector, Subscription,
+    Transact, Update,
+};
 use yrs_kvstore::DocOps;
 
 pub struct DocWithSyncKv {
@@ -50,7 +53,7 @@ impl DocWithSyncKv {
             let sync_kv = sync_kv.clone();
             let webhook_callback = webhook_callback.clone();
             let doc_key = key.to_string();
-            doc.observe_update_v1(move |_, event| {
+            doc.observe_update_v1(move |txn, event| {
                 sync_kv.push_update(DOC_NAME, &event.update).unwrap();
                 sync_kv
                     .flush_doc_with(DOC_NAME, Default::default())
@@ -58,10 +61,14 @@ impl DocWithSyncKv {
 
                 // Trigger webhook if callback is configured
                 if let Some(ref callback) = webhook_callback {
-                    // Create the event payload with business data, metadata, and update
+                    // Extract state vector from the transaction (post-update)
+                    let sv = txn.state_vector().encode_v1();
+
+                    // Create the event payload with business data, metadata, update, and state vector
                     let event = DocumentUpdatedEvent::new(doc_key.clone())
                         .with_metadata(&sync_kv)
-                        .with_update(event.update.to_vec());
+                        .with_update(event.update.to_vec())
+                        .with_state_vector(sv);
 
                     // Callback handles envelope creation and dispatch
                     callback(event);
@@ -127,5 +134,158 @@ impl DocWithSyncKv {
         let awareness_guard = self.awareness.read().unwrap();
         let doc = &awareness_guard.doc;
         crate::permanent_user_data::compact_user_data(doc)
+    }
+
+    /// Update the state vector for a subdocument in this document's metadata index.
+    pub fn update_subdoc_state_vector(&self, subdoc_id: &str, encoded_sv: Vec<u8>) {
+        let mut metadata = self.sync_kv.get_metadata().unwrap_or_default();
+
+        let sv_map = metadata
+            .entry("subdoc_state_vectors".to_string())
+            .or_insert_with(|| ciborium::value::Value::Map(Vec::new()));
+
+        if let ciborium::value::Value::Map(ref mut entries) = sv_map {
+            let key = ciborium::value::Value::Text(subdoc_id.to_string());
+            let value = ciborium::value::Value::Bytes(encoded_sv);
+
+            if let Some(entry) = entries.iter_mut().find(|(k, _)| *k == key) {
+                entry.1 = value;
+            } else {
+                entries.push((key, value));
+            }
+        }
+
+        self.sync_kv.set_metadata(metadata);
+    }
+
+    /// Get the subdocument state vector index from metadata.
+    pub fn get_subdoc_state_vectors(&self) -> Option<Vec<(String, Vec<u8>)>> {
+        let metadata = self.sync_kv.get_metadata()?;
+        let sv_map = metadata.get("subdoc_state_vectors")?;
+
+        if let ciborium::value::Value::Map(entries) = sv_map {
+            let mut result = Vec::new();
+            for (k, v) in entries {
+                if let (
+                    ciborium::value::Value::Text(doc_id),
+                    ciborium::value::Value::Bytes(sv_bytes),
+                ) = (k, v)
+                {
+                    result.push((doc_id.clone(), sv_bytes.clone()));
+                }
+            }
+            Some(result)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Store;
+    use async_trait::async_trait;
+    use dashmap::DashMap;
+
+    #[derive(Default, Clone)]
+    struct MemoryStore {
+        data: Arc<DashMap<String, Vec<u8>>>,
+    }
+
+    #[cfg_attr(not(feature = "single-threaded"), async_trait)]
+    #[cfg_attr(feature = "single-threaded", async_trait(?Send))]
+    impl Store for MemoryStore {
+        async fn init(&self) -> crate::store::Result<()> {
+            Ok(())
+        }
+        async fn get(&self, key: &str) -> crate::store::Result<Option<Vec<u8>>> {
+            Ok(self.data.get(key).map(|v| v.clone()))
+        }
+        async fn set(&self, key: &str, value: Vec<u8>) -> crate::store::Result<()> {
+            self.data.insert(key.to_owned(), value);
+            Ok(())
+        }
+        async fn remove(&self, key: &str) -> crate::store::Result<()> {
+            self.data.remove(key);
+            Ok(())
+        }
+        async fn exists(&self, key: &str) -> crate::store::Result<bool> {
+            Ok(self.data.contains_key(key))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_subdoc_state_vector_roundtrip() {
+        let store = MemoryStore::default();
+        let dwskv = DocWithSyncKv::new("parent_doc", Some(Arc::new(Box::new(store))), || (), None)
+            .await
+            .unwrap();
+
+        // Initially no subdoc state vectors
+        assert!(dwskv.get_subdoc_state_vectors().is_none());
+
+        // Add a subdoc state vector
+        dwskv.update_subdoc_state_vector("subdoc-abc", vec![1, 2, 3, 4]);
+
+        let svs = dwskv.get_subdoc_state_vectors().unwrap();
+        assert_eq!(svs.len(), 1);
+        assert_eq!(svs[0], ("subdoc-abc".to_string(), vec![1, 2, 3, 4]));
+
+        // Add another subdoc
+        dwskv.update_subdoc_state_vector("subdoc-def", vec![5, 6, 7, 8]);
+
+        let svs = dwskv.get_subdoc_state_vectors().unwrap();
+        assert_eq!(svs.len(), 2);
+
+        // Update existing subdoc — should replace, not duplicate
+        dwskv.update_subdoc_state_vector("subdoc-abc", vec![10, 20, 30]);
+
+        let svs = dwskv.get_subdoc_state_vectors().unwrap();
+        assert_eq!(svs.len(), 2);
+        let abc = svs.iter().find(|(id, _)| id == "subdoc-abc").unwrap();
+        assert_eq!(abc.1, vec![10, 20, 30]);
+    }
+
+    #[tokio::test]
+    async fn test_subdoc_state_vectors_persist() {
+        let store = MemoryStore::default();
+
+        // Create parent, add subdoc state vectors, persist
+        {
+            let dwskv = DocWithSyncKv::new(
+                "parent_doc",
+                Some(Arc::new(Box::new(store.clone()))),
+                || (),
+                None,
+            )
+            .await
+            .unwrap();
+
+            dwskv.update_subdoc_state_vector("subdoc-1", vec![1, 2, 3]);
+            dwskv.update_subdoc_state_vector("subdoc-2", vec![4, 5, 6]);
+            dwskv.sync_kv().persist().await.unwrap();
+        }
+
+        // Reload and verify state vectors survived
+        {
+            let dwskv = DocWithSyncKv::new(
+                "parent_doc",
+                Some(Arc::new(Box::new(store.clone()))),
+                || (),
+                None,
+            )
+            .await
+            .unwrap();
+
+            let svs = dwskv.get_subdoc_state_vectors().unwrap();
+            assert_eq!(svs.len(), 2);
+
+            let s1 = svs.iter().find(|(id, _)| id == "subdoc-1").unwrap();
+            assert_eq!(s1.1, vec![1, 2, 3]);
+
+            let s2 = svs.iter().find(|(id, _)| id == "subdoc-2").unwrap();
+            assert_eq!(s2.1, vec![4, 5, 6]);
+        }
     }
 }
