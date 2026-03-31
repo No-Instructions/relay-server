@@ -332,7 +332,7 @@ impl DocConnection {
                 }
                 Ok(None)
             }
-            Message::QuerySubdocs => {
+            Message::QuerySubdocs(guids) => {
                 let sv_value = self
                     .sync_kv
                     .as_ref()
@@ -340,8 +340,30 @@ impl DocConnection {
                     .and_then(|m| m.get("subdoc_state_vectors").cloned())
                     .unwrap_or_else(|| ciborium::value::Value::Map(Vec::new()));
 
+                let filtered = if guids.is_empty() {
+                    sv_value
+                } else {
+                    let guids_set: std::collections::HashSet<&str> =
+                        guids.iter().map(|s| s.as_str()).collect();
+                    if let ciborium::value::Value::Map(entries) = sv_value {
+                        let filtered_entries: Vec<_> = entries
+                            .into_iter()
+                            .filter(|(k, _)| {
+                                if let ciborium::value::Value::Text(key) = k {
+                                    guids_set.contains(key.as_str())
+                                } else {
+                                    false
+                                }
+                            })
+                            .collect();
+                        ciborium::value::Value::Map(filtered_entries)
+                    } else {
+                        ciborium::value::Value::Map(Vec::new())
+                    }
+                };
+
                 let mut cbor_bytes = Vec::new();
-                ciborium::ser::into_writer(&sv_value, &mut cbor_bytes).unwrap_or_else(|_| {
+                ciborium::ser::into_writer(&filtered, &mut cbor_bytes).unwrap_or_else(|_| {
                     cbor_bytes.clear();
                     ciborium::ser::into_writer(
                         &ciborium::value::Value::Map(Vec::new()),

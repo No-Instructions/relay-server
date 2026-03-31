@@ -232,8 +232,8 @@ pub enum Message {
     Event(Vec<u8>),                // CBOR-encoded EventMessage
     EventSubscribe(Vec<String>),   // List of event types to subscribe to
     EventUnsubscribe(Vec<String>), // List of event types to unsubscribe from
-    QuerySubdocs,                  // Client → server: request subdoc state vector index
-    Subdocs(Vec<u8>),              // Server → client: CBOR map of {doc_id: state_vector_bytes}
+    QuerySubdocs(Vec<String>), // Client → server: request subdoc state vectors for given guids (empty = all)
+    Subdocs(Vec<u8>),          // Server → client: CBOR map of {doc_id: state_vector_bytes}
     Custom(u8, Vec<u8>),
 }
 
@@ -278,8 +278,12 @@ impl Encode for Message {
                     encoder.write_string(event_type);
                 }
             }
-            Message::QuerySubdocs => {
+            Message::QuerySubdocs(guids) => {
                 encoder.write_var(MSG_QUERY_SUBDOCS);
+                encoder.write_var(guids.len());
+                for guid in guids {
+                    encoder.write_string(guid);
+                }
             }
             Message::Subdocs(cbor_data) => {
                 encoder.write_var(MSG_SUBDOCS);
@@ -337,7 +341,14 @@ impl Decode for Message {
                 }
                 Ok(Message::EventUnsubscribe(event_types))
             }
-            MSG_QUERY_SUBDOCS => Ok(Message::QuerySubdocs),
+            MSG_QUERY_SUBDOCS => {
+                let count: u64 = decoder.read_var()?;
+                let mut guids = Vec::with_capacity(count as usize);
+                for _ in 0..count {
+                    guids.push(decoder.read_string()?.to_string());
+                }
+                Ok(Message::QuerySubdocs(guids))
+            }
             MSG_SUBDOCS => {
                 let data = decoder.read_buf()?;
                 Ok(Message::Subdocs(data.to_vec()))
@@ -830,7 +841,8 @@ mod test {
                 "user.joined".to_string(),
             ]),
             Message::EventUnsubscribe(vec!["user.left".to_string()]),
-            Message::QuerySubdocs,
+            Message::QuerySubdocs(vec![]),
+            Message::QuerySubdocs(vec!["subdoc-abc".to_string(), "subdoc-def".to_string()]),
             Message::Subdocs(vec![0xa0]), // empty CBOR map
             Message::Custom(100, vec![1, 2, 3, 4]),
         ];
@@ -844,11 +856,20 @@ mod test {
     }
 
     #[test]
-    fn test_query_subdocs_message_encoding() {
-        let msg = Message::QuerySubdocs;
+    fn test_query_subdocs_message_encoding_empty() {
+        let msg = Message::QuerySubdocs(vec![]);
         let encoded = msg.encode_v1();
         let decoded = Message::decode_v1(&encoded).unwrap();
-        assert_eq!(decoded, Message::QuerySubdocs);
+        assert_eq!(decoded, Message::QuerySubdocs(vec![]));
+    }
+
+    #[test]
+    fn test_query_subdocs_message_encoding_with_guids() {
+        let guids = vec!["subdoc-abc".to_string(), "subdoc-def".to_string()];
+        let msg = Message::QuerySubdocs(guids.clone());
+        let encoded = msg.encode_v1();
+        let decoded = Message::decode_v1(&encoded).unwrap();
+        assert_eq!(decoded, Message::QuerySubdocs(guids));
     }
 
     #[test]
