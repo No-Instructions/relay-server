@@ -333,20 +333,21 @@ impl DocConnection {
                 Ok(None)
             }
             Message::QuerySubdocs(guids) => {
-                let sv_value = self
+                let subdocs_value = self
                     .sync_kv
                     .as_ref()
                     .and_then(|kv| kv.get_metadata())
-                    .and_then(|m| m.get("subdoc_state_vectors").cloned())
+                    .and_then(|m| m.get("subdocs").cloned())
                     .unwrap_or_else(|| ciborium::value::Value::Map(Vec::new()));
 
-                let filtered = if guids.is_empty() {
-                    sv_value
-                } else {
-                    let guids_set: std::collections::HashSet<&str> =
-                        guids.iter().map(|s| s.as_str()).collect();
-                    if let ciborium::value::Value::Map(entries) = sv_value {
-                        let filtered_entries: Vec<_> = entries
+                // Filter to requested GUIDs (empty = all)
+                let entries = if let ciborium::value::Value::Map(entries) = subdocs_value {
+                    if guids.is_empty() {
+                        entries
+                    } else {
+                        let guids_set: std::collections::HashSet<&str> =
+                            guids.iter().map(|s| s.as_str()).collect();
+                        entries
                             .into_iter()
                             .filter(|(k, _)| {
                                 if let ciborium::value::Value::Text(key) = k {
@@ -355,15 +356,68 @@ impl DocConnection {
                                     false
                                 }
                             })
-                            .collect();
-                        ciborium::value::Value::Map(filtered_entries)
-                    } else {
-                        ciborium::value::Value::Map(Vec::new())
+                            .collect()
                     }
+                } else {
+                    Vec::new()
                 };
 
+                // Build response: {guid: state_vector_bytes, ...}
+                let mut response_entries = Vec::new();
+                for (k, v) in &entries {
+                    if let ciborium::value::Value::Map(fields) = v {
+                        for (fk, fv) in fields {
+                            if let (
+                                ciborium::value::Value::Text(fname),
+                                ciborium::value::Value::Bytes(_),
+                            ) = (fk, fv)
+                            {
+                                if fname == "state_vector" {
+                                    response_entries.push((k.clone(), fv.clone()));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Update last-seen timestamps for queried GUIDs
+                if !guids.is_empty() {
+                    if let Some(kv) = self.sync_kv.as_ref() {
+                        let now = current_time_epoch_millis();
+                        let now_val = ciborium::value::Value::Integer(now.into());
+                        let mut metadata = kv.get_metadata().unwrap_or_default();
+                        let subdocs = metadata
+                            .entry("subdocs".to_string())
+                            .or_insert_with(|| ciborium::value::Value::Map(Vec::new()));
+
+                        if let ciborium::value::Value::Map(ref mut all_entries) = subdocs {
+                            for guid in &guids {
+                                let key = ciborium::value::Value::Text(guid.clone());
+                                if let Some((_, ref mut entry_val)) =
+                                    all_entries.iter_mut().find(|(k, _)| *k == key)
+                                {
+                                    if let ciborium::value::Value::Map(ref mut fields) = entry_val {
+                                        let ls_key =
+                                            ciborium::value::Value::Text("last_seen".to_string());
+                                        if let Some(field) =
+                                            fields.iter_mut().find(|(k, _)| *k == ls_key)
+                                        {
+                                            field.1 = now_val.clone();
+                                        } else {
+                                            fields.push((ls_key, now_val.clone()));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        kv.set_metadata(metadata);
+                    }
+                }
+
+                let response = ciborium::value::Value::Map(response_entries);
                 let mut cbor_bytes = Vec::new();
-                ciborium::ser::into_writer(&filtered, &mut cbor_bytes).unwrap_or_else(|_| {
+                ciborium::ser::into_writer(&response, &mut cbor_bytes).unwrap_or_else(|_| {
                     cbor_bytes.clear();
                     ciborium::ser::into_writer(
                         &ciborium::value::Value::Map(Vec::new()),

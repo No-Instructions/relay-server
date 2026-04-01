@@ -628,7 +628,7 @@ impl DebouncedSyncProtocolEventSender {
     }
 
     pub async fn queue_event(&self, envelope: EventEnvelope) {
-        let doc_id = &envelope.channel;
+        let doc_id = &envelope.event.doc_id;
 
         // Extract user from event
         let user = envelope.event.user.as_deref();

@@ -137,21 +137,36 @@ impl DocWithSyncKv {
     }
 
     /// Update the state vector for a subdocument in this document's metadata index.
+    /// Also seeds the last-seen timestamp so new entries aren't immediately eligible for GC.
     pub fn update_subdoc_state_vector(&self, subdoc_id: &str, encoded_sv: Vec<u8>) {
         let mut metadata = self.sync_kv.get_metadata().unwrap_or_default();
 
-        let sv_map = metadata
-            .entry("subdoc_state_vectors".to_string())
+        let subdocs = metadata
+            .entry("subdocs".to_string())
             .or_insert_with(|| ciborium::value::Value::Map(Vec::new()));
 
-        if let ciborium::value::Value::Map(ref mut entries) = sv_map {
-            let key = ciborium::value::Value::Text(subdoc_id.to_string());
-            let value = ciborium::value::Value::Bytes(encoded_sv);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
 
+        let entry_value = ciborium::value::Value::Map(vec![
+            (
+                ciborium::value::Value::Text("state_vector".to_string()),
+                ciborium::value::Value::Bytes(encoded_sv),
+            ),
+            (
+                ciborium::value::Value::Text("last_seen".to_string()),
+                ciborium::value::Value::Integer(now.into()),
+            ),
+        ]);
+
+        if let ciborium::value::Value::Map(ref mut entries) = subdocs {
+            let key = ciborium::value::Value::Text(subdoc_id.to_string());
             if let Some(entry) = entries.iter_mut().find(|(k, _)| *k == key) {
-                entry.1 = value;
+                entry.1 = entry_value;
             } else {
-                entries.push((key, value));
+                entries.push((key, entry_value));
             }
         }
 
@@ -161,17 +176,25 @@ impl DocWithSyncKv {
     /// Get the subdocument state vector index from metadata.
     pub fn get_subdoc_state_vectors(&self) -> Option<Vec<(String, Vec<u8>)>> {
         let metadata = self.sync_kv.get_metadata()?;
-        let sv_map = metadata.get("subdoc_state_vectors")?;
+        let subdocs = metadata.get("subdocs")?;
 
-        if let ciborium::value::Value::Map(entries) = sv_map {
+        if let ciborium::value::Value::Map(entries) = subdocs {
             let mut result = Vec::new();
             for (k, v) in entries {
-                if let (
-                    ciborium::value::Value::Text(doc_id),
-                    ciborium::value::Value::Bytes(sv_bytes),
-                ) = (k, v)
-                {
-                    result.push((doc_id.clone(), sv_bytes.clone()));
+                if let ciborium::value::Value::Text(doc_id) = k {
+                    if let ciborium::value::Value::Map(fields) = v {
+                        for (fk, fv) in fields {
+                            if let (
+                                ciborium::value::Value::Text(fname),
+                                ciborium::value::Value::Bytes(sv_bytes),
+                            ) = (fk, fv)
+                            {
+                                if fname == "state_vector" {
+                                    result.push((doc_id.clone(), sv_bytes.clone()));
+                                }
+                            }
+                        }
+                    }
                 }
             }
             Some(result)
@@ -286,6 +309,71 @@ mod tests {
 
             let s2 = svs.iter().find(|(id, _)| id == "subdoc-2").unwrap();
             assert_eq!(s2.1, vec![4, 5, 6]);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_subdoc_last_seen_seeded_on_update() {
+        let store = MemoryStore::default();
+        let dwskv = DocWithSyncKv::new("parent_doc", Some(Arc::new(Box::new(store))), || (), None)
+            .await
+            .unwrap();
+
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        dwskv.update_subdoc_state_vector("subdoc-abc", vec![1, 2, 3]);
+
+        let metadata = dwskv.sync_kv().get_metadata().unwrap();
+        let subdocs = metadata.get("subdocs").unwrap();
+        if let ciborium::value::Value::Map(entries) = subdocs {
+            assert_eq!(entries.len(), 1);
+            let (k, v) = &entries[0];
+            assert_eq!(*k, ciborium::value::Value::Text("subdoc-abc".to_string()));
+            if let ciborium::value::Value::Map(fields) = v {
+                // Check state_vector
+                let sv = fields
+                    .iter()
+                    .find(|(k, _)| *k == ciborium::value::Value::Text("state_vector".to_string()))
+                    .unwrap();
+                assert_eq!(sv.1, ciborium::value::Value::Bytes(vec![1, 2, 3]));
+                // Check last_seen
+                let ls = fields
+                    .iter()
+                    .find(|(k, _)| *k == ciborium::value::Value::Text("last_seen".to_string()))
+                    .unwrap();
+                if let ciborium::value::Value::Integer(ts) = &ls.1 {
+                    let ts: u64 = (*ts).try_into().unwrap();
+                    assert!(ts >= before);
+                } else {
+                    panic!("Expected Integer timestamp");
+                }
+            } else {
+                panic!("Expected Map for subdoc entry");
+            }
+        } else {
+            panic!("Expected Map for subdocs");
+        }
+
+        // Second update should refresh the timestamp, not duplicate the entry
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        dwskv.update_subdoc_state_vector("subdoc-abc", vec![4, 5, 6]);
+
+        let metadata = dwskv.sync_kv().get_metadata().unwrap();
+        let subdocs = metadata.get("subdocs").unwrap();
+        if let ciborium::value::Value::Map(entries) = subdocs {
+            assert_eq!(entries.len(), 1);
+            if let ciborium::value::Value::Map(fields) = &entries[0].1 {
+                let sv = fields
+                    .iter()
+                    .find(|(k, _)| *k == ciborium::value::Value::Text("state_vector".to_string()))
+                    .unwrap();
+                assert_eq!(sv.1, ciborium::value::Value::Bytes(vec![4, 5, 6]));
+            }
+        } else {
+            panic!("Expected Map");
         }
     }
 }
