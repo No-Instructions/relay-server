@@ -3180,60 +3180,91 @@ async fn handle_file_download(
 ) -> Result<Response, AppError> {
     tracing::info!(doc_id = %doc_id, hash = %params.hash, "Handling file download");
 
-    let permission = validate_file_token(&server_state, &params.token, &doc_id)?;
+    let authenticator = server_state.authenticator.as_ref().ok_or_else(|| {
+        AppError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            anyhow!("No authenticator configured"),
+        )
+    })?;
 
-    if let Permission::File(file_permission) = permission {
-        // Both ReadOnly and Full can download files
-        if !matches!(
-            file_permission.authorization,
-            Authorization::ReadOnly | Authorization::Full
-        ) {
-            return Err(AppError::auth(
-                StatusCode::FORBIDDEN,
-                anyhow!("Insufficient permissions to download file"),
-                "insufficient_permissions",
-            ));
-        }
-
-        // Verify the hash parameter matches the token
-        if file_permission.file_hash != params.hash {
-            return Err(AppError::new(
-                StatusCode::BAD_REQUEST,
-                anyhow!("Hash parameter does not match token"),
-            ));
-        }
-
-        // Check if we have a store configured
-        let store = server_state.store.as_ref().ok_or_else(|| {
-            AppError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                anyhow!("No store configured for file downloads"),
+    let permission = authenticator
+        .verify_token_auto(&params.token, current_time_epoch_millis())
+        .map_err(|auth_error| {
+            AppError::auth(
+                StatusCode::UNAUTHORIZED,
+                anyhow!("Invalid token"),
+                auth_error.to_metric_label(),
             )
         })?;
 
-        // Retrieve file
-        let key = format!("files/{}/{}", doc_id, file_permission.file_hash);
-        let file_data = store
-            .get(&key)
-            .await
-            .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
-            .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, anyhow!("File not found")))?;
+    let (file_hash, content_type) = match permission {
+        Permission::File(ref file_permission) => {
+            if file_permission.doc_id != doc_id {
+                return Err(AppError::auth(
+                    StatusCode::UNAUTHORIZED,
+                    anyhow!("Token not valid for this document"),
+                    "access_wrong_document",
+                ));
+            }
+            if !matches!(
+                file_permission.authorization,
+                Authorization::ReadOnly | Authorization::Full
+            ) {
+                return Err(AppError::auth(
+                    StatusCode::FORBIDDEN,
+                    anyhow!("Insufficient permissions to download file"),
+                    "insufficient_permissions",
+                ));
+            }
+            if file_permission.file_hash != params.hash {
+                return Err(AppError::new(
+                    StatusCode::BAD_REQUEST,
+                    anyhow!("Hash parameter does not match token"),
+                ));
+            }
+            (
+                file_permission.file_hash.clone(),
+                file_permission
+                    .content_type
+                    .clone()
+                    .unwrap_or_else(|| "application/octet-stream".to_string()),
+            )
+        }
+        Permission::Server => {
+            if !validate_file_hash(&params.hash) {
+                return Err(AppError::new(
+                    StatusCode::BAD_REQUEST,
+                    anyhow!("Invalid file hash format"),
+                ));
+            }
+            (params.hash.clone(), "application/octet-stream".to_string())
+        }
+        _ => {
+            return Err(AppError::new(
+                StatusCode::BAD_REQUEST,
+                anyhow!("Token must be a file token or server token"),
+            ));
+        }
+    };
 
-        // Stream response
-        let content_type = file_permission
-            .content_type
-            .unwrap_or_else(|| "application/octet-stream".to_string());
+    let store = server_state.store.as_ref().ok_or_else(|| {
+        AppError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            anyhow!("No store configured for file downloads"),
+        )
+    })?;
 
-        Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header("content-type", content_type)
-            .header("content-length", file_data.len())
-            .body(axum::body::Body::from(file_data))
-            .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?)
-    } else {
-        Err(AppError::new(
-            StatusCode::BAD_REQUEST,
-            anyhow!("Invalid permission type"),
-        ))
-    }
+    let key = format!("files/{}/{}", doc_id, file_hash);
+    let file_data = store
+        .get(&key)
+        .await
+        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
+        .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, anyhow!("File not found")))?;
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", content_type)
+        .header("content-length", file_data.len())
+        .body(axum::body::Body::from(file_data))
+        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?)
 }
