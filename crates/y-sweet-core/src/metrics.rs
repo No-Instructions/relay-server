@@ -21,6 +21,9 @@ pub struct RelayMetrics {
 
     // Authentication & security metrics
     pub http_auth_errors_total: CounterVec,
+
+    // Object store metrics
+    pub s3_requests_total: CounterVec,
 }
 
 static RELAY_METRICS: OnceLock<Result<Arc<RelayMetrics>, prometheus::Error>> = OnceLock::new();
@@ -154,6 +157,16 @@ impl RelayMetrics {
         )?;
         registry.register(Box::new(http_auth_errors_total.clone()))?;
 
+        // Object store metrics
+        let s3_requests_total = CounterVec::new(
+            Opts::new(
+                "relay_server_s3_requests_total",
+                "Total S3-compatible object store requests, labeled by HTTP method and outcome",
+            ),
+            &["method", "outcome"],
+        )?;
+        registry.register(Box::new(s3_requests_total.clone()))?;
+
         Ok(Arc::new(Self {
             webhook_requests_total,
             webhook_request_duration_seconds,
@@ -168,6 +181,7 @@ impl RelayMetrics {
             sync_protocol_subscriptions_by_channel,
             debounced_queue_length,
             http_auth_errors_total,
+            s3_requests_total,
         }))
     }
 
@@ -258,6 +272,12 @@ impl RelayMetrics {
     ) {
         self.http_auth_errors_total
             .with_label_values(&[error_type, status_code, path, method])
+            .inc();
+    }
+
+    pub fn record_s3_request(&self, method: &str, outcome: &str) {
+        self.s3_requests_total
+            .with_label_values(&[method, outcome])
             .inc();
     }
 }
