@@ -1021,6 +1021,7 @@ async fn handle_socket_upgrade_with_channel_and_user(
         None
     };
 
+    let user_for_pud = user.clone();
     let dwskv = server_state
         .get_or_create_doc_with_channel_and_user(&doc_id, routing_channel, user)
         .await
@@ -1039,6 +1040,7 @@ async fn handle_socket_upgrade_with_channel_and_user(
             sync_kv,
             authorization,
             expiration_time,
+            user_for_pud,
             cancellation_token,
             sync_protocol_event_sender,
             doc_id_clone,
@@ -1212,6 +1214,7 @@ async fn handle_socket(
     sync_kv: Arc<SyncKv>,
     authorization: Authorization,
     expiration_time: Option<u64>,
+    user: Option<String>,
     cancellation_token: CancellationToken,
     sync_protocol_event_sender: Arc<SyncProtocolEventSender>,
     doc_id: String,
@@ -1238,6 +1241,9 @@ async fn handle_socket(
         },
     );
     conn.set_sync_kv(sync_kv);
+    if let Some(user) = user {
+        conn.set_user(user);
+    }
     let connection = Arc::new(conn);
 
     // Register the connection with the sync protocol event sender

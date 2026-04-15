@@ -5,8 +5,8 @@ use crate::{
 use anyhow::{anyhow, Context, Result};
 use std::sync::{Arc, RwLock};
 use yrs::{
-    updates::decoder::Decode, updates::encoder::Encode, Doc, ReadTxn, StateVector, Subscription,
-    Transact, Update,
+    updates::decoder::Decode, updates::encoder::Encode, Array, Doc, Map, Out, ReadTxn, StateVector,
+    Subscription, Transact, Update,
 };
 use yrs_kvstore::DocOps;
 
@@ -134,6 +134,64 @@ impl DocWithSyncKv {
         let awareness_guard = self.awareness.read().unwrap();
         let doc = &awareness_guard.doc;
         crate::permanent_user_data::compact_user_data(doc)
+    }
+
+    /// Register a client_id under the given user in the "users" PermanentUserData map.
+    /// This is a no-op if the client_id is already registered for that user.
+    /// Returns true if a new registration was written.
+    pub fn register_client_id(&self, user_id: &str, client_id: u64) -> bool {
+        let awareness_guard = self.awareness.read().unwrap();
+        let doc = &awareness_guard.doc;
+
+        // get_or_insert_map takes a write txn internally, call before any read txn.
+        let users_map = doc.get_or_insert_map("users");
+
+        // Check if already registered under a read txn.
+        {
+            let txn = doc.transact();
+            if let Some(Out::YMap(user_map)) = users_map.get(&txn, user_id) {
+                if let Some(Out::YArray(ids_arr)) = user_map.get(&txn, "ids") {
+                    for item in ids_arr.iter(&txn) {
+                        let existing_id = match &item {
+                            Out::Any(yrs::Any::Number(n)) => Some(*n as u64),
+                            Out::Any(yrs::Any::BigInt(n)) => Some(*n as u64),
+                            _ => None,
+                        };
+                        if existing_id == Some(client_id) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        // Read txn dropped before taking a write txn.
+
+        let mut txn = doc.transact_mut();
+
+        // Get or create the user entry.
+        let user_map = match users_map.get(&txn, user_id) {
+            Some(Out::YMap(m)) => m,
+            _ => users_map.insert(&mut txn, user_id, yrs::MapPrelim::default()),
+        };
+
+        // Get or create the ids array.
+        let ids_arr = match user_map.get(&txn, "ids") {
+            Some(Out::YArray(a)) => a,
+            _ => user_map.insert(&mut txn, "ids", yrs::ArrayPrelim::default()),
+        };
+
+        // Ensure `ds` exists as an empty YArray so canonical Yjs PUD readers don't crash.
+        if !matches!(user_map.get(&txn, "ds"), Some(Out::YArray(_))) {
+            user_map.insert(&mut txn, "ds", yrs::ArrayPrelim::default());
+        }
+
+        ids_arr.push_back(&mut txn, yrs::Any::Number(client_id as f64));
+        tracing::info!(
+            user_id,
+            client_id,
+            "Registered client_id for user via server-driven PUD"
+        );
+        true
     }
 
     /// Update the state vector for a subdocument in this document's metadata index.
@@ -374,6 +432,90 @@ mod tests {
             }
         } else {
             panic!("Expected Map");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_register_client_id_basic() {
+        let store = MemoryStore::default();
+        let dwskv = DocWithSyncKv::new("test_doc", Some(Arc::new(Box::new(store))), || (), None)
+            .await
+            .unwrap();
+
+        // First registration should return true.
+        assert!(dwskv.register_client_id("alice", 12345));
+
+        // Duplicate registration should return false.
+        assert!(!dwskv.register_client_id("alice", 12345));
+
+        // Different client_id for same user should return true.
+        assert!(dwskv.register_client_id("alice", 67890));
+
+        // Verify the "users" map structure via a read txn.
+        let awareness = dwskv.awareness();
+        let awareness_guard = awareness.read().unwrap();
+        let doc = &awareness_guard.doc;
+        let users_map = doc.get_or_insert_map("users");
+        let txn = doc.transact();
+
+        let alice = users_map.get(&txn, "alice").unwrap();
+        if let Out::YMap(user_map) = alice {
+            let ids = user_map.get(&txn, "ids").unwrap();
+            if let Out::YArray(ids_arr) = ids {
+                let items: Vec<i64> = ids_arr
+                    .iter(&txn)
+                    .filter_map(|item| match item {
+                        Out::Any(yrs::Any::Number(n)) => Some(n as i64),
+                        Out::Any(yrs::Any::BigInt(n)) => Some(n),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(items, vec![12345i64, 67890i64]);
+            } else {
+                panic!("Expected YArray for ids");
+            }
+        } else {
+            panic!("Expected YMap for user entry");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_register_client_id_multiple_users() {
+        let store = MemoryStore::default();
+        let dwskv = DocWithSyncKv::new("test_doc", Some(Arc::new(Box::new(store))), || (), None)
+            .await
+            .unwrap();
+
+        assert!(dwskv.register_client_id("alice", 111));
+        assert!(dwskv.register_client_id("bob", 222));
+        assert!(dwskv.register_client_id("alice", 333));
+
+        let awareness = dwskv.awareness();
+        let awareness_guard = awareness.read().unwrap();
+        let doc = &awareness_guard.doc;
+        let users_map = doc.get_or_insert_map("users");
+        let txn = doc.transact();
+
+        // Alice should have 2 client_ids.
+        if let Some(Out::YMap(alice_map)) = users_map.get(&txn, "alice") {
+            if let Some(Out::YArray(ids)) = alice_map.get(&txn, "ids") {
+                assert_eq!(ids.len(&txn), 2);
+            } else {
+                panic!("Expected ids array for alice");
+            }
+        } else {
+            panic!("Expected user map for alice");
+        }
+
+        // Bob should have 1 client_id.
+        if let Some(Out::YMap(bob_map)) = users_map.get(&txn, "bob") {
+            if let Some(Out::YArray(ids)) = bob_map.get(&txn, "ids") {
+                assert_eq!(ids.len(&txn), 1);
+            } else {
+                panic!("Expected ids array for bob");
+            }
+        } else {
+            panic!("Expected user map for bob");
         }
     }
 }

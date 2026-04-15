@@ -13,7 +13,7 @@ use yrs::{
         decoder::Decode,
         encoder::{Encode, Encoder, EncoderV1},
     },
-    ReadTxn, Subscription, Transact, Update,
+    Array, Map, Out, ReadTxn, Subscription, Transact, Update,
 };
 
 fn current_time_epoch_millis() -> u64 {
@@ -56,6 +56,10 @@ pub struct DocConnection {
 
     /// Optional reference to the document's SyncKv for reading subdoc state vectors
     sync_kv: Option<Arc<SyncKv>>,
+
+    /// Authenticated user identity from the connection token.
+    /// When set, the server will register new client_ids under this user in the "users" map.
+    user: Option<String>,
 }
 
 impl DocConnection {
@@ -203,12 +207,113 @@ impl DocConnection {
             event_subscriptions: Arc::new(RwLock::new(HashSet::new())),
             expiration_time,
             sync_kv: None,
+            user: None,
         }
     }
 
     /// Set the SyncKv reference for subdoc state vector queries
     pub fn set_sync_kv(&mut self, sync_kv: Arc<SyncKv>) {
         self.sync_kv = Some(sync_kv);
+    }
+
+    /// Set the authenticated user identity for server-driven PUD registration.
+    pub fn set_user(&mut self, user: String) {
+        self.user = Some(user);
+    }
+
+    /// Snapshot the current state vector's client_ids (for before/after comparison).
+    fn snapshot_sv(&self, awareness: &Awareness) -> std::collections::HashSet<ClientID> {
+        let txn = awareness.doc().transact();
+        txn.state_vector()
+            .iter()
+            .map(|(&cid, &_clock)| cid)
+            .collect()
+    }
+
+    /// After applying an update, register any client_ids that are new in the state vector.
+    /// The caller must already hold the awareness lock — pass the guard directly.
+    fn register_new_client_ids(
+        &self,
+        awareness: &Awareness,
+        sv_before: &std::collections::HashSet<ClientID>,
+    ) {
+        let user_id = match &self.user {
+            Some(u) => u,
+            None => return,
+        };
+
+        let sv_after = awareness.doc().transact().state_vector();
+
+        let new_ids: Vec<ClientID> = sv_after
+            .iter()
+            .filter_map(|(&cid, &_clock)| {
+                if !sv_before.contains(&cid) {
+                    Some(cid)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if new_ids.is_empty() {
+            return;
+        }
+
+        let doc = awareness.doc();
+
+        for client_id in new_ids {
+            Self::register_pud_client_id_on_doc(doc, user_id, client_id);
+        }
+    }
+
+    /// Register a client_id in the "users" PermanentUserData map on the document.
+    /// Takes a Doc reference directly to avoid re-locking awareness.
+    fn register_pud_client_id_on_doc(doc: &yrs::Doc, user_id: &str, client_id: ClientID) {
+        // get_or_insert_map takes a write txn internally, call before any read txn.
+        let users_map = doc.get_or_insert_map("users");
+
+        // Check if already registered.
+        {
+            let txn = doc.transact();
+            if let Some(Out::YMap(user_map)) = users_map.get(&txn, user_id) {
+                if let Some(Out::YArray(ids_arr)) = user_map.get(&txn, "ids") {
+                    for item in ids_arr.iter(&txn) {
+                        let existing_id = match &item {
+                            Out::Any(yrs::Any::Number(n)) => Some(*n as u64),
+                            Out::Any(yrs::Any::BigInt(n)) => Some(*n as u64),
+                            _ => None,
+                        };
+                        if existing_id == Some(client_id) {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut txn = doc.transact_mut();
+
+        let user_map = match users_map.get(&txn, user_id) {
+            Some(Out::YMap(m)) => m,
+            _ => users_map.insert(&mut txn, user_id, yrs::MapPrelim::default()),
+        };
+
+        let ids_arr = match user_map.get(&txn, "ids") {
+            Some(Out::YArray(a)) => a,
+            _ => user_map.insert(&mut txn, "ids", yrs::ArrayPrelim::default()),
+        };
+
+        // Ensure `ds` exists as an empty YArray so canonical Yjs PUD readers don't crash.
+        if !matches!(user_map.get(&txn, "ds"), Some(Out::YArray(_))) {
+            user_map.insert(&mut txn, "ds", yrs::ArrayPrelim::default());
+        }
+
+        ids_arr.push_back(&mut txn, yrs::Any::Number(client_id as f64));
+        tracing::info!(
+            user_id,
+            client_id,
+            "Registered client_id for user via server-driven PUD"
+        );
     }
 
     /// Check if the token associated with this connection has expired
@@ -262,7 +367,13 @@ impl DocConnection {
                 SyncMessage::SyncStep2(update) => {
                     if can_write {
                         let mut awareness = a.write().unwrap();
-                        protocol.handle_sync_step2(&mut awareness, Update::decode_v1(&update)?)
+                        let sv_before = self.snapshot_sv(&awareness);
+                        let result =
+                            protocol.handle_sync_step2(&mut awareness, Update::decode_v1(&update)?);
+                        if result.is_ok() {
+                            self.register_new_client_ids(&awareness, &sv_before);
+                        }
+                        result
                     } else {
                         Err(sync::Error::PermissionDenied {
                             reason: "Token does not have write access".to_string(),
@@ -272,7 +383,13 @@ impl DocConnection {
                 SyncMessage::Update(update) => {
                     if can_write {
                         let mut awareness = a.write().unwrap();
-                        protocol.handle_update(&mut awareness, Update::decode_v1(&update)?)
+                        let sv_before = self.snapshot_sv(&awareness);
+                        let result =
+                            protocol.handle_update(&mut awareness, Update::decode_v1(&update)?);
+                        if result.is_ok() {
+                            self.register_new_client_ids(&awareness, &sv_before);
+                        }
+                        result
                     } else {
                         Err(sync::Error::PermissionDenied {
                             reason: "Token does not have write access".to_string(),

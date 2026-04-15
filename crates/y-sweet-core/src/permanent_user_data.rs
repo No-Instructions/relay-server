@@ -98,7 +98,7 @@ pub fn compact_user_data(doc: &Doc) -> CompactionResult {
         result.ids_removed += (iw.original_len - iw.unique_ids.len() as u32) as usize;
         iw.arr.remove_range(&mut txn, 0, iw.original_len);
         for cid in iw.unique_ids {
-            iw.arr.push_back(&mut txn, cid);
+            iw.arr.push_back(&mut txn, yrs::Any::Number(cid as f64));
         }
     }
 
