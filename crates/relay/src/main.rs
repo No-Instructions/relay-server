@@ -385,6 +385,51 @@ fn get_store_from_opts(store_path: &str) -> Result<Box<dyn Store>> {
     }
 }
 
+fn log_store_backend(store_config: &y_sweet_core::config::StoreConfig) {
+    use y_sweet_core::config::StoreConfig;
+
+    match store_config {
+        StoreConfig::Memory => {
+            tracing::info!("Store backend: memory (documents will not be persisted)");
+        }
+        StoreConfig::Filesystem(fs) => {
+            tracing::info!("Store backend: filesystem at {}", fs.path);
+        }
+        other => {
+            let kind = match other {
+                StoreConfig::S3(_) => "s3",
+                StoreConfig::Aws(_) => "aws",
+                StoreConfig::Cloudflare(_) => "cloudflare",
+                StoreConfig::Backblaze(_) => "backblaze",
+                StoreConfig::Minio(_) => "minio",
+                StoreConfig::Tigris(_) => "tigris",
+                _ => "s3-compatible",
+            };
+            if let Some(s3) = other.to_s3_config() {
+                let prefix = if s3.prefix.is_empty() {
+                    "(no prefix)".to_string()
+                } else {
+                    format!("prefix={}", s3.prefix)
+                };
+                let endpoint = if s3.endpoint.is_empty() {
+                    format!("region={}", s3.region)
+                } else {
+                    format!("endpoint={}", s3.endpoint)
+                };
+                tracing::info!(
+                    "Store backend: {} bucket={} {} {}",
+                    kind,
+                    s3.bucket,
+                    endpoint,
+                    prefix,
+                );
+            } else {
+                tracing::info!("Store backend: {}", kind);
+            }
+        }
+    }
+}
+
 fn parse_allowed_hosts(hosts: Vec<String>) -> Result<Vec<AllowedHost>> {
     let mut parsed_hosts = Vec::new();
 
@@ -524,6 +569,7 @@ async fn main() -> Result<()> {
 
             // Create store from config
             let store = if let Some(store) = get_store_from_config(&config.store)? {
+                log_store_backend(&config.store);
                 store.init().await?;
                 Some(store)
             } else {
@@ -931,6 +977,12 @@ async fn main() -> Result<()> {
 
                 // Use the unified S3Config::from_env method with explicit bucket and prefix
                 let s3_config = S3Config::from_env(Some(bucket), prefix)?;
+                tracing::info!(
+                    "Store backend: s3 bucket={} endpoint={} prefix={}",
+                    s3_config.bucket,
+                    s3_config.endpoint,
+                    s3_config.bucket_prefix.as_deref().unwrap_or("(none)"),
+                );
                 let store = S3Store::new(s3_config);
                 let store: Box<dyn Store> = Box::new(store);
                 store.init().await?;
@@ -939,6 +991,7 @@ async fn main() -> Result<()> {
                 if env::var("STORAGE_PREFIX").is_ok() {
                     anyhow::bail!("If STORAGE_PREFIX is set, STORAGE_BUCKET must also be set.");
                 }
+                tracing::warn!("No store set. Documents will be stored in memory only.");
 
                 None
             };
