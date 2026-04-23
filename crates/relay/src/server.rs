@@ -514,7 +514,7 @@ impl Server {
                 }
             };
 
-            tracing::info!("Received signal. done: {}", is_done);
+            tracing::debug!("Received signal. done: {}", is_done);
             let now = std::time::Instant::now();
             if !is_done && now - last_save < checkpoint_freq {
                 let sleep = tokio::time::sleep(checkpoint_freq - (now - last_save));
@@ -541,11 +541,11 @@ impl Server {
                     tracing::info!("Done throttling.");
                 }
             }
-            tracing::info!("Persisting.");
+            tracing::debug!("Persisting.");
             if let Err(e) = sync_kv.persist().await {
                 tracing::error!(?e, "Error persisting.");
             } else {
-                tracing::info!("Done persisting.");
+                tracing::debug!("Done persisting.");
             }
             last_save = std::time::Instant::now();
 
