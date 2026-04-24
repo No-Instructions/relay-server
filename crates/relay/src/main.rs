@@ -642,7 +642,7 @@ async fn main() -> Result<()> {
                 let server = server.clone();
                 let token = token.clone();
                 async move {
-                    let routes = server.routes();
+                    let routes = server.routes_with_metrics();
                     let app = routes.layer(middleware::from_fn(
                         relay::server::Server::version_header_middleware,
                     ));
