@@ -1049,29 +1049,32 @@ async fn handle_socket_upgrade_with_channel_and_user(
     }))
 }
 
-async fn handle_socket_upgrade_deprecated(
-    ws: WebSocketUpgrade,
-    Path(doc_id): Path<String>,
-    Query(params): Query<HandlerParams>,
-    State(server_state): State<Arc<Server>>,
-) -> Result<Response, AppError> {
-    tracing::warn!(
-        "/doc/ws/:doc_id is deprecated; call /doc/:doc_id/auth instead and use the returned URL."
-    );
+fn verify_socket_token(
+    server_state: &Arc<Server>,
+    doc_id: &str,
+    token: Option<&str>,
+) -> Result<(Authorization, Option<String>, Option<String>), AppError> {
     let (permission, channel) = if let Some(authenticator) = &server_state.authenticator {
-        if let Some(token) = params.token.as_deref() {
-            authenticator
-                .verify_token_with_channel(token, current_time_epoch_millis())
-                .map_err(|e| AppError::auth(StatusCode::UNAUTHORIZED, e.into(), "invalid_token"))?
-        } else {
-            (y_sweet_core::auth::Permission::Server, None)
-        }
+        let token = token.ok_or_else(|| {
+            AppError::auth(
+                StatusCode::UNAUTHORIZED,
+                anyhow!("No token provided."),
+                "missing_token",
+            )
+        })?;
+
+        authenticator
+            .verify_token_with_channel(token, current_time_epoch_millis())
+            .map_err(|e| {
+                tracing::debug!("Token verification failed: {:?}", e);
+                AppError::auth(StatusCode::UNAUTHORIZED, e.into(), "invalid_token")
+            })?
     } else {
-        (y_sweet_core::auth::Permission::Server, None)
+        (Permission::Server, None)
     };
 
     let (authorization, user) = match permission {
-        y_sweet_core::auth::Permission::Doc(doc_perm) => {
+        Permission::Doc(doc_perm) => {
             if doc_perm.doc_id != doc_id {
                 return Err(AppError::auth(
                     StatusCode::FORBIDDEN,
@@ -1081,8 +1084,8 @@ async fn handle_socket_upgrade_deprecated(
             }
             (doc_perm.authorization, doc_perm.user)
         }
-        y_sweet_core::auth::Permission::Server => (Authorization::Full, None),
-        y_sweet_core::auth::Permission::Prefix(prefix_perm) => {
+        Permission::Server => (Authorization::Full, None),
+        Permission::Prefix(prefix_perm) => {
             if !doc_id.starts_with(&prefix_perm.prefix) {
                 return Err(AppError::auth(
                     StatusCode::FORBIDDEN,
@@ -1092,7 +1095,7 @@ async fn handle_socket_upgrade_deprecated(
             }
             (prefix_perm.authorization, prefix_perm.user)
         }
-        y_sweet_core::auth::Permission::File(_) => {
+        Permission::File(_) => {
             return Err(AppError::auth(
                 StatusCode::FORBIDDEN,
                 anyhow!("File token not valid for document access"),
@@ -1100,6 +1103,21 @@ async fn handle_socket_upgrade_deprecated(
             ));
         }
     };
+
+    Ok((authorization, channel, user))
+}
+
+async fn handle_socket_upgrade_deprecated(
+    ws: WebSocketUpgrade,
+    Path(doc_id): Path<String>,
+    Query(params): Query<HandlerParams>,
+    State(server_state): State<Arc<Server>>,
+) -> Result<Response, AppError> {
+    tracing::warn!(
+        "/doc/ws/:doc_id is deprecated; call /doc/:doc_id/auth instead and use the returned URL."
+    );
+    let (authorization, channel, user) =
+        verify_socket_token(&server_state, &doc_id, params.token.as_deref())?;
 
     handle_socket_upgrade_with_channel_and_user(
         ws,
@@ -1129,53 +1147,8 @@ async fn handle_socket_upgrade_full_path(
         ));
     }
 
-    let (permission, channel) = if let Some(authenticator) = &server_state.authenticator {
-        if let Some(token) = params.token.as_deref() {
-            let current_time = current_time_epoch_millis();
-
-            authenticator
-                .verify_token_with_channel(token, current_time)
-                .map_err(|e| {
-                    tracing::debug!("Token verification failed: {:?}", e);
-                    AppError::auth(StatusCode::UNAUTHORIZED, e.into(), "invalid_token")
-                })?
-        } else {
-            (y_sweet_core::auth::Permission::Server, None)
-        }
-    } else {
-        (y_sweet_core::auth::Permission::Server, None)
-    };
-
-    let (authorization, user) = match permission {
-        y_sweet_core::auth::Permission::Doc(doc_perm) => {
-            if doc_perm.doc_id != doc_id {
-                return Err(AppError::auth(
-                    StatusCode::FORBIDDEN,
-                    anyhow!("Token not valid for this document"),
-                    "access_wrong_document",
-                ));
-            }
-            (doc_perm.authorization, doc_perm.user)
-        }
-        y_sweet_core::auth::Permission::Server => (Authorization::Full, None),
-        y_sweet_core::auth::Permission::Prefix(prefix_perm) => {
-            if !doc_id.starts_with(&prefix_perm.prefix) {
-                return Err(AppError::auth(
-                    StatusCode::FORBIDDEN,
-                    anyhow!("Token not valid for this document"),
-                    "prefix_mismatch",
-                ));
-            }
-            (prefix_perm.authorization, prefix_perm.user)
-        }
-        y_sweet_core::auth::Permission::File(_) => {
-            return Err(AppError::auth(
-                StatusCode::FORBIDDEN,
-                anyhow!("File token not valid for document access"),
-                "wrong_token_type",
-            ));
-        }
-    };
+    let (authorization, channel, user) =
+        verify_socket_token(&server_state, &doc_id, params.token.as_deref())?;
 
     handle_socket_upgrade_with_channel_and_user(
         ws,
@@ -2519,6 +2492,55 @@ mod test {
         assert_eq!(token.url, expected_url);
         assert_eq!(token.doc_id, doc_id);
         assert!(token.token.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_websocket_auth_rejects_missing_token_when_auth_configured() {
+        let authenticator = y_sweet_core::auth::Authenticator::gen_key().unwrap();
+        let server_state = Arc::new(
+            Server::new(
+                None,
+                Duration::from_secs(60),
+                Some(authenticator),
+                None,
+                vec![],
+                CancellationToken::new(),
+                true,
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+
+        let err = verify_socket_token(&server_state, "test-doc", None).unwrap_err();
+
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(err.auth_error_type, Some("missing_token"));
+    }
+
+    #[tokio::test]
+    async fn test_websocket_auth_allows_missing_token_without_authenticator() {
+        let server_state = Arc::new(
+            Server::new(
+                None,
+                Duration::from_secs(60),
+                None,
+                None,
+                vec![],
+                CancellationToken::new(),
+                true,
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+
+        let (authorization, channel, user) =
+            verify_socket_token(&server_state, "test-doc", None).unwrap();
+
+        assert_eq!(authorization, Authorization::Full);
+        assert_eq!(channel, None);
+        assert_eq!(user, None);
     }
 
     #[tokio::test]
