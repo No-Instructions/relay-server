@@ -365,6 +365,10 @@ impl DocConnection {
                     protocol.handle_sync_step1(&awareness, sv)
                 }
                 SyncMessage::SyncStep2(update) => {
+                    if update.is_empty() {
+                        return Ok(None);
+                    }
+
                     if can_write {
                         let mut awareness = a.write().unwrap();
                         let sv_before = self.snapshot_sv(&awareness);
@@ -381,6 +385,10 @@ impl DocConnection {
                     }
                 }
                 SyncMessage::Update(update) => {
+                    if update.is_empty() {
+                        return Ok(None);
+                    }
+
                     if can_write {
                         let mut awareness = a.write().unwrap();
                         let sv_before = self.snapshot_sv(&awareness);
@@ -617,7 +625,7 @@ impl Drop for DocConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sync::{DefaultProtocol, EventMessage, Message};
+    use crate::sync::{DefaultProtocol, EventMessage, Message, SyncMessage};
 
     #[test]
     fn test_doc_connection_event_subscriptions() {
@@ -909,5 +917,36 @@ mod tests {
         // Should succeed when not expired
         let result = connection.send(&encoded).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_doc_connection_send_empty_sync_step2_is_noop() {
+        let doc = yrs::Doc::new();
+        let awareness = Arc::new(RwLock::new(Awareness::new(doc)));
+
+        let connection = DocConnection::new(awareness, Authorization::Full, |_| {});
+        let msg = Message::Sync(SyncMessage::SyncStep2(Vec::new()));
+        let encoded = msg.encode_v1();
+
+        let result = connection.send(&encoded).await;
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_doc_connection_allows_empty_sync_update_from_read_only() {
+        let doc = yrs::Doc::new();
+        let awareness = Arc::new(RwLock::new(Awareness::new(doc)));
+
+        let connection = DocConnection::new(awareness, Authorization::ReadOnly, |_| {});
+
+        let sync_step2 = Message::Sync(SyncMessage::SyncStep2(Vec::new()));
+        let result = connection.handle_msg(&DefaultProtocol, sync_step2);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+
+        let update = Message::Sync(SyncMessage::Update(Vec::new()));
+        let result = connection.handle_msg(&DefaultProtocol, update);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
     }
 }
