@@ -27,6 +27,8 @@ pub struct RelayMetrics {
 
     // WebSocket connection lifecycle metrics
     pub websocket_closes_total: CounterVec,
+    pub websocket_pong_timeouts_total: CounterVec,
+    pub websocket_pong_recoveries_total: CounterVec,
     pub websocket_send_failures_total: CounterVec,
 }
 
@@ -181,6 +183,28 @@ impl RelayMetrics {
         )?;
         registry.register(Box::new(websocket_closes_total.clone()))?;
 
+        let websocket_pong_timeouts_total = CounterVec::new(
+            Opts::new(
+                "relay_server_websocket_pong_timeouts_total",
+                "Connections that went silent past the pong timeout. Observe-only: a keepalive reaper would have closed these",
+            ),
+            &[],
+        )?;
+        registry.register(Box::new(websocket_pong_timeouts_total.clone()))?;
+        // Touch the label-less soak counters so they export 0 from startup;
+        // "no would-be reaps yet" must be distinguishable from "no data".
+        websocket_pong_timeouts_total.with_label_values(&[]);
+
+        let websocket_pong_recoveries_total = CounterVec::new(
+            Opts::new(
+                "relay_server_websocket_pong_recoveries_total",
+                "Connections that ponged again after exceeding the pong timeout. A keepalive reaper would have closed a live connection",
+            ),
+            &[],
+        )?;
+        registry.register(Box::new(websocket_pong_recoveries_total.clone()))?;
+        websocket_pong_recoveries_total.with_label_values(&[]);
+
         let websocket_send_failures_total = CounterVec::new(
             Opts::new(
                 "relay_server_websocket_send_failures_total",
@@ -206,6 +230,8 @@ impl RelayMetrics {
             http_auth_errors_total,
             s3_requests_total,
             websocket_closes_total,
+            websocket_pong_timeouts_total,
+            websocket_pong_recoveries_total,
             websocket_send_failures_total,
         }))
     }
@@ -310,6 +336,18 @@ impl RelayMetrics {
     pub fn record_websocket_close(&self, reason: &str) {
         self.websocket_closes_total
             .with_label_values(&[reason])
+            .inc();
+    }
+
+    pub fn record_pong_timeout(&self) {
+        self.websocket_pong_timeouts_total
+            .with_label_values(&[])
+            .inc();
+    }
+
+    pub fn record_pong_recovery(&self) {
+        self.websocket_pong_recoveries_total
+            .with_label_values(&[])
             .inc();
     }
 

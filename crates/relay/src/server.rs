@@ -60,6 +60,13 @@ use y_sweet_core::{
 
 const RELAY_SERVER_VERSION: &str = env!("GIT_VERSION");
 
+/// How often the server pings each WebSocket connection.
+const PING_EVERY: Duration = Duration::from_secs(20);
+/// How long a connection may go silent (no pong) before it is counted as a
+/// would-be keepalive reap. Observe-only: the connection is never closed for
+/// this; the metric exists to measure whether enforcement would be safe.
+const PONG_TIMEOUT: Duration = Duration::from_secs(40);
+
 #[derive(Clone, Debug)]
 pub struct AllowedHost {
     pub host: String,
@@ -1338,6 +1345,15 @@ async fn handle_socket_inner<S, T, E>(
     // Register the connection with the sync protocol event sender
     sync_protocol_event_sender.register_doc_connection(doc_id.clone(), Arc::downgrade(&connection));
 
+    // Observe-only keepalive: ping on an interval and record would-be reaps
+    // (silent past PONG_TIMEOUT) and recoveries (a pong after the timeout,
+    // i.e. a live connection enforcement would have killed). Nothing is
+    // closed on timeout until the soak metrics show enforcement is safe.
+    let mut ticker = tokio::time::interval(PING_EVERY);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_pong = tokio::time::Instant::now();
+    let mut pong_timed_out = false;
+
     let close_reason = loop {
         tokio::select! {
             msg = stream.next() => {
@@ -1348,6 +1364,23 @@ async fn handle_socket_inner<S, T, E>(
                 let msg = match msg {
                     Ok(Message::Binary(bytes)) => bytes,
                     Ok(Message::Close(_)) => break "close_frame",
+                    Ok(Message::Pong(_)) => {
+                        if pong_timed_out {
+                            pong_timed_out = false;
+                            metrics.record_pong_recovery();
+                            tracing::info!(
+                                doc_id = %doc_id,
+                                silent_secs = last_pong.elapsed().as_secs(),
+                                "Connection recovered after pong timeout; a keepalive reaper would have closed it"
+                            );
+                        }
+                        last_pong = tokio::time::Instant::now();
+                        continue;
+                    }
+                    Ok(Message::Ping(_)) => {
+                        // The transport replies with a pong automatically.
+                        continue;
+                    }
                     Err(_e) => {
                         // The stream will complain about things like
                         // connections being lost without handshake.
@@ -1382,6 +1415,17 @@ async fn handle_socket_inner<S, T, E>(
                         tracing::warn!(?e, "Error handling message");
                     }
                 }
+            }
+            _ = ticker.tick() => {
+                if last_pong.elapsed() > PONG_TIMEOUT && !pong_timed_out {
+                    pong_timed_out = true;
+                    metrics.record_pong_timeout();
+                    tracing::info!(
+                        doc_id = %doc_id,
+                        "Pong timeout (observe-only): a keepalive reaper would close this connection"
+                    );
+                }
+                let _ = send.try_send(Message::Ping(vec![]));
             }
             _ = conn_token.cancelled() => {
                 if cancellation_token.is_cancelled() {
@@ -3437,6 +3481,67 @@ mod test {
             }
             let frame = last_close.expect("no close frame reached the client");
             assert_eq!(frame.code, 1001);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn pong_timeout_is_observe_only() {
+            let mut harness = spawn_socket(CancellationToken::new()).await;
+
+            // Stay silent long past PONG_TIMEOUT: the would-be reap is
+            // recorded exactly once and the connection stays open.
+            tokio::time::sleep(Duration::from_secs(130)).await;
+            assert_eq!(
+                harness
+                    .metrics
+                    .websocket_pong_timeouts_total
+                    .with_label_values(&[])
+                    .get(),
+                1.0,
+                "one silent stretch should count as one would-be reap, not one per tick"
+            );
+            assert!(
+                !harness.task.is_finished(),
+                "observe-only keepalive must not close the connection"
+            );
+
+            // The server should still be probing.
+            let mut pings = 0;
+            while let Ok(Some(msg)) = harness.from_server.try_next() {
+                if matches!(msg, Message::Ping(_)) {
+                    pings += 1;
+                }
+            }
+            assert!(pings > 0, "server should send keepalive pings");
+
+            // A late pong is a live connection enforcement would have killed.
+            harness
+                .to_server
+                .send(Ok(Message::Pong(vec![])))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert_eq!(
+                harness
+                    .metrics
+                    .websocket_pong_recoveries_total
+                    .with_label_values(&[])
+                    .get(),
+                1.0
+            );
+
+            // A second silent stretch counts as a new would-be reap.
+            tokio::time::sleep(Duration::from_secs(130)).await;
+            assert_eq!(
+                harness
+                    .metrics
+                    .websocket_pong_timeouts_total
+                    .with_label_values(&[])
+                    .get(),
+                2.0
+            );
+            assert!(!harness.task.is_finished());
+
+            harness.task.abort();
         }
     }
 }
