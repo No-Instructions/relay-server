@@ -510,7 +510,10 @@ impl Server {
             doc_id,
             self.store.clone(),
             move || {
-                send.try_send(()).unwrap();
+                // Best-effort wake: after eviction the persistence worker is
+                // gone and the channel is closed; the teardown-time persist()
+                // covers those writes instead of a panic here.
+                let _ = send.try_send(());
             },
             event_callback,
         )
@@ -1313,6 +1316,11 @@ async fn handle_socket_inner<S, T, E>(
 
     let send_clone = send.clone();
     let metrics_clone = metrics.clone();
+    // Held past the connection's lifetime: the awareness strong count tells
+    // the teardown whether this handler was the doc's last connection (the
+    // same liveness test the gc worker uses), and the flush needs the kv.
+    let awareness_probe = awareness.clone();
+    let sync_kv_flush = sync_kv.clone();
     let mut conn = DocConnection::new_with_expiration(
         awareness,
         authorization,
@@ -1445,6 +1453,22 @@ async fn handle_socket_inner<S, T, E>(
     };
 
     metrics.record_websocket_close(close_reason);
+
+    // The park window (auto-suspend / auto-stop) opens when a doc's last
+    // socket drains, but the checkpoint throttle may still be holding
+    // changes — an unsignaled suspend would freeze them dirty. Flush now:
+    // it is the same PUT the throttle already owed, just earlier, and a
+    // no-op when clean. Holders of the awareness Arc at this point are the
+    // doc's DocWithSyncKv, this probe, and two per live connection.
+    drop(connection);
+    if Arc::strong_count(&awareness_probe) <= 2 {
+        if sync_kv_flush.is_dirty() {
+            metrics.record_doc_dirty_at_drain();
+        }
+        if let Err(e) = sync_kv_flush.persist().await {
+            tracing::error!(?e, doc_id = %doc_id, "Error persisting on last disconnect");
+        }
+    }
 }
 
 async fn check_store(
@@ -3335,6 +3359,7 @@ mod test {
             to_server: tokio::sync::mpsc::Sender<Result<Message, axum::Error>>,
             from_server: futures_mpsc::UnboundedReceiver<Message>,
             awareness: Arc<RwLock<Awareness>>,
+            sync_kv: Arc<SyncKv>,
             metrics: Arc<RelayMetrics>,
             task: tokio::task::JoinHandle<()>,
         }
@@ -3353,7 +3378,7 @@ mod test {
                 sink_tx,
                 ReceiverStream::new(stream_rx),
                 awareness.clone(),
-                sync_kv,
+                sync_kv.clone(),
                 Authorization::Full,
                 None,
                 None,
@@ -3367,6 +3392,7 @@ mod test {
                 to_server,
                 from_server,
                 awareness,
+                sync_kv,
                 metrics,
                 task,
             }
@@ -3457,6 +3483,42 @@ mod test {
                 .unwrap();
 
             assert_eq!(closes(&harness.metrics, "server_shutdown"), 1.0);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn last_disconnect_flushes_dirty_doc() {
+            let harness = spawn_socket(CancellationToken::new()).await;
+
+            // Dirty the doc the way any metadata/content change would,
+            // inside the checkpoint throttle window.
+            let mut meta = std::collections::BTreeMap::new();
+            meta.insert(
+                "k".to_string(),
+                ciborium::value::Value::Text("v".to_string()),
+            );
+            harness.sync_kv.set_metadata(meta);
+            assert!(harness.sync_kv.is_dirty());
+
+            // Last (only) connection drops; the park window opens here.
+            drop(harness.to_server);
+
+            tokio::time::timeout(Duration::from_secs(5), harness.task)
+                .await
+                .expect("read loop kept running after stream EOF")
+                .unwrap();
+
+            assert!(
+                !harness.sync_kv.is_dirty(),
+                "last disconnect must flush before the park window opens"
+            );
+            assert_eq!(
+                harness
+                    .metrics
+                    .doc_dirty_at_drain_total
+                    .with_label_values(&[])
+                    .get(),
+                1.0
+            );
         }
 
         #[tokio::test(start_paused = true)]

@@ -229,7 +229,12 @@ impl SyncKv {
     }
 
     fn mark_dirty(&self) {
-        if !self.dirty.load(Ordering::Relaxed) && !self.shutdown.load(Ordering::SeqCst) {
+        // Writes after shutdown still mark dirty: a connection that raced
+        // eviction and kept writing must leave persist() something to
+        // save. The callback wake is best-effort — the persistence worker
+        // may already be gone — so the write's durability rests on the
+        // explicit persist() at connection teardown.
+        if !self.dirty.load(Ordering::Relaxed) {
             self.dirty.store(true, Ordering::Relaxed);
             (self.dirty_callback)();
         }
@@ -326,6 +331,11 @@ impl SyncKv {
 
     pub fn is_shutdown(&self) -> bool {
         self.shutdown.load(Ordering::SeqCst)
+    }
+
+    /// Whether local state has changes the store has not seen.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty.load(Ordering::Relaxed)
     }
 
     pub fn shutdown(&self) {

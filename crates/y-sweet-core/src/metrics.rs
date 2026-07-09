@@ -30,6 +30,7 @@ pub struct RelayMetrics {
     pub websocket_pong_timeouts_total: CounterVec,
     pub websocket_pong_recoveries_total: CounterVec,
     pub websocket_send_failures_total: CounterVec,
+    pub doc_dirty_at_drain_total: CounterVec,
 }
 
 static RELAY_METRICS: OnceLock<Result<Arc<RelayMetrics>, prometheus::Error>> = OnceLock::new();
@@ -214,6 +215,18 @@ impl RelayMetrics {
         )?;
         registry.register(Box::new(websocket_send_failures_total.clone()))?;
 
+        let doc_dirty_at_drain_total = CounterVec::new(
+            Opts::new(
+                "relay_server_doc_dirty_at_drain_total",
+                "Docs whose last connection closed while unpersisted changes were still inside the checkpoint throttle — the window an unsignaled suspend would freeze dirty",
+            ),
+            &[],
+        )?;
+        registry.register(Box::new(doc_dirty_at_drain_total.clone()))?;
+        // Touch so it exports 0 from startup; "never raced" must be
+        // distinguishable from "no data".
+        doc_dirty_at_drain_total.with_label_values(&[]);
+
         Ok(Arc::new(Self {
             webhook_requests_total,
             webhook_request_duration_seconds,
@@ -233,6 +246,7 @@ impl RelayMetrics {
             websocket_pong_timeouts_total,
             websocket_pong_recoveries_total,
             websocket_send_failures_total,
+            doc_dirty_at_drain_total,
         }))
     }
 
@@ -349,6 +363,10 @@ impl RelayMetrics {
         self.websocket_pong_recoveries_total
             .with_label_values(&[])
             .inc();
+    }
+
+    pub fn record_doc_dirty_at_drain(&self) {
+        self.doc_dirty_at_drain_total.with_label_values(&[]).inc();
     }
 
     pub fn record_websocket_send_failure(&self, kind: &str) {
