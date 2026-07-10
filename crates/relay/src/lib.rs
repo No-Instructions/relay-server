@@ -3,6 +3,7 @@
 pub mod cli;
 pub mod convert;
 pub mod doc_inspect;
+pub mod doc_lifecycle;
 pub mod doc_restore;
 pub mod doc_versions;
 pub mod migrations;

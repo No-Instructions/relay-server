@@ -12,7 +12,9 @@ use std::sync::{
 use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
+use y_sweet_core::doc_sync::DocWithSyncKv;
 use y_sweet_core::store::{memory::MemoryStore, Result as StoreResult, Store};
+use yrs::{Map, Out, ReadTxn, Transact};
 
 /// A `MemoryStore` wrapper that counts reads/writes per key and can hold
 /// every `set` on a gate, so tests can freeze a persist mid-flight and
@@ -200,6 +202,31 @@ impl Store for PresignedStore {
 
     async fn generate_download_url(&self, _key: &str) -> StoreResult<Option<String>> {
         Ok(Some(self.download_url.to_string()))
+    }
+}
+
+/// A v1 update inserting `value` under `key` in the "data" map.
+pub(crate) fn content_update(key: &str, value: &str) -> Vec<u8> {
+    let doc = yrs::Doc::new();
+    let map = doc.get_or_insert_map("data");
+    {
+        let mut txn = doc.transact_mut();
+        map.insert(&mut txn, key, value);
+    }
+    let txn = doc.transact();
+    txn.encode_state_as_update_v1(&yrs::StateVector::default())
+}
+
+/// Read back a string inserted with [`content_update`].
+pub(crate) fn read_content(dwskv: &DocWithSyncKv, key: &str) -> Option<String> {
+    let awareness = dwskv.awareness();
+    let awareness = awareness.read().unwrap();
+    let doc = awareness.doc();
+    let txn = doc.transact();
+    let map = txn.get_map("data")?;
+    match map.get(&txn, key) {
+        Some(Out::Any(yrs::Any::String(s))) => Some(s.to_string()),
+        _ => None,
     }
 }
 

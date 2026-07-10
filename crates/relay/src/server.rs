@@ -1,3 +1,4 @@
+use crate::doc_lifecycle::{DocRegistry, EvictDecision, EvictOutcome};
 use anyhow::{anyhow, Result};
 use axum::{
     body::Bytes,
@@ -17,7 +18,6 @@ use axum::{
     Json, Router,
 };
 use axum_extra::typed_header::TypedHeader;
-use dashmap::{mapref::one::MappedRef, DashMap};
 use futures::{Sink, SinkExt, Stream, StreamExt, TryStreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -30,10 +30,7 @@ use std::{
 use tempfile::NamedTempFile;
 use tokio::{
     net::TcpListener,
-    sync::{
-        mpsc::{channel, error::TrySendError, Receiver},
-        Mutex as AsyncMutex,
-    },
+    sync::mpsc::{channel, error::TrySendError, Receiver},
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{span, Instrument, Level};
@@ -229,11 +226,9 @@ struct FileDownloadParams {
 }
 
 pub struct Server {
-    docs: Arc<DashMap<String, DocWithSyncKv>>,
-    /// Per-doc-id async locks held only across the load-from-store step
-    /// so concurrent first-time requests for the same doc don't both load
-    /// from the store and clobber each other in `docs`.
-    loading_locks: Arc<DashMap<String, Arc<AsyncMutex<()>>>>,
+    /// Owner of document identity: single-flight loads, eviction under
+    /// the slot lock, slots reclaimed at eviction and on failed loads.
+    registry: Arc<DocRegistry>,
     doc_worker_tracker: TaskTracker,
     store: Option<Arc<Box<dyn Store>>>,
     checkpoint_freq: Duration,
@@ -302,8 +297,7 @@ impl Server {
         tracing::info!("Event dispatcher created successfully");
 
         Ok(Self {
-            docs: Arc::new(DashMap::new()),
-            loading_locks: Arc::new(DashMap::new()),
+            registry: Arc::new(DocRegistry::new()),
             doc_worker_tracker: TaskTracker::new(),
             store: store.map(Arc::new),
             checkpoint_freq,
@@ -330,29 +324,29 @@ impl Server {
     }
 
     /// First beat of the client-compatible shutdown drain: persist every
-    /// resident doc while sockets stay open and serving. Deployed clients
-    /// stop retrying a dropped socket after a sub-second burst of refused
-    /// attempts, so the slow store work must happen before any
-    /// client-visible disconnect, keeping the close-to-exit window inside
-    /// that budget.
+    /// dirty doc while sockets stay open and serving, so the post-cutover
+    /// delta flush — and with it the close-to-exit window deployed
+    /// clients' sub-second retry budgets must survive — stays within a
+    /// handful of store round-trips. Races with the per-doc persistence
+    /// workers are the status-quo multi-writer behavior; the actor
+    /// migration serializes per-doc writes later.
     pub async fn flush_all_docs(&self) {
+        let docs = self.registry.resident_docs();
         let started = std::time::Instant::now();
-        // Collect handles first: a DashMap shard guard must not be held
-        // across an await.
-        let sync_kvs: Vec<_> = self
-            .docs
-            .iter()
-            .map(|entry| entry.value().sync_kv())
-            .collect();
-        let docs = sync_kvs.len();
-        for sync_kv in sync_kvs {
-            if let Err(e) = sync_kv.persist().await {
-                tracing::error!(?e, "Error persisting during pre-close flush");
+        let mut flushed = 0usize;
+        for doc in docs {
+            let sync_kv = doc.sync_kv();
+            if !sync_kv.is_dirty() {
+                continue;
+            }
+            match sync_kv.persist().await {
+                Ok(()) => flushed += 1,
+                Err(e) => tracing::error!(?e, "Error persisting during pre-close flush"),
             }
         }
         tracing::info!(
-            "pre-close flush: {} docs persisted in {} ms",
-            docs,
+            "pre-close flush: {} dirty docs persisted in {} ms",
+            flushed,
             started.elapsed().as_millis()
         );
     }
@@ -361,7 +355,7 @@ impl Server {
     /// run one final unthrottled persist when the server token cancels,
     /// so returning means the flush is fully on the store.
     pub async fn drain_doc_workers(&self) {
-        let docs = self.docs.len();
+        let docs = self.registry.len();
         let started = std::time::Instant::now();
         self.doc_worker_tracker.close();
         self.doc_worker_tracker.wait().await;
@@ -377,7 +371,7 @@ impl Server {
         if Self::validate_doc_id(doc_id).is_err() {
             return false;
         }
-        if self.docs.contains_key(doc_id) {
+        if self.registry.is_resident(doc_id) {
             return true;
         }
         if let Some(store) = &self.store {
@@ -416,12 +410,10 @@ impl Server {
         Ok(())
     }
 
-    pub fn load_doc<'a>(
-        &'a self,
-        doc_id: &'a str,
-        routing_channel: Option<String>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
-        Box::pin(self.load_doc_with_user(doc_id, routing_channel, None))
+    pub async fn load_doc(&self, doc_id: &str, routing_channel: Option<String>) -> Result<()> {
+        self.get_or_create_doc_with_channel_and_user(doc_id, routing_channel, None)
+            .await?;
+        Ok(())
     }
 
     pub async fn load_doc_with_user(
@@ -430,7 +422,20 @@ impl Server {
         routing_channel: Option<String>,
         user: Option<String>,
     ) -> Result<()> {
-        Self::validate_doc_id(doc_id)?;
+        self.get_or_create_doc_with_channel_and_user(doc_id, routing_channel, user)
+            .await?;
+        Ok(())
+    }
+
+    /// Construct a doc instance and spawn its workers. Runs under the
+    /// registry's slot lock (as a `get_or_load` loader); the registry
+    /// installs the result.
+    async fn build_doc(
+        &self,
+        doc_id: &str,
+        routing_channel: Option<String>,
+        user: Option<String>,
+    ) -> Result<DocWithSyncKv> {
         let (send, recv) = channel(1024);
 
         // Determine routing channel: use provided channel or fallback to doc_id
@@ -440,15 +445,11 @@ impl Server {
 
         // If this doc routes to a different channel (i.e., it's a subdoc),
         // ensure the parent is loaded and hold a reference to prevent GC.
-        // The load goes through the per-key lock: concurrent subdoc loads
-        // (e.g. a folder's documents reconnecting together) otherwise race
-        // to load the same parent, and the losing insert orphans the
-        // winner's in-memory state and spawns duplicate persistence workers.
+        // Lock order is strictly child slot → parent slot, and parents
+        // never route elsewhere, so no cycle exists.
         let parent_awareness_guard = if routing_channel_name != doc_id {
-            self.ensure_doc_loaded_boxed(&routing_channel_name).await?;
-            self.docs
-                .get(&routing_channel_name)
-                .map(|parent| parent.awareness())
+            let parent = self.get_or_create_boxed(&routing_channel_name).await?;
+            Some(parent.awareness())
         } else {
             None
         };
@@ -458,7 +459,7 @@ impl Server {
             let event_dispatcher = self.event_dispatcher.clone();
             let routing_channel_for_callback = routing_channel_name.clone();
             let user_for_callback = user.clone();
-            let docs = self.docs.clone();
+            let registry = self.registry.clone();
             let doc_id_for_callback = doc_id.to_string();
             // Capture parent awareness to keep it alive (prevents GC while subdoc exists)
             let _parent_awareness = parent_awareness_guard;
@@ -475,7 +476,7 @@ impl Server {
                     // Update parent's subdoc snapshot index
                     if routing_channel_for_callback != doc_id_for_callback {
                         if let Some(snapshot) = &event.snapshot {
-                            if let Some(parent) = docs.get(&routing_channel_for_callback) {
+                            if let Some(parent) = registry.peek(&routing_channel_for_callback) {
                                 parent
                                     .update_subdoc_snapshot(&doc_id_for_callback, snapshot.clone());
                             }
@@ -551,8 +552,7 @@ impl Server {
             if self.doc_gc {
                 self.doc_worker_tracker.spawn(
                     Self::doc_gc_worker(
-                        self.docs.clone(),
-                        self.loading_locks.clone(),
+                        self.registry.clone(),
                         doc_id.clone(),
                         checkpoint_freq,
                         cancellation_token,
@@ -562,13 +562,11 @@ impl Server {
             }
         }
 
-        self.docs.insert(doc_id.to_string(), dwskv);
-        Ok(())
+        Ok(dwskv)
     }
 
     async fn doc_gc_worker(
-        docs: Arc<DashMap<String, DocWithSyncKv>>,
-        loading_locks: Arc<DashMap<String, Arc<AsyncMutex<()>>>>,
+        registry: Arc<DocRegistry>,
         doc_id: String,
         checkpoint_freq: Duration,
         cancellation_token: CancellationToken,
@@ -578,7 +576,7 @@ impl Server {
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(checkpoint_freq) => {
-                    if let Some(doc) = docs.get(&doc_id) {
+                    if let Some(doc) = registry.peek(&doc_id) {
                         let awareness = Arc::downgrade(&doc.awareness());
                         if awareness.strong_count() > 1 {
                             checkpoints_without_refs = 0;
@@ -592,57 +590,54 @@ impl Server {
                     }
 
                     if checkpoints_without_refs >= 2 {
-                        // Eviction is atomic with respect to attachment: it
-                        // holds the same per-doc lock ensure_doc_loaded takes,
-                        // so a loader either finds the doc in the map or
-                        // waits until the store already holds the final
-                        // flush.
-                        let lock = {
-                            let entry = loading_locks
-                                .entry(doc_id.clone())
-                                .or_insert_with(|| Arc::new(AsyncMutex::new(())));
-                            Arc::clone(entry.value())
-                        };
-                        let _guard = lock.lock().await;
+                        // Eviction runs under the registry's slot lock: a
+                        // loader either finds the doc resident or waits
+                        // until the store already holds the final flush.
+                        let outcome = registry.evict(&doc_id, |doc| async move {
+                            // A connection may have attached between the
+                            // idle checks and taking the slot lock; it
+                            // holds awareness refs. Un-evict rather than
+                            // orphan it on an instance the registry no
+                            // longer knows: an orphan's updates dispatch
+                            // only to its own instance and are invisible
+                            // to every later connection.
+                            let probe = Arc::downgrade(&doc.awareness());
+                            if probe.strong_count() > 1 {
+                                tracing::info!("attach raced GC; un-evicting doc");
+                                return EvictDecision::Refuse;
+                            }
+                            tracing::info!("GCing doc");
+                            // Compact PUD before shutdown: dedup ids, clear
+                            // ds. The mutations create tombstones which yrs
+                            // GC will clean up, and the update observer
+                            // marks SyncKv dirty so the compacted state
+                            // gets persisted.
+                            let result = doc.compact_user_data();
+                            if !result.is_empty() {
+                                tracing::debug!(
+                                    ids_removed = result.ids_removed,
+                                    ds_removed = result.ds_removed,
+                                    "Compacted PermanentUserData"
+                                );
+                            }
+                            // The final state must reach the store before
+                            // the slot lock releases: a reload racing a
+                            // fire-and-forget flush loads a stale snapshot
+                            // and its next persist rolls the doc back.
+                            if let Err(e) = doc.sync_kv().persist().await {
+                                tracing::error!(?e, "Error persisting during GC eviction");
+                            }
+                            doc.sync_kv().shutdown();
+                            EvictDecision::Evict
+                        }).await;
 
-                        let Some((_, doc)) = docs.remove(&doc_id) else {
-                            break;
-                        };
-                        // A connection may have attached between the idle
-                        // checks and taking the lock; it holds awareness
-                        // refs. Un-evict rather than orphan it on an
-                        // instance the map no longer knows: an orphan's
-                        // updates dispatch only to its own instance and are
-                        // invisible to every later connection.
-                        let probe = Arc::downgrade(&doc.awareness());
-                        if probe.strong_count() > 1 {
-                            tracing::info!("attach raced GC; un-evicting doc");
-                            docs.insert(doc_id.clone(), doc);
-                            checkpoints_without_refs = 0;
-                            continue;
+                        match outcome {
+                            EvictOutcome::Refused => {
+                                checkpoints_without_refs = 0;
+                                continue;
+                            }
+                            EvictOutcome::Evicted | EvictOutcome::Absent => break,
                         }
-                        tracing::info!("GCing doc");
-                        // Compact PUD before shutdown: dedup ids, clear ds.
-                        // The mutations create tombstones which yrs GC will
-                        // clean up, and the update observer marks SyncKv
-                        // dirty so the compacted state gets persisted.
-                        let result = doc.compact_user_data();
-                        if !result.is_empty() {
-                            tracing::debug!(
-                                ids_removed = result.ids_removed,
-                                ds_removed = result.ds_removed,
-                                "Compacted PermanentUserData"
-                            );
-                        }
-                        // The final state must reach the store before the
-                        // loading lock releases: a reload racing a
-                        // fire-and-forget flush loads a stale snapshot and
-                        // its next persist rolls the doc back.
-                        if let Err(e) = doc.sync_kv().persist().await {
-                            tracing::error!(?e, "Error persisting during GC eviction");
-                        }
-                        doc.sync_kv().shutdown();
-                        break;
                     }
                 }
                 _ = cancellation_token.cancelled() => {
@@ -713,24 +708,16 @@ impl Server {
         tracing::info!("Terminating loop for {}", doc_id);
     }
 
-    pub async fn get_or_create_doc(
-        &self,
-        doc_id: &str,
-    ) -> Result<MappedRef<'_, String, DocWithSyncKv, DocWithSyncKv>> {
-        self.ensure_doc_loaded(doc_id, None, None).await?;
-
-        Ok(self
-            .docs
-            .get(doc_id)
-            .ok_or_else(|| anyhow!("Failed to get-or-create doc"))?
-            .map(|d| d))
+    pub async fn get_or_create_doc(&self, doc_id: &str) -> Result<Arc<DocWithSyncKv>> {
+        self.get_or_create_doc_with_channel_and_user(doc_id, None, None)
+            .await
     }
 
     pub async fn get_or_create_doc_with_channel(
         &self,
         doc_id: &str,
         routing_channel: Option<String>,
-    ) -> Result<MappedRef<'_, String, DocWithSyncKv, DocWithSyncKv>> {
+    ) -> Result<Arc<DocWithSyncKv>> {
         self.get_or_create_doc_with_channel_and_user(doc_id, routing_channel, None)
             .await
     }
@@ -740,64 +727,31 @@ impl Server {
         doc_id: &str,
         routing_channel: Option<String>,
         user: Option<String>,
-    ) -> Result<MappedRef<'_, String, DocWithSyncKv, DocWithSyncKv>> {
-        self.ensure_doc_loaded(doc_id, routing_channel, user)
-            .await?;
-
-        Ok(self
-            .docs
-            .get(doc_id)
-            .ok_or_else(|| anyhow!("Failed to get-or-create doc"))?
-            .map(|d| d))
+    ) -> Result<Arc<DocWithSyncKv>> {
+        Self::validate_doc_id(doc_id)?;
+        self.registry
+            .get_or_load(doc_id, || {
+                let routing_channel = routing_channel.clone();
+                let user = user.clone();
+                async move {
+                    tracing::info!(doc_id=?doc_id, channel=?routing_channel, user=?user, "Loading doc");
+                    self.build_doc(doc_id, routing_channel, user).await
+                }
+            })
+            .await
     }
 
-    /// Idempotently load `doc_id` into `self.docs`. Concurrent callers for
-    /// the same doc_id serialize through a per-key async mutex so that only
-    /// one `load_doc` actually hits the store; the others observe the
-    /// already-loaded entry on a double-check after the lock is acquired.
-    async fn ensure_doc_loaded(
-        &self,
-        doc_id: &str,
-        routing_channel: Option<String>,
-        user: Option<String>,
-    ) -> Result<()> {
-        if self.docs.contains_key(doc_id) {
-            return Ok(());
-        }
-
-        // Acquire (or create) the per-key lock without holding the DashMap
-        // shard guard across the `.lock().await` below.
-        let lock = {
-            let entry = self
-                .loading_locks
-                .entry(doc_id.to_string())
-                .or_insert_with(|| Arc::new(AsyncMutex::new(())));
-            Arc::clone(entry.value())
-        };
-        let _guard = lock.lock().await;
-
-        // Double-check after acquiring the lock: another caller may have
-        // loaded while we were waiting.
-        if self.docs.contains_key(doc_id) {
-            return Ok(());
-        }
-
-        tracing::info!(doc_id=?doc_id, channel=?routing_channel, user=?user, "Loading doc");
-        self.load_doc_with_user(doc_id, routing_channel, user)
-            .await?;
-        Ok(())
-    }
-
-    /// Boxed form of [`Self::ensure_doc_loaded`] for use inside
-    /// `load_doc_with_user`, which it recursively calls to load a subdoc's
-    /// parent. The recursion terminates because a parent never routes to
-    /// another channel, and no lock cycle exists because parent loads take
-    /// only the parent's own key lock.
-    fn ensure_doc_loaded_boxed<'a>(
+    /// Boxed form of [`Self::get_or_create_doc`] for use inside
+    /// `build_doc`, which recursively calls it to load a subdoc's parent.
+    /// The recursion terminates because a parent never routes to another
+    /// channel, and no lock cycle exists because parent loads take only
+    /// the parent's own slot lock.
+    fn get_or_create_boxed<'a>(
         &'a self,
         doc_id: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
-        Box::pin(self.ensure_doc_loaded(doc_id, None, None))
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Arc<DocWithSyncKv>>> + Send + 'a>>
+    {
+        Box::pin(self.get_or_create_doc_with_channel_and_user(doc_id, None, None))
     }
 
     pub fn check_auth(
@@ -2791,7 +2745,7 @@ mod test {
         )
         .await;
 
-        assert!(!server.docs.contains_key(doc_id));
+        assert!(!server.registry.is_resident(doc_id));
         server
             .ensure_socket_doc_access(doc_id, Authorization::ReadOnly)
             .await
@@ -3247,7 +3201,7 @@ mod test {
         let doc_id = server.create_doc().await.unwrap();
 
         // Verify the doc exists
-        assert!(server.docs.contains_key(&doc_id));
+        assert!(server.registry.is_resident(&doc_id));
 
         // The doc has no external references (we're not holding an awareness Arc),
         // so it should be eligible for GC after 2 checkpoint intervals.
@@ -3256,7 +3210,7 @@ mod test {
 
         // Doc should be removed by GC
         assert!(
-            !server.docs.contains_key(&doc_id),
+            !server.registry.is_resident(&doc_id),
             "Doc should have been garbage collected"
         );
 
@@ -3279,33 +3233,8 @@ mod test {
     /// every migration step.
     mod lifecycle_characterization {
         use super::*;
-        use crate::test_util::{test_server, GatedStore};
+        use crate::test_util::{content_update, read_content, test_server, GatedStore};
         use y_sweet_core::store::memory::MemoryStore;
-        use yrs::{Map, Out, ReadTxn, Transact};
-
-        /// A v1 update inserting `value` under `key` in the "data" map.
-        fn content_update(key: &str, value: &str) -> Vec<u8> {
-            let doc = yrs::Doc::new();
-            let map = doc.get_or_insert_map("data");
-            {
-                let mut txn = doc.transact_mut();
-                map.insert(&mut txn, key, value);
-            }
-            let txn = doc.transact();
-            txn.encode_state_as_update_v1(&yrs::StateVector::default())
-        }
-
-        fn read_content(dwskv: &DocWithSyncKv, key: &str) -> Option<String> {
-            let awareness = dwskv.awareness();
-            let awareness = awareness.read().unwrap();
-            let doc = awareness.doc();
-            let txn = doc.transact();
-            let map = txn.get_map("data")?;
-            match map.get(&txn, key) {
-                Some(Out::Any(yrs::Any::String(s))) => Some(s.to_string()),
-                _ => None,
-            }
-        }
 
         #[tokio::test(start_paused = true)]
         async fn evicted_doc_state_survives_reload() {
@@ -3330,12 +3259,12 @@ mod test {
             // time auto-advances through the worker sleeps.
             for _ in 0..50 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
-                if !server.docs.contains_key(&doc_id) {
+                if !server.registry.is_resident(&doc_id) {
                     break;
                 }
             }
             assert!(
-                !server.docs.contains_key(&doc_id),
+                !server.registry.is_resident(&doc_id),
                 "doc should have been GC-evicted"
             );
 
@@ -3363,7 +3292,7 @@ mod test {
             // Many multiples of the two-probe GC cadence.
             tokio::time::sleep(Duration::from_millis(200)).await;
             assert!(
-                server.docs.contains_key(&doc_id),
+                server.registry.is_resident(&doc_id),
                 "a held awareness ref is the current liveness contract; GC must not evict"
             );
         }
@@ -3405,6 +3334,50 @@ mod test {
             assert_ne!(baseline, Some(after));
             let dwskv = server.get_or_create_doc(&doc_id).await.unwrap();
             assert!(!dwskv.sync_kv().is_dirty());
+        }
+
+        /// Beat one of the client-compatible drain: the pre-close flush
+        /// persists every dirty doc while sockets stay open and docs stay
+        /// resident — it must not close, evict, or cancel anything.
+        #[tokio::test(start_paused = true)]
+        async fn shutdown_flush_persists_while_docs_keep_serving() {
+            let store = MemoryStore::new();
+            let server = Arc::new(
+                test_server(
+                    Some(Box::new(store.clone())),
+                    // Long checkpoint so the persistence worker can't be
+                    // the one doing the flushing.
+                    Duration::from_secs(600),
+                    false,
+                    CancellationToken::new(),
+                )
+                .await,
+            );
+
+            let doc_id = server.create_doc().await.unwrap();
+            {
+                let dwskv = server.get_or_create_doc(&doc_id).await.unwrap();
+                dwskv.apply_update(&content_update("k", "v")).unwrap();
+                assert!(dwskv.sync_kv().is_dirty());
+            }
+
+            server.flush_all_docs().await;
+
+            let key = format!("{doc_id}/data.ysweet");
+            assert!(
+                store.get_bytes(&key).is_some(),
+                "pre-close flush must reach the store"
+            );
+            let dwskv = server.get_or_create_doc(&doc_id).await.unwrap();
+            assert!(!dwskv.sync_kv().is_dirty());
+            assert!(
+                server.registry.is_resident(&doc_id),
+                "the flush must not evict"
+            );
+            assert!(
+                !server.doc_close_token.is_cancelled(),
+                "the flush must not close sockets"
+            );
         }
 
         #[tokio::test(start_paused = true)]
