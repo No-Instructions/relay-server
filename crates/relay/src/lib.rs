@@ -9,4 +9,6 @@ pub mod migrations;
 pub mod server;
 pub mod stores;
 pub mod subdocs;
+#[cfg(test)]
+pub(crate) mod test_util;
 pub mod webhook;

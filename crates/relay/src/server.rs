@@ -2659,7 +2659,7 @@ mod test {
         assert!(token.token.is_none());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn drain_doc_workers_completes_after_cancel() {
         let token = CancellationToken::new();
         let server = Server::new(
@@ -2773,53 +2773,23 @@ mod test {
 
     #[tokio::test]
     async fn test_read_only_socket_access_allows_persisted_unloaded_doc() {
-        use async_trait::async_trait;
-        use std::collections::HashSet;
-        use y_sweet_core::store::Result as StoreResult;
-
-        struct ExistingDocStore {
-            existing_keys: HashSet<String>,
-        }
-
-        #[async_trait]
-        impl Store for ExistingDocStore {
-            async fn init(&self) -> StoreResult<()> {
-                Ok(())
-            }
-
-            async fn get(&self, _key: &str) -> StoreResult<Option<Vec<u8>>> {
-                Ok(None)
-            }
-
-            async fn set(&self, _key: &str, _value: Vec<u8>) -> StoreResult<()> {
-                Ok(())
-            }
-
-            async fn remove(&self, _key: &str) -> StoreResult<()> {
-                Ok(())
-            }
-
-            async fn exists(&self, key: &str) -> StoreResult<bool> {
-                Ok(self.existing_keys.contains(key))
-            }
-        }
+        use y_sweet_core::store::memory::MemoryStore;
 
         let doc_id = "persisted-doc";
-        let store = ExistingDocStore {
-            existing_keys: HashSet::from([format!("{}/data.ysweet", doc_id)]),
-        };
-        let server = Server::new(
+        let store = MemoryStore::new();
+        // Seed the store so the doc exists without being loaded. The
+        // access check only consults `exists`, never the bytes.
+        store
+            .set(&format!("{}/data.ysweet", doc_id), vec![])
+            .await
+            .unwrap();
+        let server = crate::test_util::test_server(
             Some(Box::new(store)),
             Duration::from_secs(60),
-            None,
-            None,
-            vec![],
-            CancellationToken::new(),
             true,
-            None,
+            CancellationToken::new(),
         )
-        .await
-        .unwrap();
+        .await;
 
         assert!(!server.docs.contains_key(doc_id));
         server
@@ -2841,52 +2811,7 @@ mod test {
 
     #[tokio::test]
     async fn test_file_head_endpoint() {
-        use async_trait::async_trait;
-        use std::collections::HashMap;
-        use std::sync::Arc;
-        use y_sweet_core::store::Result as StoreResult;
-
-        // Create a mock store for testing
-        #[derive(Clone)]
-        struct MockStore {
-            files: Arc<HashMap<String, Vec<u8>>>,
-        }
-
-        #[async_trait]
-        impl Store for MockStore {
-            async fn init(&self) -> StoreResult<()> {
-                Ok(())
-            }
-
-            async fn get(&self, key: &str) -> StoreResult<Option<Vec<u8>>> {
-                Ok(self.files.get(key).cloned())
-            }
-
-            async fn set(&self, _key: &str, _value: Vec<u8>) -> StoreResult<()> {
-                Ok(())
-            }
-
-            async fn remove(&self, _key: &str) -> StoreResult<()> {
-                Ok(())
-            }
-
-            async fn exists(&self, key: &str) -> StoreResult<bool> {
-                Ok(self.files.contains_key(key))
-            }
-
-            async fn generate_upload_url(
-                &self,
-                _key: &str,
-                _content_type: Option<&str>,
-                _content_length: Option<u64>,
-            ) -> StoreResult<Option<String>> {
-                Ok(Some("http://mock-upload-url".to_string()))
-            }
-
-            async fn generate_download_url(&self, _key: &str) -> StoreResult<Option<String>> {
-                Ok(Some("http://mock-download-url".to_string()))
-            }
-        }
+        use crate::test_util::PresignedStore;
 
         // Create a mock authenticator
         let mut authenticator = y_sweet_core::auth::Authenticator::gen_key().unwrap();
@@ -2909,12 +2834,11 @@ mod test {
             .unwrap();
 
         // Set up the mock store with the test file
-        let mut mock_files = HashMap::new();
-        mock_files.insert(format!("files/{}/{}", doc_id, file_hash), vec![1, 2, 3, 4]);
-
-        let mock_store = MockStore {
-            files: Arc::new(mock_files),
-        };
+        let mock_store = PresignedStore::new();
+        mock_store
+            .set(&format!("files/{}/{}", doc_id, file_hash), vec![1, 2, 3, 4])
+            .await
+            .unwrap();
 
         // Create the server with our mock components
         let server_state = Arc::new(
@@ -3298,9 +3222,10 @@ mod test {
 
     /// Test that persistence workers terminate when docs are garbage collected.
     /// This is a regression test for the memory leak fixed in PR #401.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_persistence_worker_terminates_on_gc() {
-        // Use a very short checkpoint frequency to speed up the test
+        // Paused time auto-advances through the worker sleeps, so the
+        // checkpoint frequency costs nothing in wall-clock terms.
         let checkpoint_freq = Duration::from_millis(50);
 
         let server = Arc::new(
@@ -3346,6 +3271,180 @@ mod test {
             wait_result.is_ok(),
             "Persistence workers should terminate after GC, but they hung"
         );
+    }
+
+    /// Characterization tests for the current document lifecycle. These pin
+    /// behavior that must survive the lifecycle redesign; they are written
+    /// against the current implementation and must stay green through
+    /// every migration step.
+    mod lifecycle_characterization {
+        use super::*;
+        use crate::test_util::{test_server, GatedStore};
+        use y_sweet_core::store::memory::MemoryStore;
+        use yrs::{Map, Out, ReadTxn, Transact};
+
+        /// A v1 update inserting `value` under `key` in the "data" map.
+        fn content_update(key: &str, value: &str) -> Vec<u8> {
+            let doc = yrs::Doc::new();
+            let map = doc.get_or_insert_map("data");
+            {
+                let mut txn = doc.transact_mut();
+                map.insert(&mut txn, key, value);
+            }
+            let txn = doc.transact();
+            txn.encode_state_as_update_v1(&yrs::StateVector::default())
+        }
+
+        fn read_content(dwskv: &DocWithSyncKv, key: &str) -> Option<String> {
+            let awareness = dwskv.awareness();
+            let awareness = awareness.read().unwrap();
+            let doc = awareness.doc();
+            let txn = doc.transact();
+            let map = txn.get_map("data")?;
+            match map.get(&txn, key) {
+                Some(Out::Any(yrs::Any::String(s))) => Some(s.to_string()),
+                _ => None,
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn evicted_doc_state_survives_reload() {
+            let store = MemoryStore::new();
+            let server = test_server(
+                Some(Box::new(store.clone())),
+                Duration::from_millis(10),
+                true,
+                CancellationToken::new(),
+            )
+            .await;
+
+            let doc_id = server.create_doc().await.unwrap();
+            {
+                // Scope the map ref: it holds a shard guard the GC's
+                // eviction needs.
+                let dwskv = server.get_or_create_doc(&doc_id).await.unwrap();
+                dwskv.apply_update(&content_update("k", "v")).unwrap();
+            }
+
+            // The GC needs two idle probes plus the eviction pass; paused
+            // time auto-advances through the worker sleeps.
+            for _ in 0..50 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                if !server.docs.contains_key(&doc_id) {
+                    break;
+                }
+            }
+            assert!(
+                !server.docs.contains_key(&doc_id),
+                "doc should have been GC-evicted"
+            );
+
+            let dwskv = server.get_or_create_doc(&doc_id).await.unwrap();
+            assert_eq!(
+                read_content(&dwskv, "k").as_deref(),
+                Some("v"),
+                "state written before eviction must survive the reload"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn held_awareness_ref_prevents_gc() {
+            let server = test_server(
+                None,
+                Duration::from_millis(10),
+                true,
+                CancellationToken::new(),
+            )
+            .await;
+
+            let doc_id = server.create_doc().await.unwrap();
+            let _held = server.get_or_create_doc(&doc_id).await.unwrap().awareness();
+
+            // Many multiples of the two-probe GC cadence.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(
+                server.docs.contains_key(&doc_id),
+                "a held awareness ref is the current liveness contract; GC must not evict"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn http_update_persisted_within_checkpoint_freq() {
+            let checkpoint_freq = Duration::from_secs(10);
+            let store = MemoryStore::new();
+            let server = Arc::new(
+                test_server(
+                    Some(Box::new(store.clone())),
+                    checkpoint_freq,
+                    false,
+                    CancellationToken::new(),
+                )
+                .await,
+            );
+
+            let doc_id = server.create_doc().await.unwrap();
+            let key = format!("{doc_id}/data.ysweet");
+            // A fresh doc is clean, so the initial persist is a no-op and
+            // the key may not exist yet.
+            let baseline = store.get_bytes(&key);
+
+            update_doc_inner(
+                doc_id.clone(),
+                server.clone(),
+                Authorization::Full,
+                Bytes::from(content_update("k", "v")),
+            )
+            .await
+            .unwrap();
+
+            tokio::time::sleep(checkpoint_freq + Duration::from_secs(1)).await;
+
+            let after = store
+                .get_bytes(&key)
+                .expect("an HTTP update must reach the store within checkpoint_freq");
+            assert_ne!(baseline, Some(after));
+            let dwskv = server.get_or_create_doc(&doc_id).await.unwrap();
+            assert!(!dwskv.sync_kv().is_dirty());
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn concurrent_first_loads_hit_store_once() {
+            let store = GatedStore::new();
+            let server = Arc::new(
+                test_server(
+                    Some(Box::new(store.clone())),
+                    Duration::from_secs(10),
+                    false,
+                    CancellationToken::new(),
+                )
+                .await,
+            );
+
+            let doc_id = "same-doc";
+            let awareness_refs = futures::future::join_all((0..8).map(|_| {
+                let server = server.clone();
+                async move {
+                    let dwskv = server.get_or_create_doc(doc_id).await.unwrap();
+                    dwskv.awareness()
+                }
+            }))
+            .await;
+
+            let key = format!("{doc_id}/data.ysweet");
+            assert_eq!(
+                store.get_count(&key),
+                1,
+                "concurrent first loads must single-flight the store read"
+            );
+
+            let first = &awareness_refs[0];
+            for awareness in &awareness_refs[1..] {
+                assert!(
+                    Arc::ptr_eq(first, awareness),
+                    "all concurrent loaders must see the same instance"
+                );
+            }
+        }
     }
 
     mod socket_teardown {

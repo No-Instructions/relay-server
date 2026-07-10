@@ -34,6 +34,7 @@ thiserror = "1.0.44"
 toml = "0.8"
 coset = "0.3.7"
 ciborium = "0.2.2"
+dashmap = "6.0.1"
 p256 = "0.13.2"
 ecdsa = "0.16.9"
 ed25519-dalek = { version = "2.1.1", features = ["pkcs8", "pem"] }
@@ -48,4 +49,3 @@ prometheus = "0.13"
 
 [dev-dependencies]
 tokio = { version = "1.29.1", features = ["macros", "rt-multi-thread"] }
-dashmap = "6.0.1"
