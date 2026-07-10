@@ -18,8 +18,246 @@
 use dashmap::DashMap;
 use std::future::Future;
 use std::sync::{Arc, RwLock};
-use tokio::sync::Mutex as AsyncMutex;
-use y_sweet_core::doc_sync::DocWithSyncKv;
+use tokio::sync::{
+    mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+    watch, Mutex as AsyncMutex,
+};
+use y_sweet_core::{
+    doc_sync::DocWithSyncKv, metrics::RelayMetrics, sync::awareness::Awareness, sync_kv::SyncKv,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachKind {
+    Socket,
+    Http,
+    Subdoc,
+}
+
+impl AttachKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            AttachKind::Socket => "socket",
+            AttachKind::Http => "http",
+            AttachKind::Subdoc => "subdoc",
+        }
+    }
+}
+
+/// The actor-side view of a doc's lifecycle. `Loading` is a registry-slot
+/// phase, so the observable states start at the actor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleState {
+    Active { connections: usize },
+    Idle,
+}
+
+/// Mailbox messages for a doc's lifecycle actor. In the shadow-accounting
+/// phase the actor only maintains explicit connection counts; eviction
+/// authority moves here in a later migration step.
+pub enum DocMsg {
+    Attach {
+        kind: AttachKind,
+    },
+    Detach {
+        kind: AttachKind,
+    },
+    #[allow(dead_code)] // authoritative from the persistence step onward
+    Dirty,
+}
+
+/// Handle to a doc's lifecycle actor. Cloned into the registry slot and
+/// every guard; the actor exits when the last sender is gone.
+#[derive(Clone)]
+pub struct DocHandle {
+    tx: UnboundedSender<DocMsg>,
+    state: watch::Receiver<LifecycleState>,
+}
+
+impl DocHandle {
+    /// Attach to the doc: counts the attachment and returns the RAII
+    /// guard carrying the data-plane handles. The guard holds a strong
+    /// awareness clone so the (still-authoritative) strong-count liveness
+    /// probes see guards exactly as they saw raw awareness refs.
+    pub fn attach(&self, kind: AttachKind, doc: &Arc<DocWithSyncKv>) -> AttachGuard {
+        // Unbounded send: never blocks; failure means the actor is gone,
+        // in which case there is no count left to maintain.
+        let _ = self.tx.send(DocMsg::Attach { kind });
+        AttachGuard {
+            kind,
+            awareness: doc.awareness(),
+            doc: Arc::clone(doc),
+            tx: self.tx.clone(),
+        }
+    }
+
+    /// Explicit connection count as the actor sees it. Shadow-accounting
+    /// accessor: exists so the GC worker can compare counts against the
+    /// strong-count probe; deleted when eviction flips to the counts.
+    pub fn connections(&self) -> usize {
+        match *self.state.borrow() {
+            LifecycleState::Active { connections } => connections,
+            LifecycleState::Idle => 0,
+        }
+    }
+
+    pub fn state(&self) -> watch::Receiver<LifecycleState> {
+        self.state.clone()
+    }
+}
+
+/// RAII attachment to a live doc. Dropping it detaches: the send is
+/// unbounded and infallible from sync contexts, so accounting cannot be
+/// lost by a caller forgetting a teardown path.
+pub struct AttachGuard {
+    kind: AttachKind,
+    doc: Arc<DocWithSyncKv>,
+    /// Strong awareness clone, held for the shadow-accounting phase: the
+    /// strong-count probes must see one ref per attachment, exactly as
+    /// they saw the raw clones this guard replaces.
+    awareness: Arc<RwLock<Awareness>>,
+    tx: UnboundedSender<DocMsg>,
+}
+
+impl AttachGuard {
+    pub fn awareness(&self) -> Arc<RwLock<Awareness>> {
+        Arc::clone(&self.awareness)
+    }
+
+    pub fn sync_kv(&self) -> Arc<SyncKv> {
+        self.doc.sync_kv()
+    }
+
+    pub fn doc(&self) -> &Arc<DocWithSyncKv> {
+        &self.doc
+    }
+}
+
+impl Drop for AttachGuard {
+    fn drop(&mut self) {
+        let _ = self.tx.send(DocMsg::Detach { kind: self.kind });
+    }
+}
+
+/// A resident doc: the instance plus its lifecycle actor's handle.
+#[derive(Clone)]
+pub(crate) struct Resident {
+    pub doc: Arc<DocWithSyncKv>,
+    pub handle: DocHandle,
+}
+
+/// The per-doc lifecycle actor. In this phase it is a pure connection
+/// ledger: it processes Attach/Detach in mailbox order, publishes the
+/// resulting state on a watch channel, and emits transition metrics.
+struct DocActor {
+    doc_id: String,
+    mailbox: UnboundedReceiver<DocMsg>,
+    state_tx: watch::Sender<LifecycleState>,
+    sockets: usize,
+    https: usize,
+    subdocs: usize,
+    metrics: Arc<RelayMetrics>,
+}
+
+impl DocActor {
+    fn spawn(doc_id: String, metrics: Arc<RelayMetrics>) -> DocHandle {
+        let (tx, mailbox) = unbounded_channel();
+        let (state_tx, state_rx) = watch::channel(LifecycleState::Idle);
+        metrics.record_lifecycle_transition("loading", "idle");
+        let actor = DocActor {
+            doc_id,
+            mailbox,
+            state_tx,
+            sockets: 0,
+            https: 0,
+            subdocs: 0,
+            metrics,
+        };
+        tokio::spawn(actor.run());
+        DocHandle {
+            tx,
+            state: state_rx,
+        }
+    }
+
+    fn connections(&self) -> usize {
+        self.sockets + self.https + self.subdocs
+    }
+
+    async fn run(mut self) {
+        // The slot holds one sender and each guard holds one; the actor
+        // ends when the doc is evicted and the last guard is gone.
+        while let Some(msg) = self.mailbox.recv().await {
+            match msg {
+                DocMsg::Attach { kind } => {
+                    let was = self.connections();
+                    match kind {
+                        AttachKind::Socket => self.sockets += 1,
+                        AttachKind::Http => self.https += 1,
+                        AttachKind::Subdoc => self.subdocs += 1,
+                    }
+                    if was == 0 {
+                        self.metrics.record_lifecycle_transition("idle", "active");
+                    }
+                    self.publish();
+                    tracing::debug!(
+                        doc_id = %self.doc_id,
+                        kind = kind.as_str(),
+                        connections = self.connections(),
+                        "attach"
+                    );
+                }
+                DocMsg::Detach { kind } => {
+                    let counter = match kind {
+                        AttachKind::Socket => &mut self.sockets,
+                        AttachKind::Http => &mut self.https,
+                        AttachKind::Subdoc => &mut self.subdocs,
+                    };
+                    debug_assert!(*counter > 0, "detach without matching attach");
+                    *counter = counter.saturating_sub(1);
+                    if self.connections() == 0 {
+                        self.metrics.record_lifecycle_transition("active", "idle");
+                    }
+                    self.publish();
+                    tracing::debug!(
+                        doc_id = %self.doc_id,
+                        kind = kind.as_str(),
+                        connections = self.connections(),
+                        "detach"
+                    );
+                }
+                DocMsg::Dirty => {}
+            }
+        }
+    }
+
+    fn publish(&self) {
+        let state = match self.connections() {
+            0 => LifecycleState::Idle,
+            n => LifecycleState::Active { connections: n },
+        };
+        let _ = self.state_tx.send(state);
+    }
+}
+
+/// A bare actor handle for harnesses that drive the socket path without
+/// a registry (see `server.rs`'s in-memory socket tests).
+#[cfg(test)]
+pub(crate) fn test_actor_handle(doc_id: &str, metrics: Arc<RelayMetrics>) -> DocHandle {
+    DocActor::spawn(doc_id.to_string(), metrics)
+}
+
+/// The shadow-accounting comparison: does the explicit connection count
+/// agree with the awareness strong-count probe? A single-instant mismatch
+/// can be an attach/detach caught mid-flight (the guard's awareness clone
+/// and its mailbox message are not atomic), so callers only record a
+/// mismatch after it persists across two consecutive checks.
+/// Returns whether this check disagreed.
+pub(crate) fn shadow_accounting_disagrees(resident: &Resident) -> bool {
+    let probe = Arc::downgrade(&resident.doc.awareness());
+    let strong_alive = probe.strong_count() > 1;
+    let counted_alive = resident.handle.connections() > 0;
+    strong_alive != counted_alive
+}
 
 /// What an evictor decided after inspecting the doc under the slot lock.
 pub enum EvictDecision {
@@ -41,7 +279,7 @@ pub enum EvictOutcome {
 }
 
 struct SlotState {
-    doc: Option<Arc<DocWithSyncKv>>,
+    doc: Option<Resident>,
     /// Set exactly once, under the slot mutex, when the slot is removed
     /// from the map. Tells mutex waiters their slot is dead.
     defunct: bool,
@@ -64,23 +302,46 @@ impl Slot {
     }
 }
 
-#[derive(Default)]
 pub struct DocRegistry {
     slots: DashMap<String, Arc<Slot>>,
+    metrics: Arc<RelayMetrics>,
 }
 
 impl DocRegistry {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(metrics: Arc<RelayMetrics>) -> Self {
+        Self {
+            slots: DashMap::new(),
+            metrics,
+        }
     }
 
     /// Lock-free view of a resident doc. During an eviction the doc is
     /// already withdrawn from the slot, so a peek misses and the caller
     /// serializes through `get_or_load`.
     pub fn peek(&self, doc_id: &str) -> Option<Arc<DocWithSyncKv>> {
+        self.peek_resident(doc_id).map(|r| r.doc)
+    }
+
+    pub(crate) fn peek_resident(&self, doc_id: &str) -> Option<Resident> {
         let slot = self.slots.get(doc_id)?;
         let state = slot.state.read().unwrap();
         state.doc.clone()
+    }
+
+    /// Load (if needed) and attach in one step: the returned guard is the
+    /// unit of explicit connection accounting.
+    pub async fn attach<F, Fut>(
+        &self,
+        doc_id: &str,
+        kind: AttachKind,
+        loader: F,
+    ) -> anyhow::Result<AttachGuard>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = anyhow::Result<DocWithSyncKv>>,
+    {
+        let resident = self.get_or_load_resident(doc_id, loader).await?;
+        Ok(resident.handle.attach(kind, &resident.doc))
     }
 
     pub fn is_resident(&self, doc_id: &str) -> bool {
@@ -95,6 +356,7 @@ impl DocRegistry {
         self.slots
             .iter()
             .filter_map(|entry| entry.value().state.read().unwrap().doc.clone())
+            .map(|resident| resident.doc)
             .collect()
     }
 
@@ -122,13 +384,25 @@ impl DocRegistry {
         F: Fn() -> Fut,
         Fut: Future<Output = anyhow::Result<DocWithSyncKv>>,
     {
+        Ok(self.get_or_load_resident(doc_id, loader).await?.doc)
+    }
+
+    async fn get_or_load_resident<F, Fut>(
+        &self,
+        doc_id: &str,
+        loader: F,
+    ) -> anyhow::Result<Resident>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = anyhow::Result<DocWithSyncKv>>,
+    {
         loop {
             // Fast path: no slot mutex. An evicting doc is already
             // withdrawn from the slot state, so this cannot observe one.
             if let Some(slot) = self.slots.get(doc_id) {
-                let doc = slot.state.read().unwrap().doc.clone();
-                if let Some(doc) = doc {
-                    return Ok(doc);
+                let resident = slot.state.read().unwrap().doc.clone();
+                if let Some(resident) = resident {
+                    return Ok(resident);
                 }
             }
 
@@ -150,16 +424,19 @@ impl DocRegistry {
                     // waited; start over from the map.
                     continue;
                 }
-                if let Some(doc) = state.doc.clone() {
-                    return Ok(doc);
+                if let Some(resident) = state.doc.clone() {
+                    return Ok(resident);
                 }
             }
 
             match loader().await {
                 Ok(doc) => {
-                    let doc = Arc::new(doc);
-                    slot.state.write().unwrap().doc = Some(Arc::clone(&doc));
-                    return Ok(doc);
+                    let resident = Resident {
+                        doc: Arc::new(doc),
+                        handle: DocActor::spawn(doc_id.to_string(), self.metrics.clone()),
+                    };
+                    slot.state.write().unwrap().doc = Some(resident.clone());
+                    return Ok(resident);
                 }
                 Err(err) => {
                     slot.state.write().unwrap().defunct = true;
@@ -186,20 +463,20 @@ impl DocRegistry {
         };
         let _guard = slot.mu.lock().await;
 
-        let doc = {
+        let resident = {
             let mut state = slot.state.write().unwrap();
             if state.defunct {
                 return EvictOutcome::Absent;
             }
             match state.doc.take() {
-                Some(doc) => doc,
+                Some(resident) => resident,
                 None => return EvictOutcome::Absent,
             }
         };
 
-        match evictor(Arc::clone(&doc)).await {
+        match evictor(Arc::clone(&resident.doc)).await {
             EvictDecision::Refuse => {
-                slot.state.write().unwrap().doc = Some(doc);
+                slot.state.write().unwrap().doc = Some(resident);
                 EvictOutcome::Refused
             }
             EvictDecision::Evict => {
@@ -218,6 +495,17 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use y_sweet_core::store::{memory::MemoryStore, Store};
 
+    fn test_metrics() -> Arc<RelayMetrics> {
+        RelayMetrics::new_with_registry(&prometheus::Registry::new()).unwrap()
+    }
+
+    /// Let the actor drain its mailbox (single-threaded test runtime).
+    async fn settle() {
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+    }
+
     async fn load_doc<S: Store + Clone + 'static>(
         store: &S,
         doc_id: &str,
@@ -234,7 +522,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn single_flight_concurrent_loads_share_one_load() {
         let store = GatedStore::new();
-        let registry = Arc::new(DocRegistry::new());
+        let registry = Arc::new(DocRegistry::new(test_metrics()));
         let loads = Arc::new(AtomicUsize::new(0));
 
         let docs = futures::future::join_all((0..8).map(|_| {
@@ -277,7 +565,7 @@ mod tests {
         // Enough injected failures that every concurrent caller's own
         // load attempt fails (waiters retry with their own load).
         let store = FailStore::new(8);
-        let registry = Arc::new(DocRegistry::new());
+        let registry = Arc::new(DocRegistry::new(test_metrics()));
 
         let results = futures::future::join_all((0..8).map(|_| {
             let registry = registry.clone();
@@ -312,7 +600,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn evict_removes_slot_and_next_load_is_fresh() {
         let store = MemoryStore::new();
-        let registry = DocRegistry::new();
+        let registry = DocRegistry::new(test_metrics());
 
         let doc = registry
             .get_or_load("doc", || {
@@ -354,7 +642,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn refused_evict_keeps_doc_resident() {
         let store = MemoryStore::new();
-        let registry = DocRegistry::new();
+        let registry = DocRegistry::new(test_metrics());
 
         let doc = registry
             .get_or_load("doc", || {
@@ -389,7 +677,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn evict_holds_slot_against_concurrent_load_until_final_persist() {
         let store = GatedStore::new();
-        let registry = Arc::new(DocRegistry::new());
+        let registry = Arc::new(DocRegistry::new(test_metrics()));
 
         let doc = registry
             .get_or_load("doc", || {
@@ -456,7 +744,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn slot_count_returns_to_zero_after_load_evict_cycles() {
         let store = MemoryStore::new();
-        let registry = DocRegistry::new();
+        let registry = DocRegistry::new(test_metrics());
 
         for round in 0..10 {
             registry
@@ -477,5 +765,187 @@ mod tests {
                 "round {round}: eviction must fully reclaim the slot"
             );
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn attach_guard_drop_sends_detach_and_count_reaches_zero() {
+        let store = MemoryStore::new();
+        let registry = DocRegistry::new(test_metrics());
+        let loader = || {
+            let store = store.clone();
+            async move { load_doc(&store, "doc").await }
+        };
+
+        let socket_guard = registry
+            .attach("doc", AttachKind::Socket, loader)
+            .await
+            .unwrap();
+        let http_guard = registry
+            .attach("doc", AttachKind::Http, loader)
+            .await
+            .unwrap();
+        settle().await;
+
+        let resident = registry.peek_resident("doc").unwrap();
+        assert_eq!(resident.handle.connections(), 2);
+        assert_eq!(
+            *resident.handle.state().borrow(),
+            LifecycleState::Active { connections: 2 }
+        );
+
+        drop(socket_guard);
+        settle().await;
+        assert_eq!(resident.handle.connections(), 1);
+
+        drop(http_guard);
+        settle().await;
+        assert_eq!(resident.handle.connections(), 0);
+        assert_eq!(*resident.handle.state().borrow(), LifecycleState::Idle);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn attach_kinds_tracked_independently() {
+        let store = MemoryStore::new();
+        let registry = DocRegistry::new(test_metrics());
+        let loader = || {
+            let store = store.clone();
+            async move { load_doc(&store, "doc").await }
+        };
+
+        let subdoc_guard = registry
+            .attach("doc", AttachKind::Subdoc, loader)
+            .await
+            .unwrap();
+
+        // Socket attachments come and go; the subdoc pin must keep the
+        // doc Active throughout.
+        for _ in 0..3 {
+            let socket_guard = registry
+                .attach("doc", AttachKind::Socket, loader)
+                .await
+                .unwrap();
+            drop(socket_guard);
+            settle().await;
+            let resident = registry.peek_resident("doc").unwrap();
+            assert_eq!(
+                *resident.handle.state().borrow(),
+                LifecycleState::Active { connections: 1 },
+                "the subdoc pin alone must keep the doc active"
+            );
+        }
+
+        drop(subdoc_guard);
+        settle().await;
+        let resident = registry.peek_resident("doc").unwrap();
+        assert_eq!(*resident.handle.state().borrow(), LifecycleState::Idle);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transition_metrics_emitted() {
+        let metrics = test_metrics();
+        let store = MemoryStore::new();
+        let registry = DocRegistry::new(metrics.clone());
+        let loader = || {
+            let store = store.clone();
+            async move { load_doc(&store, "doc").await }
+        };
+
+        let transitions = |from: &str, to: &str| {
+            metrics
+                .doc_lifecycle_transitions_total
+                .with_label_values(&[from, to])
+                .get()
+        };
+
+        let guard = registry
+            .attach("doc", AttachKind::Socket, loader)
+            .await
+            .unwrap();
+        settle().await;
+        assert_eq!(transitions("loading", "idle"), 1.0, "actor birth");
+        assert_eq!(transitions("idle", "active"), 1.0, "first attach");
+
+        drop(guard);
+        settle().await;
+        assert_eq!(transitions("active", "idle"), 1.0, "last detach");
+    }
+
+    /// The step-3 shippability contract: a guard holds exactly one strong
+    /// awareness clone, so the strong-count probes (still authoritative
+    /// for eviction) see attachments exactly as before the swap.
+    #[tokio::test(start_paused = true)]
+    async fn guard_holds_awareness_so_strong_count_agrees() {
+        let store = MemoryStore::new();
+        let registry = DocRegistry::new(test_metrics());
+        let loader = || {
+            let store = store.clone();
+            async move { load_doc(&store, "doc").await }
+        };
+
+        let doc = registry.get_or_load("doc", loader).await.unwrap();
+        let probe = Arc::downgrade(&doc.awareness());
+        assert_eq!(probe.strong_count(), 1, "baseline: only the doc's own ref");
+
+        let guard = registry
+            .attach("doc", AttachKind::Socket, loader)
+            .await
+            .unwrap();
+        assert_eq!(probe.strong_count(), 2, "a guard is one awareness ref");
+
+        drop(guard);
+        assert_eq!(probe.strong_count(), 1, "detach releases the ref");
+    }
+
+    /// A scripted attach/detach sequence during which the shadow
+    /// comparison (explicit counts vs strong-count probe) must never
+    /// disagree once the actor has drained its mailbox. This is the
+    /// in-vitro version of the soak the GC worker runs in production.
+    #[tokio::test(start_paused = true)]
+    async fn shadow_mismatch_metric_zero_across_scripted_sequence() {
+        let store = MemoryStore::new();
+        let registry = DocRegistry::new(test_metrics());
+        let loader = || {
+            let store = store.clone();
+            async move { load_doc(&store, "doc").await }
+        };
+
+        let check = |step: &str| {
+            let resident = registry.peek_resident("doc").unwrap();
+            assert!(
+                !shadow_accounting_disagrees(&resident),
+                "shadow accounting disagreed after: {step}"
+            );
+        };
+
+        registry.get_or_load("doc", loader).await.unwrap();
+        settle().await;
+        check("load without attach");
+
+        let socket = registry
+            .attach("doc", AttachKind::Socket, loader)
+            .await
+            .unwrap();
+        settle().await;
+        check("socket attach");
+
+        let subdoc = registry
+            .attach("doc", AttachKind::Subdoc, loader)
+            .await
+            .unwrap();
+        let http = registry
+            .attach("doc", AttachKind::Http, loader)
+            .await
+            .unwrap();
+        settle().await;
+        check("three concurrent kinds");
+
+        drop(http);
+        drop(socket);
+        settle().await;
+        check("partial detach");
+
+        drop(subdoc);
+        settle().await;
+        check("fully idle");
     }
 }

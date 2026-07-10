@@ -1,4 +1,4 @@
-use crate::doc_lifecycle::{DocRegistry, EvictDecision, EvictOutcome};
+use crate::doc_lifecycle::{AttachGuard, AttachKind, DocRegistry, EvictDecision, EvictOutcome};
 use anyhow::{anyhow, Result};
 use axum::{
     body::Bytes,
@@ -22,11 +22,7 @@ use futures::{Sink, SinkExt, Stream, StreamExt, TryStreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{
-    io::Write,
-    sync::{Arc, RwLock},
-    time::Duration,
-};
+use std::{io::Write, sync::Arc, time::Duration};
 use tempfile::NamedTempFile;
 use tokio::{
     net::TcpListener,
@@ -50,7 +46,6 @@ use y_sweet_core::{
     },
     metrics::RelayMetrics,
     store::Store,
-    sync::awareness::Awareness,
     sync_kv::SyncKv,
     webhook::WebhookConfig,
 };
@@ -297,7 +292,7 @@ impl Server {
         tracing::info!("Event dispatcher created successfully");
 
         Ok(Self {
-            registry: Arc::new(DocRegistry::new()),
+            registry: Arc::new(DocRegistry::new(metrics.clone())),
             doc_worker_tracker: TaskTracker::new(),
             store: store.map(Arc::new),
             checkpoint_freq,
@@ -444,12 +439,16 @@ impl Server {
             .unwrap_or_else(|| doc_id.to_string());
 
         // If this doc routes to a different channel (i.e., it's a subdoc),
-        // ensure the parent is loaded and hold a reference to prevent GC.
+        // load the parent and pin it with an explicit Subdoc attachment:
+        // the guard both counts on the parent's actor and holds a parent
+        // awareness ref (which the strong-count probes still key on).
         // Lock order is strictly child slot → parent slot, and parents
         // never route elsewhere, so no cycle exists.
-        let parent_awareness_guard = if routing_channel_name != doc_id {
-            let parent = self.get_or_create_boxed(&routing_channel_name).await?;
-            Some(parent.awareness())
+        let parent_guard = if routing_channel_name != doc_id {
+            Some(
+                self.attach_doc_boxed(&routing_channel_name, AttachKind::Subdoc)
+                    .await?,
+            )
         } else {
             None
         };
@@ -461,13 +460,14 @@ impl Server {
             let user_for_callback = user.clone();
             let registry = self.registry.clone();
             let doc_id_for_callback = doc_id.to_string();
-            // Capture parent awareness to keep it alive (prevents GC while subdoc exists)
-            let _parent_awareness = parent_awareness_guard;
+            // The parent pin lives in this closure, which the doc owns via
+            // its SyncKv observer: the guard detaches when the doc drops.
+            let _parent_guard = parent_guard;
 
             if let Some(dispatcher) = event_dispatcher {
                 Some(Arc::new(move |mut event: DocumentUpdatedEvent| {
-                    // Keep parent awareness alive by referencing it in the closure
-                    let _ = &_parent_awareness;
+                    // Keep the parent pin alive by referencing it in the closure
+                    let _ = &_parent_guard;
                     // Add user to event if available
                     if let Some(ref user) = user_for_callback {
                         event.user = Some(user.clone());
@@ -556,6 +556,7 @@ impl Server {
                         doc_id.clone(),
                         checkpoint_freq,
                         cancellation_token,
+                        self.metrics.clone(),
                     )
                     .instrument(span!(Level::INFO, "gc_loop", doc_id=?doc_id)),
                 );
@@ -570,14 +571,35 @@ impl Server {
         doc_id: String,
         checkpoint_freq: Duration,
         cancellation_token: CancellationToken,
+        metrics: Arc<RelayMetrics>,
     ) {
         let mut checkpoints_without_refs = 0;
+        let mut consecutive_shadow_mismatches = 0u32;
 
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(checkpoint_freq) => {
-                    if let Some(doc) = registry.peek(&doc_id) {
-                        let awareness = Arc::downgrade(&doc.awareness());
+                    if let Some(resident) = registry.peek_resident(&doc_id) {
+                        // Shadow-accounting soak: the explicit counts must
+                        // agree with the strong-count probe before eviction
+                        // can flip to them. A single-tick disagreement can
+                        // be an attach/detach caught mid-flight, so only
+                        // two consecutive mismatched ticks count as drift.
+                        if crate::doc_lifecycle::shadow_accounting_disagrees(&resident) {
+                            consecutive_shadow_mismatches += 1;
+                            if consecutive_shadow_mismatches >= 2 {
+                                metrics.record_lifecycle_accounting_mismatch();
+                                tracing::warn!(
+                                    doc_id = %doc_id,
+                                    connections = resident.handle.connections(),
+                                    "lifecycle shadow accounting mismatch: explicit counts disagree with the awareness strong-count probe"
+                                );
+                            }
+                        } else {
+                            consecutive_shadow_mismatches = 0;
+                        }
+
+                        let awareness = Arc::downgrade(&resident.doc.awareness());
                         if awareness.strong_count() > 1 {
                             checkpoints_without_refs = 0;
                             tracing::debug!("doc is still alive - it has {} references", awareness.strong_count());
@@ -741,17 +763,41 @@ impl Server {
             .await
     }
 
-    /// Boxed form of [`Self::get_or_create_doc`] for use inside
-    /// `build_doc`, which recursively calls it to load a subdoc's parent.
-    /// The recursion terminates because a parent never routes to another
-    /// channel, and no lock cycle exists because parent loads take only
-    /// the parent's own slot lock.
-    fn get_or_create_boxed<'a>(
+    /// Load (if needed) and attach to a doc. The guard is the unit of
+    /// explicit connection accounting; every socket, HTTP one-shot, and
+    /// subdoc parent pin holds one for exactly as long as it can touch
+    /// the doc.
+    pub async fn attach_doc(
+        &self,
+        doc_id: &str,
+        kind: AttachKind,
+        routing_channel: Option<String>,
+        user: Option<String>,
+    ) -> Result<AttachGuard> {
+        Self::validate_doc_id(doc_id)?;
+        self.registry
+            .attach(doc_id, kind, || {
+                let routing_channel = routing_channel.clone();
+                let user = user.clone();
+                async move {
+                    tracing::info!(doc_id=?doc_id, channel=?routing_channel, user=?user, "Loading doc");
+                    self.build_doc(doc_id, routing_channel, user).await
+                }
+            })
+            .await
+    }
+
+    /// Boxed form of [`Self::attach_doc`] for use inside `build_doc`,
+    /// which recursively calls it to pin a subdoc's parent. The recursion
+    /// terminates because a parent never routes to another channel, and
+    /// no lock cycle exists because parent loads take only the parent's
+    /// own slot lock.
+    fn attach_doc_boxed<'a>(
         &'a self,
         doc_id: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Arc<DocWithSyncKv>>> + Send + 'a>>
-    {
-        Box::pin(self.get_or_create_doc_with_channel_and_user(doc_id, None, None))
+        kind: AttachKind,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<AttachGuard>> + Send + 'a>> {
+        Box::pin(self.attach_doc(doc_id, kind, None, None))
     }
 
     pub fn check_auth(
@@ -963,12 +1009,12 @@ async fn get_doc_as_update(
     let token = get_token_from_header(auth_header);
     let _ = server_state.verify_doc_token(token.as_deref(), &doc_id)?;
 
-    let dwskv = server_state
-        .get_or_create_doc(&doc_id)
+    let guard = server_state
+        .attach_doc(&doc_id, AttachKind::Http, None, None)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    let update = dwskv.as_update();
+    let update = guard.doc().as_update();
     tracing::debug!("update: {:?}", update);
     Ok(update.into_response())
 }
@@ -1017,12 +1063,12 @@ async fn update_doc_inner(
         ));
     }
 
-    let dwskv = server_state
-        .get_or_create_doc(&doc_id)
+    let guard = server_state
+        .attach_doc(&doc_id, AttachKind::Http, None, None)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    if let Err(err) = dwskv.apply_update(&body) {
+    if let Err(err) = guard.doc().apply_update(&body) {
         tracing::error!(?err, "Failed to apply update");
         return Err(AppError::new(StatusCode::INTERNAL_SERVER_ERROR, err));
     }
@@ -1059,12 +1105,10 @@ async fn handle_socket_upgrade_with_channel_and_user(
     };
 
     let user_for_pud = user.clone();
-    let dwskv = server_state
-        .get_or_create_doc_with_channel_and_user(&doc_id, routing_channel, user)
+    let guard = server_state
+        .attach_doc(&doc_id, AttachKind::Socket, routing_channel, user)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let awareness = dwskv.awareness();
-    let sync_kv = dwskv.sync_kv();
     // Socket loops watch the doc-close token (a child of the server token)
     // so shutdown can close them ahead of the graceful drain.
     let cancellation_token = server_state.doc_close_token.clone();
@@ -1072,11 +1116,12 @@ async fn handle_socket_upgrade_with_channel_and_user(
     let metrics = server_state.metrics.clone();
     let doc_id_clone = doc_id.clone();
 
+    // The guard moves into the upgrade closure: an abandoned upgrade
+    // detaches via RAII.
     Ok(ws.on_upgrade(move |socket| {
         handle_socket(
             socket,
-            awareness,
-            sync_kv,
+            guard,
             authorization,
             expiration_time,
             user_for_pud,
@@ -1203,8 +1248,7 @@ async fn handle_socket_upgrade_full_path(
 
 async fn handle_socket(
     socket: WebSocket,
-    awareness: Arc<RwLock<Awareness>>,
-    sync_kv: Arc<SyncKv>,
+    guard: AttachGuard,
     authorization: Authorization,
     expiration_time: Option<u64>,
     user: Option<String>,
@@ -1217,8 +1261,7 @@ async fn handle_socket(
     handle_socket_inner(
         sink,
         stream,
-        awareness,
-        sync_kv,
+        guard,
         authorization,
         expiration_time,
         user,
@@ -1236,8 +1279,7 @@ async fn handle_socket(
 async fn handle_socket_inner<S, T, E>(
     mut sink: S,
     mut stream: T,
-    awareness: Arc<RwLock<Awareness>>,
-    sync_kv: Arc<SyncKv>,
+    guard: AttachGuard,
     authorization: Authorization,
     expiration_time: Option<u64>,
     user: Option<String>,
@@ -1250,6 +1292,8 @@ async fn handle_socket_inner<S, T, E>(
     T: Stream<Item = Result<Message, E>> + Unpin,
     E: std::fmt::Debug,
 {
+    let awareness = guard.awareness();
+    let sync_kv = guard.sync_kv();
     let (send, mut recv) = channel(1024);
 
     // Cancelled when the writer task exits (sink write failure) or when the
@@ -1412,9 +1456,12 @@ async fn handle_socket_inner<S, T, E>(
     // socket drains, but the checkpoint throttle may still be holding
     // changes — an unsignaled suspend would freeze them dirty. Flush now:
     // it is the same PUT the throttle already owed, just earlier, and a
-    // no-op when clean. Holders of the awareness Arc at this point are the
-    // doc's DocWithSyncKv, this probe, and two per live connection.
+    // no-op when clean. The guard (and its awareness ref) must drop before
+    // the probe: holders at this point are then the doc's DocWithSyncKv,
+    // this probe, and three per other live connection (DocConnection,
+    // guard, probe).
     drop(connection);
+    drop(guard);
     if Arc::strong_count(&awareness_probe) <= 2 {
         if sync_kv_flush.is_dirty() {
             metrics.record_doc_dirty_at_drain();
@@ -2571,8 +2618,10 @@ async fn metrics_endpoint(State(_server_state): State<Arc<Server>>) -> Result<St
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::sync::RwLock;
     use y_sweet_core::api_types::Authorization;
     use y_sweet_core::auth::ExpirationTimeEpochMillis;
+    use y_sweet_core::sync::awareness::Awareness;
 
     #[tokio::test]
     async fn test_auth_doc() {
@@ -3297,6 +3346,57 @@ mod test {
             );
         }
 
+        /// The subdoc→parent pin contract: a parent must stay resident
+        /// while any of its subdocs is resident, and must become evictable
+        /// once the last subdoc is gone (the pin must not leak).
+        #[tokio::test(start_paused = true)]
+        async fn subdoc_parent_pinned_by_guard_not_closure() {
+            let store = MemoryStore::new();
+            let server = test_server(
+                Some(Box::new(store.clone())),
+                Duration::from_millis(10),
+                true,
+                CancellationToken::new(),
+            )
+            .await;
+
+            let parent_id = "parent-doc";
+            let child_id = "child-doc";
+            // Loading a doc with a routing channel != its own id makes it a
+            // subdoc; the load force-loads the parent and pins it.
+            server
+                .get_or_create_doc_with_channel(child_id, Some(parent_id.to_string()))
+                .await
+                .unwrap();
+            assert!(server.registry.is_resident(child_id));
+            assert!(server.registry.is_resident(parent_id));
+
+            // While the child is resident the parent must be pinned.
+            let mut ticks = 0;
+            while server.registry.is_resident(child_id) {
+                assert!(
+                    server.registry.is_resident(parent_id),
+                    "parent must not be evicted under a live subdoc"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                ticks += 1;
+                assert!(ticks < 100, "child was never GC-evicted");
+            }
+
+            // Once the child is gone its pin is released; the parent must
+            // itself be evictable (the pin must not leak).
+            for _ in 0..100 {
+                if !server.registry.is_resident(parent_id) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(
+                !server.registry.is_resident(parent_id),
+                "parent pin leaked after the last subdoc was evicted"
+            );
+        }
+
         #[tokio::test(start_paused = true)]
         async fn http_update_persisted_within_checkpoint_freq() {
             let checkpoint_freq = Duration::from_secs(10);
@@ -3430,10 +3530,21 @@ mod test {
         struct SocketHarness {
             to_server: tokio::sync::mpsc::Sender<Result<Message, axum::Error>>,
             from_server: futures_mpsc::UnboundedReceiver<Message>,
-            awareness: Arc<RwLock<Awareness>>,
+            /// Keeps the doc alive, standing in for the registry slot. The
+            /// harness must NOT retain a raw awareness clone: the
+            /// last-disconnect probe counts awareness refs, and an extra
+            /// retained clone would shift its threshold.
+            doc: Arc<DocWithSyncKv>,
             sync_kv: Arc<SyncKv>,
             metrics: Arc<RelayMetrics>,
             task: tokio::task::JoinHandle<()>,
+        }
+
+        impl SocketHarness {
+            /// Transient awareness access for assertions.
+            fn awareness(&self) -> Arc<RwLock<Awareness>> {
+                self.doc.awareness()
+            }
         }
 
         /// Run handle_socket_inner against in-memory socket halves so
@@ -3442,15 +3553,20 @@ mod test {
             let (to_server, stream_rx) =
                 tokio::sync::mpsc::channel::<Result<Message, axum::Error>>(64);
             let (sink_tx, from_server) = futures_mpsc::unbounded::<Message>();
-            let awareness = Arc::new(RwLock::new(Awareness::new(yrs::Doc::new())));
             let metrics = RelayMetrics::new_with_registry(&prometheus::Registry::new()).unwrap();
-            let sync_kv = Arc::new(SyncKv::new(None, "test_doc", || ()).await.unwrap());
+            let doc = Arc::new(
+                DocWithSyncKv::new("test_doc", None, || (), None)
+                    .await
+                    .unwrap(),
+            );
+            let sync_kv = doc.sync_kv();
+            let handle = crate::doc_lifecycle::test_actor_handle("test_doc", metrics.clone());
+            let guard = handle.attach(crate::doc_lifecycle::AttachKind::Socket, &doc);
 
             let task = tokio::spawn(handle_socket_inner(
                 sink_tx,
                 ReceiverStream::new(stream_rx),
-                awareness.clone(),
-                sync_kv.clone(),
+                guard,
                 Authorization::Full,
                 None,
                 None,
@@ -3463,7 +3579,7 @@ mod test {
             SocketHarness {
                 to_server,
                 from_server,
-                awareness,
+                doc,
                 sync_kv,
                 metrics,
                 task,
@@ -3489,7 +3605,7 @@ mod test {
         #[tokio::test(start_paused = true)]
         async fn stream_eof_tears_down_connection_and_clears_awareness() {
             let harness = spawn_socket(CancellationToken::new()).await;
-            let base_clients = harness.awareness.read().unwrap().clients().len();
+            let base_clients = harness.awareness().read().unwrap().clients().len();
 
             harness
                 .to_server
@@ -3499,7 +3615,7 @@ mod test {
 
             tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
-                    if harness.awareness.read().unwrap().clients().len() == base_clients + 1 {
+                    if harness.awareness().read().unwrap().clients().len() == base_clients + 1 {
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -3510,6 +3626,7 @@ mod test {
 
             // End the stream without a close handshake, as a vanished client
             // whose TCP connection got reset would.
+            let doc = harness.doc.clone();
             drop(harness.to_server);
 
             tokio::time::timeout(Duration::from_secs(5), harness.task)
@@ -3518,7 +3635,7 @@ mod test {
                 .unwrap();
 
             assert_eq!(
-                harness.awareness.read().unwrap().clients().len(),
+                doc.awareness().read().unwrap().clients().len(),
                 base_clients,
                 "DocConnection drop should remove the client's awareness state"
             );
