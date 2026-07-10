@@ -984,12 +984,24 @@ async fn main() -> Result<()> {
             let signal = shutdown_signal().await;
 
             tracing::info!("Received {}, shutting down.", signal);
+            // Client-compatible drain: deployed clients stop retrying a
+            // dropped socket after a brief burst of refused attempts, so
+            // the close-to-exit window must stay well under a second.
+            //
+            // Beat 1: flush every dirty doc while sockets keep serving —
+            // the slow store work happens before any client notices.
+            server.flush_all_docs().await;
+            // Beat 2: cutover. Cancel the workers; their final persists
+            // cover only the delta written during the flush, so this is
+            // bounded by a handful of PUTs.
             token.cancel();
-
+            server.drain_doc_workers().await;
+            // Beat 3: exit now. Deliberately do NOT await the HTTP drain:
+            // a bound listener that refuses upgrades eats into the
+            // reconnect budget of every client it turns away.
+            main_handle.abort();
             if let Some(metrics_handle) = metrics_handle {
-                let _ = tokio::join!(main_handle, metrics_handle);
-            } else {
-                let _ = main_handle.await;
+                metrics_handle.abort();
             }
             tracing::info!("Server shut down.");
         }

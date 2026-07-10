@@ -307,6 +307,49 @@ impl Server {
         })
     }
 
+    /// First beat of the client-compatible shutdown drain: persist every
+    /// resident doc while sockets stay open and serving. Deployed clients
+    /// stop retrying a dropped socket after a sub-second burst of refused
+    /// attempts, so the slow store work must happen before any
+    /// client-visible disconnect, keeping the close-to-exit window inside
+    /// that budget.
+    pub async fn flush_all_docs(&self) {
+        let started = std::time::Instant::now();
+        // Collect handles first: a DashMap shard guard must not be held
+        // across an await.
+        let sync_kvs: Vec<_> = self
+            .docs
+            .iter()
+            .map(|entry| entry.value().sync_kv())
+            .collect();
+        let docs = sync_kvs.len();
+        for sync_kv in sync_kvs {
+            if let Err(e) = sync_kv.persist().await {
+                tracing::error!(?e, "Error persisting during pre-close flush");
+            }
+        }
+        tracing::info!(
+            "pre-close flush: {} docs persisted in {} ms",
+            docs,
+            started.elapsed().as_millis()
+        );
+    }
+
+    /// Wait for every per-doc worker to finish. The persistence workers
+    /// run one final unthrottled persist when the server token cancels,
+    /// so returning means the flush is fully on the store.
+    pub async fn drain_doc_workers(&self) {
+        let docs = self.docs.len();
+        let started = std::time::Instant::now();
+        self.doc_worker_tracker.close();
+        self.doc_worker_tracker.wait().await;
+        tracing::info!(
+            "final flush: {} docs persisted in {} ms",
+            docs,
+            started.elapsed().as_millis()
+        );
+    }
+
     pub async fn doc_exists(&self, doc_id: &str) -> bool {
         // Reject system keys
         if Self::validate_doc_id(doc_id).is_err() {
@@ -838,11 +881,7 @@ impl Server {
             tracing::info!("Event dispatcher shutdown complete");
         }
 
-        tracing::info!("Closing doc worker tracker...");
-        self.doc_worker_tracker.close();
-        tracing::info!("Waiting for doc workers to finish...");
-        self.doc_worker_tracker.wait().await;
-        tracing::info!("All doc workers stopped");
+        self.drain_doc_workers().await;
 
         Ok(())
     }
@@ -2422,6 +2461,33 @@ mod test {
         assert_eq!(token.url, expected_url);
         assert_eq!(token.doc_id, doc_id);
         assert!(token.token.is_none());
+    }
+
+    #[tokio::test]
+    async fn drain_doc_workers_completes_after_cancel() {
+        let token = CancellationToken::new();
+        let server = Server::new(
+            None,
+            Duration::from_secs(60),
+            None,
+            None,
+            vec![],
+            token.clone(),
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // A live doc spawns persistence (and gc) workers; despite the 60s
+        // checkpoint throttle, cancellation must run the final persist and
+        // let the drain return promptly.
+        server.create_doc().await.unwrap();
+        token.cancel();
+
+        tokio::time::timeout(Duration::from_secs(5), server.drain_doc_workers())
+            .await
+            .expect("doc workers did not finish their final persist");
     }
 
     #[tokio::test]
