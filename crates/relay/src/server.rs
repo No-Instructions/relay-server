@@ -1,4 +1,4 @@
-use crate::doc_lifecycle::{AttachGuard, AttachKind, DocRegistry, EvictDecision, EvictOutcome};
+use crate::doc_lifecycle::{AttachGuard, AttachKind, DocRegistry, LifecycleConfig};
 use anyhow::{anyhow, Result};
 use axum::{
     body::Bytes,
@@ -235,8 +235,6 @@ pub struct Server {
     /// alone closes every doc WebSocket without stopping anything else, so
     /// shutdown can clear the sockets before axum's graceful drain starts.
     doc_close_token: CancellationToken,
-    /// Whether to garbage collect docs that are no longer in use.
-    doc_gc: bool,
     event_dispatcher: Option<Arc<dyn EventDispatcher>>,
     sync_protocol_event_sender: Arc<SyncProtocolEventSender>,
     metrics: Arc<RelayMetrics>,
@@ -292,7 +290,13 @@ impl Server {
         tracing::info!("Event dispatcher created successfully");
 
         Ok(Self {
-            registry: Arc::new(DocRegistry::new(metrics.clone())),
+            registry: Arc::new(DocRegistry::new(
+                metrics.clone(),
+                LifecycleConfig {
+                    checkpoint_freq,
+                    doc_gc,
+                },
+            )),
             doc_worker_tracker: TaskTracker::new(),
             store: store.map(Arc::new),
             checkpoint_freq,
@@ -301,7 +305,6 @@ impl Server {
             allowed_hosts,
             doc_close_token: cancellation_token.child_token(),
             cancellation_token,
-            doc_gc,
             event_dispatcher,
             sync_protocol_event_sender,
             metrics,
@@ -548,126 +551,9 @@ impl Server {
                 )
                 .instrument(span!(Level::INFO, "save_loop", doc_id=?doc_id)),
             );
-
-            if self.doc_gc {
-                self.doc_worker_tracker.spawn(
-                    Self::doc_gc_worker(
-                        self.registry.clone(),
-                        doc_id.clone(),
-                        checkpoint_freq,
-                        cancellation_token,
-                        self.metrics.clone(),
-                    )
-                    .instrument(span!(Level::INFO, "gc_loop", doc_id=?doc_id)),
-                );
-            }
         }
 
         Ok(dwskv)
-    }
-
-    async fn doc_gc_worker(
-        registry: Arc<DocRegistry>,
-        doc_id: String,
-        checkpoint_freq: Duration,
-        cancellation_token: CancellationToken,
-        metrics: Arc<RelayMetrics>,
-    ) {
-        let mut checkpoints_without_refs = 0;
-        let mut consecutive_shadow_mismatches = 0u32;
-
-        loop {
-            tokio::select! {
-                _ = tokio::time::sleep(checkpoint_freq) => {
-                    if let Some(resident) = registry.peek_resident(&doc_id) {
-                        // Shadow-accounting soak: the explicit counts must
-                        // agree with the strong-count probe before eviction
-                        // can flip to them. A single-tick disagreement can
-                        // be an attach/detach caught mid-flight, so only
-                        // two consecutive mismatched ticks count as drift.
-                        if crate::doc_lifecycle::shadow_accounting_disagrees(&resident) {
-                            consecutive_shadow_mismatches += 1;
-                            if consecutive_shadow_mismatches >= 2 {
-                                metrics.record_lifecycle_accounting_mismatch();
-                                tracing::warn!(
-                                    doc_id = %doc_id,
-                                    connections = resident.handle.connections(),
-                                    "lifecycle shadow accounting mismatch: explicit counts disagree with the awareness strong-count probe"
-                                );
-                            }
-                        } else {
-                            consecutive_shadow_mismatches = 0;
-                        }
-
-                        let awareness = Arc::downgrade(&resident.doc.awareness());
-                        if awareness.strong_count() > 1 {
-                            checkpoints_without_refs = 0;
-                            tracing::debug!("doc is still alive - it has {} references", awareness.strong_count());
-                        } else {
-                            checkpoints_without_refs += 1;
-                            tracing::info!("doc has only one reference, candidate for GC. checkpoints_without_refs: {}", checkpoints_without_refs);
-                        }
-                    } else {
-                        break;
-                    }
-
-                    if checkpoints_without_refs >= 2 {
-                        // Eviction runs under the registry's slot lock: a
-                        // loader either finds the doc resident or waits
-                        // until the store already holds the final flush.
-                        let outcome = registry.evict(&doc_id, |doc| async move {
-                            // A connection may have attached between the
-                            // idle checks and taking the slot lock; it
-                            // holds awareness refs. Un-evict rather than
-                            // orphan it on an instance the registry no
-                            // longer knows: an orphan's updates dispatch
-                            // only to its own instance and are invisible
-                            // to every later connection.
-                            let probe = Arc::downgrade(&doc.awareness());
-                            if probe.strong_count() > 1 {
-                                tracing::info!("attach raced GC; un-evicting doc");
-                                return EvictDecision::Refuse;
-                            }
-                            tracing::info!("GCing doc");
-                            // Compact PUD before shutdown: dedup ids, clear
-                            // ds. The mutations create tombstones which yrs
-                            // GC will clean up, and the update observer
-                            // marks SyncKv dirty so the compacted state
-                            // gets persisted.
-                            let result = doc.compact_user_data();
-                            if !result.is_empty() {
-                                tracing::debug!(
-                                    ids_removed = result.ids_removed,
-                                    ds_removed = result.ds_removed,
-                                    "Compacted PermanentUserData"
-                                );
-                            }
-                            // The final state must reach the store before
-                            // the slot lock releases: a reload racing a
-                            // fire-and-forget flush loads a stale snapshot
-                            // and its next persist rolls the doc back.
-                            if let Err(e) = doc.sync_kv().persist().await {
-                                tracing::error!(?e, "Error persisting during GC eviction");
-                            }
-                            doc.sync_kv().shutdown();
-                            EvictDecision::Evict
-                        }).await;
-
-                        match outcome {
-                            EvictOutcome::Refused => {
-                                checkpoints_without_refs = 0;
-                                continue;
-                            }
-                            EvictOutcome::Evicted | EvictOutcome::Absent => break,
-                        }
-                    }
-                }
-                _ = cancellation_token.cancelled() => {
-                    break;
-                }
-            };
-        }
-        tracing::info!("Exiting gc_loop");
     }
 
     async fn doc_persistence_worker(
@@ -1314,11 +1200,6 @@ async fn handle_socket_inner<S, T, E>(
 
     let send_clone = send.clone();
     let metrics_clone = metrics.clone();
-    // Held past the connection's lifetime: the awareness strong count tells
-    // the teardown whether this handler was the doc's last connection (the
-    // same liveness test the gc worker uses), and the flush needs the kv.
-    let awareness_probe = awareness.clone();
-    let sync_kv_flush = sync_kv.clone();
     let mut conn = DocConnection::new_with_expiration(
         awareness,
         authorization,
@@ -1452,24 +1333,12 @@ async fn handle_socket_inner<S, T, E>(
 
     metrics.record_websocket_close(close_reason);
 
-    // The park window (auto-suspend / auto-stop) opens when a doc's last
-    // socket drains, but the checkpoint throttle may still be holding
-    // changes — an unsignaled suspend would freeze them dirty. Flush now:
-    // it is the same PUT the throttle already owed, just earlier, and a
-    // no-op when clean. The guard (and its awareness ref) must drop before
-    // the probe: holders at this point are then the doc's DocWithSyncKv,
-    // this probe, and three per other live connection (DocConnection,
-    // guard, probe).
+    // Teardown is pure RAII: dropping the guard detaches this connection
+    // from the doc's lifecycle actor, and if it was the last one, the
+    // actor's idle-entry flush persists whatever the checkpoint throttle
+    // was still holding — before the machine's park window can open.
     drop(connection);
     drop(guard);
-    if Arc::strong_count(&awareness_probe) <= 2 {
-        if sync_kv_flush.is_dirty() {
-            metrics.record_doc_dirty_at_drain();
-        }
-        if let Err(e) = sync_kv_flush.persist().await {
-            tracing::error!(?e, doc_id = %doc_id, "Error persisting on last disconnect");
-        }
-    }
 }
 
 async fn check_store(
@@ -3326,7 +3195,7 @@ mod test {
         }
 
         #[tokio::test(start_paused = true)]
-        async fn held_awareness_ref_prevents_gc() {
+        async fn held_attach_guard_prevents_eviction_until_dropped() {
             let server = test_server(
                 None,
                 Duration::from_millis(10),
@@ -3336,13 +3205,23 @@ mod test {
             .await;
 
             let doc_id = server.create_doc().await.unwrap();
-            let _held = server.get_or_create_doc(&doc_id).await.unwrap().awareness();
+            let guard = server
+                .attach_doc(&doc_id, AttachKind::Socket, None, None)
+                .await
+                .unwrap();
 
-            // Many multiples of the two-probe GC cadence.
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            // Many multiples of the idle-deadline cadence.
+            tokio::time::sleep(Duration::from_millis(500)).await;
             assert!(
                 server.registry.is_resident(&doc_id),
-                "a held awareness ref is the current liveness contract; GC must not evict"
+                "a held attachment is the liveness contract; the doc must not evict"
+            );
+
+            drop(guard);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert!(
+                !server.registry.is_resident(&doc_id),
+                "with the last attachment gone the idle deadline must evict"
             );
         }
 
@@ -3394,6 +3273,92 @@ mod test {
             assert!(
                 !server.registry.is_resident(parent_id),
                 "parent pin leaked after the last subdoc was evicted"
+            );
+        }
+
+        /// Race 6, explicit form: a live subdoc's parent pin must refuse
+        /// eviction, and releasing the last pin must make the parent
+        /// evictable — driven by explicit evicts, no timers.
+        #[tokio::test(start_paused = true)]
+        async fn parent_evicts_only_after_last_subdoc_detaches() {
+            use crate::doc_lifecycle::EvictOutcome;
+            let store = MemoryStore::new();
+            let server = test_server(
+                Some(Box::new(store.clone())),
+                Duration::from_secs(600),
+                false,
+                CancellationToken::new(),
+            )
+            .await;
+
+            server
+                .get_or_create_doc_with_channel("child-doc", Some("parent-doc".to_string()))
+                .await
+                .unwrap();
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+
+            assert_eq!(
+                server.registry.evict("parent-doc").await,
+                EvictOutcome::Refused,
+                "a live subdoc must pin its parent"
+            );
+
+            assert_eq!(
+                server.registry.evict("child-doc").await,
+                EvictOutcome::Evicted
+            );
+            // The child actor dropped its doc, releasing the Subdoc guard
+            // held by its event callback; the parent's detach follows.
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                server.registry.evict("parent-doc").await,
+                EvictOutcome::Evicted,
+                "the released pin must make the parent evictable"
+            );
+        }
+
+        /// Race 5 (the HTTP-writer park hole): an HTTP one-shot update is
+        /// an attach/detach cycle, so its detach is an idle entry and must
+        /// flush immediately — no checkpoint_freq wait, no time advance.
+        #[tokio::test(start_paused = true)]
+        async fn http_update_flushes_on_idle_entry() {
+            let store = MemoryStore::new();
+            let server = Arc::new(
+                test_server(
+                    Some(Box::new(store.clone())),
+                    // A throttle long enough that only an idle-entry flush
+                    // can explain bytes reaching the store.
+                    Duration::from_secs(600),
+                    false,
+                    CancellationToken::new(),
+                )
+                .await,
+            );
+
+            let doc_id = server.create_doc().await.unwrap();
+            update_doc_inner(
+                doc_id.clone(),
+                server.clone(),
+                Authorization::Full,
+                Bytes::from(content_update("k", "v")),
+            )
+            .await
+            .unwrap();
+
+            // Let the actor process the detach and run its flush; no
+            // virtual time may pass (sleeps would advance the throttle).
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+
+            let key = format!("{doc_id}/data.ysweet");
+            assert!(
+                store.get_bytes(&key).is_some(),
+                "an HTTP update must be flushed at idle entry, within the park window"
             );
         }
 
@@ -3560,8 +3525,11 @@ mod test {
                     .unwrap(),
             );
             let sync_kv = doc.sync_kv();
-            let handle = crate::doc_lifecycle::test_actor_handle("test_doc", metrics.clone());
-            let guard = handle.attach(crate::doc_lifecycle::AttachKind::Socket, &doc);
+            let handle = crate::doc_lifecycle::test_actor_handle(&doc, metrics.clone());
+            let guard = handle
+                .attach(crate::doc_lifecycle::AttachKind::Socket, &doc)
+                .await
+                .expect("fresh test actor must grant the attach");
 
             let task = tokio::spawn(handle_socket_inner(
                 sink_tx,
@@ -3674,8 +3642,13 @@ mod test {
             assert_eq!(closes(&harness.metrics, "server_shutdown"), 1.0);
         }
 
+        /// The socket-path half of race 4: the socket dying is the last
+        /// detach, which is an idle entry, which flushes — before the
+        /// park window can open. The flush now lives in the lifecycle
+        /// actor; the socket handler's only obligation is dropping its
+        /// guard.
         #[tokio::test(start_paused = true)]
-        async fn last_disconnect_flushes_dirty_doc() {
+        async fn idle_entry_flushes_dirty_doc() {
             let harness = spawn_socket(CancellationToken::new()).await;
 
             // Dirty the doc the way any metadata/content change would,
@@ -3696,9 +3669,15 @@ mod test {
                 .expect("read loop kept running after stream EOF")
                 .unwrap();
 
+            // The guard's detach and the actor's flush run after the
+            // socket task ends; let them settle without advancing time.
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+
             assert!(
                 !harness.sync_kv.is_dirty(),
-                "last disconnect must flush before the park window opens"
+                "idle entry must flush before the park window opens"
             );
             assert_eq!(
                 harness

@@ -34,7 +34,6 @@ pub struct RelayMetrics {
 
     // Document lifecycle metrics
     pub doc_lifecycle_transitions_total: CounterVec,
-    pub lifecycle_accounting_mismatch_total: CounterVec,
 }
 
 static RELAY_METRICS: OnceLock<Result<Arc<RelayMetrics>, prometheus::Error>> = OnceLock::new();
@@ -240,18 +239,6 @@ impl RelayMetrics {
         )?;
         registry.register(Box::new(doc_lifecycle_transitions_total.clone()))?;
 
-        let lifecycle_accounting_mismatch_total = CounterVec::new(
-            Opts::new(
-                "relay_server_lifecycle_accounting_mismatch_total",
-                "Shadow-accounting soak: ticks where explicit attach/detach counts disagreed with the awareness strong-count probe across two consecutive checks. Must stay 0 before eviction switches to the explicit counts",
-            ),
-            &[],
-        )?;
-        registry.register(Box::new(lifecycle_accounting_mismatch_total.clone()))?;
-        // Touch so it exports 0 from startup; "no drift" must be
-        // distinguishable from "no data".
-        lifecycle_accounting_mismatch_total.with_label_values(&[]);
-
         Ok(Arc::new(Self {
             webhook_requests_total,
             webhook_request_duration_seconds,
@@ -273,7 +260,6 @@ impl RelayMetrics {
             websocket_send_failures_total,
             doc_dirty_at_drain_total,
             doc_lifecycle_transitions_total,
-            lifecycle_accounting_mismatch_total,
         }))
     }
 
@@ -399,12 +385,6 @@ impl RelayMetrics {
     pub fn record_lifecycle_transition(&self, from: &str, to: &str) {
         self.doc_lifecycle_transitions_total
             .with_label_values(&[from, to])
-            .inc();
-    }
-
-    pub fn record_lifecycle_accounting_mismatch(&self) {
-        self.lifecycle_accounting_mismatch_total
-            .with_label_values(&[])
             .inc();
     }
 
