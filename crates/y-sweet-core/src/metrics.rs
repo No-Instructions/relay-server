@@ -24,6 +24,10 @@ pub struct RelayMetrics {
 
     // Object store metrics
     pub s3_requests_total: CounterVec,
+
+    // WebSocket connection lifecycle metrics
+    pub websocket_closes_total: CounterVec,
+    pub websocket_send_failures_total: CounterVec,
 }
 
 static RELAY_METRICS: OnceLock<Result<Arc<RelayMetrics>, prometheus::Error>> = OnceLock::new();
@@ -167,6 +171,25 @@ impl RelayMetrics {
         )?;
         registry.register(Box::new(s3_requests_total.clone()))?;
 
+        // WebSocket connection lifecycle metrics
+        let websocket_closes_total = CounterVec::new(
+            Opts::new(
+                "relay_server_websocket_closes_total",
+                "Total number of WebSocket connection teardowns, labeled by cause",
+            ),
+            &["reason"],
+        )?;
+        registry.register(Box::new(websocket_closes_total.clone()))?;
+
+        let websocket_send_failures_total = CounterVec::new(
+            Opts::new(
+                "relay_server_websocket_send_failures_total",
+                "Outbound WebSocket messages dropped because the connection's send channel was full or closed",
+            ),
+            &["kind"],
+        )?;
+        registry.register(Box::new(websocket_send_failures_total.clone()))?;
+
         Ok(Arc::new(Self {
             webhook_requests_total,
             webhook_request_duration_seconds,
@@ -182,6 +205,8 @@ impl RelayMetrics {
             debounced_queue_length,
             http_auth_errors_total,
             s3_requests_total,
+            websocket_closes_total,
+            websocket_send_failures_total,
         }))
     }
 
@@ -278,6 +303,19 @@ impl RelayMetrics {
     pub fn record_s3_request(&self, method: &str, outcome: &str) {
         self.s3_requests_total
             .with_label_values(&[method, outcome])
+            .inc();
+    }
+
+    // WebSocket connection lifecycle metrics methods
+    pub fn record_websocket_close(&self, reason: &str) {
+        self.websocket_closes_total
+            .with_label_values(&[reason])
+            .inc();
+    }
+
+    pub fn record_websocket_send_failure(&self, kind: &str) {
+        self.websocket_send_failures_total
+            .with_label_values(&[kind])
             .inc();
     }
 }

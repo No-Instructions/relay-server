@@ -18,7 +18,7 @@ use axum::{
 };
 use axum_extra::typed_header::TypedHeader;
 use dashmap::{mapref::one::MappedRef, DashMap};
-use futures::{SinkExt, StreamExt, TryStreamExt};
+use futures::{Sink, SinkExt, Stream, StreamExt, TryStreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -31,7 +31,7 @@ use tempfile::NamedTempFile;
 use tokio::{
     net::TcpListener,
     sync::{
-        mpsc::{channel, Receiver},
+        mpsc::{channel, error::TrySendError, Receiver},
         Mutex as AsyncMutex,
     },
 };
@@ -234,6 +234,10 @@ pub struct Server {
     url: Option<Url>,
     allowed_hosts: Vec<AllowedHost>,
     cancellation_token: CancellationToken,
+    /// Child of cancellation_token that doc socket loops watch. Firing it
+    /// alone closes every doc WebSocket without stopping anything else, so
+    /// shutdown can clear the sockets before axum's graceful drain starts.
+    doc_close_token: CancellationToken,
     /// Whether to garbage collect docs that are no longer in use.
     doc_gc: bool,
     event_dispatcher: Option<Arc<dyn EventDispatcher>>,
@@ -299,12 +303,23 @@ impl Server {
             authenticator,
             url,
             allowed_hosts,
+            doc_close_token: cancellation_token.child_token(),
             cancellation_token,
             doc_gc,
             event_dispatcher,
             sync_protocol_event_sender,
             metrics,
         })
+    }
+
+    /// Close every doc WebSocket: each socket loop breaks, sends its
+    /// client a going-away close frame, and lets its connection task
+    /// finish — so a graceful HTTP drain started afterwards has nothing
+    /// left to wait for. Cancelling the server token also fires this (the
+    /// close token is its child); calling this first merely orders the
+    /// socket close ahead of the drain.
+    pub fn close_doc_sockets(&self) {
+        self.doc_close_token.cancel();
     }
 
     /// First beat of the client-compatible shutdown drain: persist every
@@ -527,6 +542,7 @@ impl Server {
                 self.doc_worker_tracker.spawn(
                     Self::doc_gc_worker(
                         self.docs.clone(),
+                        self.loading_locks.clone(),
                         doc_id.clone(),
                         checkpoint_freq,
                         cancellation_token,
@@ -542,6 +558,7 @@ impl Server {
 
     async fn doc_gc_worker(
         docs: Arc<DashMap<String, DocWithSyncKv>>,
+        loading_locks: Arc<DashMap<String, Arc<AsyncMutex<()>>>>,
         doc_id: String,
         checkpoint_freq: Duration,
         cancellation_token: CancellationToken,
@@ -565,23 +582,56 @@ impl Server {
                     }
 
                     if checkpoints_without_refs >= 2 {
-                        tracing::info!("GCing doc");
-                        if let Some(doc) = docs.get(&doc_id) {
-                            // Compact PUD before shutdown: dedup ids, clear ds.
-                            // The mutations create tombstones which yrs GC will
-                            // clean up, and the update observer marks SyncKv
-                            // dirty so the compacted state gets persisted.
-                            let result = doc.compact_user_data();
-                            if !result.is_empty() {
-                                tracing::debug!(
-                                    ids_removed = result.ids_removed,
-                                    ds_removed = result.ds_removed,
-                                    "Compacted PermanentUserData"
-                                );
-                            }
-                            doc.sync_kv().shutdown();
+                        // Eviction is atomic with respect to attachment: it
+                        // holds the same per-doc lock ensure_doc_loaded takes,
+                        // so a loader either finds the doc in the map or
+                        // waits until the store already holds the final
+                        // flush.
+                        let lock = {
+                            let entry = loading_locks
+                                .entry(doc_id.clone())
+                                .or_insert_with(|| Arc::new(AsyncMutex::new(())));
+                            Arc::clone(entry.value())
+                        };
+                        let _guard = lock.lock().await;
+
+                        let Some((_, doc)) = docs.remove(&doc_id) else {
+                            break;
+                        };
+                        // A connection may have attached between the idle
+                        // checks and taking the lock; it holds awareness
+                        // refs. Un-evict rather than orphan it on an
+                        // instance the map no longer knows: an orphan's
+                        // updates dispatch only to its own instance and are
+                        // invisible to every later connection.
+                        let probe = Arc::downgrade(&doc.awareness());
+                        if probe.strong_count() > 1 {
+                            tracing::info!("attach raced GC; un-evicting doc");
+                            docs.insert(doc_id.clone(), doc);
+                            checkpoints_without_refs = 0;
+                            continue;
                         }
-                        docs.remove(&doc_id);
+                        tracing::info!("GCing doc");
+                        // Compact PUD before shutdown: dedup ids, clear ds.
+                        // The mutations create tombstones which yrs GC will
+                        // clean up, and the update observer marks SyncKv
+                        // dirty so the compacted state gets persisted.
+                        let result = doc.compact_user_data();
+                        if !result.is_empty() {
+                            tracing::debug!(
+                                ids_removed = result.ids_removed,
+                                ds_removed = result.ds_removed,
+                                "Compacted PermanentUserData"
+                            );
+                        }
+                        // The final state must reach the store before the
+                        // loading lock releases: a reload racing a
+                        // fire-and-forget flush loads a stale snapshot and
+                        // its next persist rolls the doc back.
+                        if let Err(e) = doc.sync_kv().persist().await {
+                            tracing::error!(?e, "Error persisting during GC eviction");
+                        }
+                        doc.sync_kv().shutdown();
                         break;
                     }
                 }
@@ -1051,7 +1101,9 @@ async fn handle_socket_upgrade_with_channel_and_user(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let awareness = dwskv.awareness();
     let sync_kv = dwskv.sync_kv();
-    let cancellation_token = server_state.cancellation_token.clone();
+    // Socket loops watch the doc-close token (a child of the server token)
+    // so shutdown can close them ahead of the graceful drain.
+    let cancellation_token = server_state.doc_close_token.clone();
     let sync_protocol_event_sender = server_state.sync_protocol_event_sender.clone();
     let metrics = server_state.metrics.clone();
     let doc_id_clone = doc_id.clone();
@@ -1197,23 +1249,83 @@ async fn handle_socket(
     doc_id: String,
     metrics: Arc<RelayMetrics>,
 ) {
-    let (mut sink, mut stream) = socket.split();
+    let (sink, stream) = socket.split();
+    handle_socket_inner(
+        sink,
+        stream,
+        awareness,
+        sync_kv,
+        authorization,
+        expiration_time,
+        user,
+        cancellation_token,
+        sync_protocol_event_sender,
+        doc_id,
+        metrics,
+    )
+    .await
+}
+
+/// Generic over the socket halves so teardown behavior can be tested without
+/// a real WebSocket upgrade.
+#[allow(clippy::too_many_arguments)]
+async fn handle_socket_inner<S, T, E>(
+    mut sink: S,
+    mut stream: T,
+    awareness: Arc<RwLock<Awareness>>,
+    sync_kv: Arc<SyncKv>,
+    authorization: Authorization,
+    expiration_time: Option<u64>,
+    user: Option<String>,
+    cancellation_token: CancellationToken,
+    sync_protocol_event_sender: Arc<SyncProtocolEventSender>,
+    doc_id: String,
+    metrics: Arc<RelayMetrics>,
+) where
+    S: Sink<Message> + Send + Unpin + 'static,
+    T: Stream<Item = Result<Message, E>> + Unpin,
+    E: std::fmt::Debug,
+{
     let (send, mut recv) = channel(1024);
+
+    // Cancelled when the writer task exits (sink write failure) or when the
+    // parent server token cancels. The read loop selects on it so the
+    // connection is torn down instead of being held forever on a socket that
+    // can no longer be written to.
+    let conn_token = cancellation_token.child_token();
+    let sink_token = conn_token.clone();
 
     tokio::spawn(async move {
         while let Some(msg) = recv.recv().await {
-            let _ = sink.send(msg).await;
+            if sink.send(msg).await.is_err() {
+                break;
+            }
         }
+        sink_token.cancel();
     });
 
     let send_clone = send.clone();
+    let metrics_clone = metrics.clone();
     let mut conn = DocConnection::new_with_expiration(
         awareness,
         authorization,
         expiration_time,
         move |bytes| {
-            if let Err(e) = send_clone.try_send(Message::Binary(bytes.to_vec())) {
-                tracing::warn!(?e, "Error sending message");
+            match send_clone.try_send(Message::Binary(bytes.to_vec())) {
+                Ok(()) => {}
+                Err(TrySendError::Closed(_)) => {
+                    // The writer task has exited; the read loop tears the
+                    // connection down as soon as it sees the cancelled token,
+                    // so this is a brief race, not an error.
+                    metrics_clone.record_websocket_send_failure("closed");
+                    tracing::debug!("Dropping outbound message: writer task exited");
+                }
+                Err(e @ TrySendError::Full(_)) => {
+                    // A dropped update silently desyncs this client until it
+                    // reconnects; the metric tracks how often that happens.
+                    metrics_clone.record_websocket_send_failure("full");
+                    tracing::warn!(?e, "Outbound channel full; dropping message");
+                }
             }
         },
     );
@@ -1226,12 +1338,16 @@ async fn handle_socket(
     // Register the connection with the sync protocol event sender
     sync_protocol_event_sender.register_doc_connection(doc_id.clone(), Arc::downgrade(&connection));
 
-    loop {
+    let close_reason = loop {
         tokio::select! {
-            Some(msg) = stream.next() => {
+            msg = stream.next() => {
+                let Some(msg) = msg else {
+                    // The stream ended without a close handshake.
+                    break "stream_eof";
+                };
                 let msg = match msg {
                     Ok(Message::Binary(bytes)) => bytes,
-                    Ok(Message::Close(_)) => break,
+                    Ok(Message::Close(_)) => break "close_frame",
                     Err(_e) => {
                         // The stream will complain about things like
                         // connections being lost without handshake.
@@ -1260,19 +1376,31 @@ async fn handle_socket(
                             code: 1008, // Policy Violation - indicates a policy violation
                             reason: "Token expired".into(),
                         })));
-                        break;
+                        break "token_expired";
                     }
                     Err(e) => {
                         tracing::warn!(?e, "Error handling message");
                     }
                 }
             }
-            _ = cancellation_token.cancelled() => {
-                tracing::debug!("Closing doc connection due to server cancel...");
-                break;
+            _ = conn_token.cancelled() => {
+                if cancellation_token.is_cancelled() {
+                    tracing::debug!("Closing doc connection due to server cancel...");
+                    // A proper close handshake instead of an abrupt drop:
+                    // the writer task drains this frame before it exits.
+                    let _ = send.try_send(Message::Close(Some(CloseFrame {
+                        code: 1001, // Going Away
+                        reason: "server shutting down".into(),
+                    })));
+                    break "server_shutdown";
+                }
+                // The child token only cancels from the writer task.
+                break "sink_error";
             }
         }
-    }
+    };
+
+    metrics.record_websocket_close(close_reason);
 }
 
 async fn check_store(
@@ -3150,6 +3278,166 @@ mod test {
             wait_result.is_ok(),
             "Persistence workers should terminate after GC, but they hung"
         );
+    }
+
+    mod socket_teardown {
+        use super::*;
+        use futures::channel::mpsc as futures_mpsc;
+        use tokio_stream::wrappers::ReceiverStream;
+        use y_sweet_core::sync::Message as SyncMessage;
+        use yrs::updates::encoder::Encode;
+
+        struct SocketHarness {
+            to_server: tokio::sync::mpsc::Sender<Result<Message, axum::Error>>,
+            from_server: futures_mpsc::UnboundedReceiver<Message>,
+            awareness: Arc<RwLock<Awareness>>,
+            metrics: Arc<RelayMetrics>,
+            task: tokio::task::JoinHandle<()>,
+        }
+
+        /// Run handle_socket_inner against in-memory socket halves so
+        /// teardown behavior is observable without a WebSocket upgrade.
+        async fn spawn_socket(server_token: CancellationToken) -> SocketHarness {
+            let (to_server, stream_rx) =
+                tokio::sync::mpsc::channel::<Result<Message, axum::Error>>(64);
+            let (sink_tx, from_server) = futures_mpsc::unbounded::<Message>();
+            let awareness = Arc::new(RwLock::new(Awareness::new(yrs::Doc::new())));
+            let metrics = RelayMetrics::new_with_registry(&prometheus::Registry::new()).unwrap();
+            let sync_kv = Arc::new(SyncKv::new(None, "test_doc", || ()).await.unwrap());
+
+            let task = tokio::spawn(handle_socket_inner(
+                sink_tx,
+                ReceiverStream::new(stream_rx),
+                awareness.clone(),
+                sync_kv,
+                Authorization::Full,
+                None,
+                None,
+                server_token,
+                Arc::new(SyncProtocolEventSender::new()),
+                "test_doc".to_string(),
+                metrics.clone(),
+            ));
+
+            SocketHarness {
+                to_server,
+                from_server,
+                awareness,
+                metrics,
+                task,
+            }
+        }
+
+        /// A y-sync awareness update announcing one client, as a client
+        /// connection would send it.
+        fn awareness_update_message() -> Vec<u8> {
+            let mut client = Awareness::new(yrs::Doc::new());
+            client.set_local_state(r#"{"user":"test"}"#);
+            let update = client.update().unwrap();
+            SyncMessage::Awareness(update).encode_v1()
+        }
+
+        fn closes(metrics: &RelayMetrics, reason: &str) -> f64 {
+            metrics
+                .websocket_closes_total
+                .with_label_values(&[reason])
+                .get()
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn stream_eof_tears_down_connection_and_clears_awareness() {
+            let harness = spawn_socket(CancellationToken::new()).await;
+            let base_clients = harness.awareness.read().unwrap().clients().len();
+
+            harness
+                .to_server
+                .send(Ok(Message::Binary(awareness_update_message())))
+                .await
+                .unwrap();
+
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if harness.awareness.read().unwrap().clients().len() == base_clients + 1 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("client awareness state was never applied");
+
+            // End the stream without a close handshake, as a vanished client
+            // whose TCP connection got reset would.
+            drop(harness.to_server);
+
+            tokio::time::timeout(Duration::from_secs(5), harness.task)
+                .await
+                .expect("read loop kept running after stream EOF")
+                .unwrap();
+
+            assert_eq!(
+                harness.awareness.read().unwrap().clients().len(),
+                base_clients,
+                "DocConnection drop should remove the client's awareness state"
+            );
+            assert_eq!(closes(&harness.metrics, "stream_eof"), 1.0);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn sink_error_tears_down_connection() {
+            let harness = spawn_socket(CancellationToken::new()).await;
+
+            // Kill the outbound half; the next write (initial sync or the
+            // first keepalive ping) fails, and the writer task must cancel
+            // the read loop rather than leave it parked forever.
+            drop(harness.from_server);
+
+            tokio::time::timeout(Duration::from_secs(60), harness.task)
+                .await
+                .expect("read loop kept running after sink write failure")
+                .unwrap();
+
+            assert_eq!(closes(&harness.metrics, "sink_error"), 1.0);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn server_cancel_closes_connection() {
+            let server_token = CancellationToken::new();
+            let harness = spawn_socket(server_token.clone()).await;
+
+            server_token.cancel();
+
+            tokio::time::timeout(Duration::from_secs(5), harness.task)
+                .await
+                .expect("read loop kept running after server cancel")
+                .unwrap();
+
+            assert_eq!(closes(&harness.metrics, "server_shutdown"), 1.0);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn server_cancel_sends_going_away_close_frame() {
+            let server_token = CancellationToken::new();
+            let mut harness = spawn_socket(server_token.clone()).await;
+
+            server_token.cancel();
+
+            tokio::time::timeout(Duration::from_secs(5), harness.task)
+                .await
+                .expect("read loop kept running after server cancel")
+                .unwrap();
+
+            // The client sees a proper close handshake, not an abrupt
+            // drop: the last frame the writer sends is Close(1001).
+            let mut last_close = None;
+            while let Ok(Some(msg)) = harness.from_server.try_next() {
+                if let Message::Close(frame) = msg {
+                    last_close = frame;
+                }
+            }
+            let frame = last_close.expect("no close frame reached the client");
+            assert_eq!(frame.code, 1001);
+        }
     }
 }
 
