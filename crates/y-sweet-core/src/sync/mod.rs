@@ -7,7 +7,43 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use yrs::updates::decoder::{Decode, Decoder};
 use yrs::updates::encoder::{Encode, Encoder};
-use yrs::{ReadTxn, StateVector, Transact, Update};
+use yrs::{Map, ReadTxn, StateVector, Transact, Update};
+
+const FILEMETA_ROOT: &str = "filemeta_v0";
+
+fn has_parent_directory_component(path: &str) -> bool {
+    path.split('/').any(|component| component == "..")
+}
+
+/// Temporary server-side guard against file metadata paths escaping their
+/// shared-folder root. Run this before the incoming transaction commits so
+/// persistence and broadcast observers only see the offending entries as
+/// tombstoned.
+pub(crate) fn block_filemeta_path_traversal(txn: &mut yrs::TransactionMut) {
+    let Some(filemeta) = txn.get_map(FILEMETA_ROOT) else {
+        return;
+    };
+
+    let blocked_keys: Vec<_> = filemeta
+        .keys(txn)
+        .filter(|key| has_parent_directory_component(key))
+        .map(str::to_owned)
+        .collect();
+
+    if blocked_keys.is_empty() {
+        return;
+    }
+
+    tracing::warn!(
+        crdt_root = FILEMETA_ROOT,
+        blocked_writes = blocked_keys.len(),
+        "Blocked file metadata writes containing path traversal"
+    );
+
+    for key in blocked_keys {
+        filemeta.remove(txn, &key);
+    }
+}
 
 /// Event message structure for CBOR serialization
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -111,6 +147,7 @@ pub trait Protocol {
     ) -> Result<Option<Message>, Error> {
         let mut txn = awareness.doc().transact_mut();
         txn.apply_update(update)?;
+        block_filemeta_path_traversal(&mut txn);
         Ok(None)
     }
 
@@ -490,7 +527,77 @@ mod test {
     use yrs::encoding::write::Write;
     use yrs::updates::decoder::{Decode, DecoderV1};
     use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
-    use yrs::{block::ClientID, Doc, GetString, ReadTxn, StateVector, Text, Transact, Update};
+    use yrs::{block::ClientID, Doc, GetString, Map, ReadTxn, StateVector, Text, Transact, Update};
+
+    fn apply_update(awareness: &mut Awareness, update: &[u8]) {
+        DefaultProtocol
+            .handle_update(awareness, Update::decode_v1(update).unwrap())
+            .unwrap();
+    }
+
+    fn full_update(doc: &Doc) -> Vec<u8> {
+        doc.transact()
+            .encode_state_as_update_v1(&StateVector::default())
+    }
+
+    #[test]
+    fn filemeta_path_traversal_writes_are_blocked() {
+        let source = Doc::with_client_id(1);
+        let filemeta = source.get_or_insert_map(super::FILEMETA_ROOT);
+        {
+            let mut txn = source.transact_mut();
+            filemeta.insert(&mut txn, "folder/note.md", "safe");
+            filemeta.insert(&mut txn, "folder/../secret.md", "blocked");
+            filemeta.insert(&mut txn, "../secret.md", "blocked");
+            filemeta.insert(&mut txn, "folder/..", "blocked");
+            filemeta.insert(&mut txn, "..", "blocked");
+            filemeta.insert(&mut txn, "folder/.../note.md", "safe");
+            filemeta.insert(&mut txn, "folder/..note.md", "safe");
+        }
+
+        let mut awareness = Awareness::default();
+        apply_update(&mut awareness, &full_update(&source));
+
+        let txn = awareness.doc().transact();
+        let filemeta = txn.get_map(super::FILEMETA_ROOT).unwrap();
+        assert!(filemeta.get(&txn, "folder/note.md").is_some());
+        assert!(filemeta.get(&txn, "folder/.../note.md").is_some());
+        assert!(filemeta.get(&txn, "folder/..note.md").is_some());
+        assert!(filemeta.get(&txn, "folder/../secret.md").is_none());
+        assert!(filemeta.get(&txn, "../secret.md").is_none());
+        assert!(filemeta.get(&txn, "folder/..").is_none());
+        assert!(filemeta.get(&txn, "..").is_none());
+    }
+
+    #[test]
+    fn pending_filemeta_path_traversal_write_is_blocked_when_integrated() {
+        let source = Doc::with_client_id(1);
+        let filemeta = source.get_or_insert_map(super::FILEMETA_ROOT);
+        let updates = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let updates_for_observer = updates.clone();
+        let _subscription = source
+            .observe_update_v1(move |_, event| {
+                updates_for_observer
+                    .lock()
+                    .unwrap()
+                    .push(event.update.clone());
+            })
+            .unwrap();
+
+        filemeta.insert(&mut source.transact_mut(), "folder/../secret.md", "first");
+        filemeta.insert(&mut source.transact_mut(), "folder/../secret.md", "second");
+
+        let updates = updates.lock().unwrap();
+        assert_eq!(updates.len(), 2);
+
+        let mut awareness = Awareness::default();
+        apply_update(&mut awareness, &updates[1]);
+        apply_update(&mut awareness, &updates[0]);
+
+        let txn = awareness.doc().transact();
+        let filemeta = txn.get_map(super::FILEMETA_ROOT).unwrap();
+        assert!(filemeta.get(&txn, "folder/../secret.md").is_none());
+    }
 
     #[test]
     fn message_encoding() {

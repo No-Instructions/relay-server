@@ -104,6 +104,7 @@ impl DocWithSyncKv {
         let mut txn = doc.transact_mut();
         txn.apply_update(update)
             .map_err(|err| anyhow!("Failed to apply update: {}", err))?;
+        crate::sync::block_filemeta_path_traversal(&mut txn);
 
         Ok(())
     }
@@ -346,6 +347,93 @@ mod tests {
         async fn exists(&self, key: &str) -> crate::store::Result<bool> {
             Ok(self.data.contains_key(key))
         }
+    }
+
+    #[tokio::test]
+    async fn out_of_order_filemeta_delete_does_not_resurrect_after_reload() {
+        let source = Doc::with_client_id(1);
+        let updates = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscription = {
+            let updates = updates.clone();
+            source
+                .observe_update_v1(move |_, event| {
+                    updates.lock().unwrap().push(event.update.clone());
+                })
+                .unwrap()
+        };
+        let map = source.get_or_insert_map("filemeta_v0");
+
+        map.insert(&mut source.transact_mut(), "k4", "v2");
+        map.insert(&mut source.transact_mut(), "k4", "v10");
+        map.insert(&mut source.transact_mut(), "k0", "v4");
+        map.insert(&mut source.transact_mut(), "k4", "v16");
+        map.insert(&mut source.transact_mut(), "k5", "v12");
+        map.insert(&mut source.transact_mut(), "k0", "v2");
+        map.insert(&mut source.transact_mut(), "k3", "v13");
+        map.remove(&mut source.transact_mut(), "k4");
+        drop(subscription);
+
+        assert!(map.get(&source.transact(), "k4").is_none());
+        let updates = Arc::into_inner(updates).unwrap().into_inner().unwrap();
+        assert_eq!(updates.len(), 8);
+
+        let store = MemoryStore::default();
+        {
+            let doc = DocWithSyncKv::new(
+                "filemeta",
+                Some(Arc::new(Box::new(store.clone()))),
+                || (),
+                None,
+            )
+            .await
+            .unwrap();
+
+            // Simulate valid updates from one peer arriving out of causal order.
+            for index in [5, 4, 3, 0, 7, 6, 1, 2] {
+                doc.apply_update(&updates[index]).unwrap();
+            }
+            doc.sync_kv().persist().await.unwrap();
+        }
+
+        let reloaded = DocWithSyncKv::new("filemeta", Some(Arc::new(Box::new(store))), || (), None)
+            .await
+            .unwrap();
+        let awareness = reloaded.awareness();
+        let guard = awareness.read().unwrap();
+        let map = guard.doc().get_or_insert_map("filemeta_v0");
+        let txn = guard.doc().transact();
+
+        assert!(map.get(&txn, "k3").is_some());
+        assert!(
+            map.get(&txn, "k4").is_none(),
+            "an out-of-order pending delete must not resurrect a removed filemeta entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_update_blocks_filemeta_path_traversal() {
+        let source = Doc::with_client_id(1);
+        let filemeta = source.get_or_insert_map("filemeta_v0");
+        {
+            let mut txn = source.transact_mut();
+            filemeta.insert(&mut txn, "folder/note.md", "safe");
+            filemeta.insert(&mut txn, "folder/../secret.md", "blocked");
+        }
+        let update = source
+            .transact()
+            .encode_state_as_update_v1(&StateVector::default());
+
+        let target = DocWithSyncKv::new("filemeta", None, || (), None)
+            .await
+            .unwrap();
+        target.apply_update(&update).unwrap();
+
+        let awareness = target.awareness();
+        let guard = awareness.read().unwrap();
+        let txn = guard.doc().transact();
+        let filemeta = txn.get_map("filemeta_v0").unwrap();
+        assert!(filemeta.get(&txn, "folder/note.md").is_some());
+        assert!(filemeta.get(&txn, "folder/../secret.md").is_none());
     }
 
     #[tokio::test]
