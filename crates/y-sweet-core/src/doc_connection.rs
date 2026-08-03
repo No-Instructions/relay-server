@@ -421,7 +421,12 @@ impl DocConnection {
                     let client_id = update.clients.keys().next().unwrap();
                     self.client_id.get_or_init(|| *client_id);
                 } else {
-                    tracing::warn!("Received awareness update with more than one client");
+                    tracing::warn!(
+                        user = ?self.user,
+                        connection_client_id = ?self.client_id.get(),
+                        update_client_ids = ?update.clients.keys().collect::<Vec<_>>(),
+                        "Received awareness update with more than one client"
+                    );
                 }
                 let mut awareness = a.write().unwrap();
                 protocol.handle_awareness_update(&mut awareness, update)

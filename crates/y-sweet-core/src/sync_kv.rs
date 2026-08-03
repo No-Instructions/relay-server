@@ -138,14 +138,14 @@ impl SyncKv {
             write_lease = Some(leased.lease);
 
             if let Some(snapshot) = leased.value {
-                tracing::info!(size=?snapshot.len(), "Loading snapshot");
+                tracing::debug!(size=?snapshot.len(), "Loading snapshot");
 
                 // Try CBOR format first
                 match ciborium::de::from_reader::<YSweetData, _>(&snapshot[..]) {
                     Ok(y_data) => {
                         created_at = Some(y_data.created_at);
                         metadata = y_data.metadata;
-                        tracing::info!("Loaded CBOR format data (version {})", y_data.version);
+                        tracing::debug!("Loaded CBOR format data (version {})", y_data.version);
                         y_data.data
                     }
                     Err(cbor_err) => {
@@ -276,7 +276,7 @@ impl SyncKv {
                 buffer
             };
 
-            tracing::info!(size=?snapshot.len(), "Persisting CBOR snapshot");
+            tracing::debug!(size=?snapshot.len(), "Persisting CBOR snapshot");
             let result = if require_lease {
                 let lease = self.write_lease.lock().unwrap().clone().ok_or_else(|| {
                     crate::store::StoreError::UnsupportedOperation(format!(

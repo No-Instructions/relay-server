@@ -579,7 +579,7 @@ impl Server {
             if !is_done && now - last_save < checkpoint_freq {
                 let sleep = tokio::time::sleep(checkpoint_freq - (now - last_save));
                 tokio::pin!(sleep);
-                tracing::info!("Throttling.");
+                tracing::debug!("Throttling.");
 
                 loop {
                     tokio::select! {
@@ -587,18 +587,18 @@ impl Server {
                             break;
                         }
                         v = recv.recv() => {
-                            tracing::info!("Received dirty while throttling.");
+                            tracing::debug!("Received dirty while throttling.");
                             if v.is_none() {
                                 break;
                             }
                         }
                         _ = cancellation_token.cancelled() => {
-                            tracing::info!("Received cancellation while throttling.");
+                            tracing::debug!("Received cancellation while throttling.");
                             break;
                         }
 
                     }
-                    tracing::info!("Done throttling.");
+                    tracing::debug!("Done throttling.");
                 }
             }
             tracing::debug!("Persisting.");
@@ -613,7 +613,7 @@ impl Server {
                 break;
             }
         }
-        tracing::info!("Terminating loop for {}", doc_id);
+        tracing::debug!("Terminating loop for {}", doc_id);
     }
 
     pub async fn get_or_create_doc(&self, doc_id: &str) -> Result<Arc<DocWithSyncKv>> {
@@ -1200,13 +1200,30 @@ async fn handle_socket_inner<S, T, E>(
 
     let send_clone = send.clone();
     let metrics_clone = metrics.clone();
+    let callback_doc_id = doc_id.clone();
+    let callback_user = user.clone();
+    // A wedged client can stay full for hours; per-message warns have produced
+    // millions of identical, contextless lines in one incident. Log the
+    // full/recovered transitions with identity, count drops in between.
+    let channel_full = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let dropped_while_full = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut conn = DocConnection::new_with_expiration(
         awareness,
         authorization,
         expiration_time,
         move |bytes| {
             match send_clone.try_send(Message::Binary(bytes.to_vec())) {
-                Ok(()) => {}
+                Ok(()) => {
+                    if channel_full.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                        tracing::info!(
+                            doc_id = %callback_doc_id,
+                            user = ?callback_user,
+                            dropped = dropped_while_full
+                                .swap(0, std::sync::atomic::Ordering::Relaxed),
+                            "Outbound channel recovered; messages were dropped while full"
+                        );
+                    }
+                }
                 Err(TrySendError::Closed(_)) => {
                     // The writer task has exited; the read loop tears the
                     // connection down as soon as it sees the cancelled token,
@@ -1214,11 +1231,18 @@ async fn handle_socket_inner<S, T, E>(
                     metrics_clone.record_websocket_send_failure("closed");
                     tracing::debug!("Dropping outbound message: writer task exited");
                 }
-                Err(e @ TrySendError::Full(_)) => {
+                Err(TrySendError::Full(_)) => {
                     // A dropped update silently desyncs this client until it
                     // reconnects; the metric tracks how often that happens.
                     metrics_clone.record_websocket_send_failure("full");
-                    tracing::warn!(?e, "Outbound channel full; dropping message");
+                    dropped_while_full.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if !channel_full.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        tracing::warn!(
+                            doc_id = %callback_doc_id,
+                            user = ?callback_user,
+                            "Outbound channel full; dropping messages until it recovers"
+                        );
+                    }
                 }
             }
         },
