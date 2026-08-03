@@ -36,6 +36,28 @@ type Callback = Arc<dyn Fn(&[u8]) + 'static + Send + Sync>;
 
 const SYNC_STATUS_MESSAGE: u8 = 102;
 
+/// An incoming update that grows the doc's delete set by at least this many
+/// clock units is logged. Clock units roughly correspond to characters for
+/// text content, so this catches section-or-larger deletions while ignoring
+/// ordinary editing. Growth is measured across the apply because SyncStep2
+/// always carries the sender's full historical delete set, which is almost
+/// entirely already applied.
+const LARGE_DELETION_CLOCK_SPAN: u32 = 200;
+
+/// Total deleted clock span per client in the doc's current delete set.
+fn deleted_spans_by_client<T: ReadTxn>(txn: &T) -> std::collections::HashMap<ClientID, u32> {
+    txn.snapshot()
+        .delete_set
+        .iter()
+        .map(|(client, ranges)| {
+            (
+                *client,
+                ranges.into_iter().map(|r| r.end - r.start).sum::<u32>(),
+            )
+        })
+        .collect()
+}
+
 pub struct DocConnection {
     awareness: Arc<RwLock<Awareness>>,
     #[allow(unused)] // acts as RAII guard
@@ -63,6 +85,9 @@ pub struct DocConnection {
     /// Authenticated user identity from the connection token.
     /// When set, the server will register new client_ids under this user in the "users" map.
     user: Option<String>,
+
+    /// Document ID, for log context only.
+    doc_id: Option<String>,
 }
 
 impl DocConnection {
@@ -211,6 +236,7 @@ impl DocConnection {
             expiration_time,
             sync_kv: None,
             user: None,
+            doc_id: None,
         }
     }
 
@@ -222,6 +248,43 @@ impl DocConnection {
     /// Set the authenticated user identity for server-driven PUD registration.
     pub fn set_user(&mut self, user: String) {
         self.user = Some(user);
+    }
+
+    /// Set the document ID for log context.
+    pub fn set_doc_id(&mut self, doc_id: String) {
+        self.doc_id = Some(doc_id);
+    }
+
+    /// Log when this connection's update grew the doc's delete set by
+    /// [LARGE_DELETION_CLOCK_SPAN] or more. The doc structurally records who
+    /// inserted content but not who deleted it, so the connection is the only
+    /// place a deletion can be attributed to a user.
+    fn log_large_deletion(
+        &self,
+        spans_before: &std::collections::HashMap<ClientID, u32>,
+        awareness: &Awareness,
+    ) {
+        let mut newly_deleted: Vec<(ClientID, u32)> =
+            deleted_spans_by_client(&awareness.doc().transact())
+                .into_iter()
+                .filter_map(|(client, span)| {
+                    let growth =
+                        span.saturating_sub(spans_before.get(&client).copied().unwrap_or(0));
+                    (growth > 0).then_some((client, growth))
+                })
+                .collect();
+        let deleted_clock_span: u32 = newly_deleted.iter().map(|(_, growth)| growth).sum();
+        if deleted_clock_span >= LARGE_DELETION_CLOCK_SPAN {
+            newly_deleted.sort_by_key(|(_, growth)| std::cmp::Reverse(*growth));
+            newly_deleted.truncate(10);
+            tracing::info!(
+                doc_id = ?self.doc_id,
+                user = ?self.user,
+                deleted_clock_span,
+                top_deleted_from = ?newly_deleted,
+                "Update applied a large deletion"
+            );
+        }
     }
 
     /// Snapshot the current state vector's client_ids (for before/after comparison).
@@ -375,10 +438,12 @@ impl DocConnection {
                     if can_write {
                         let mut awareness = a.write().unwrap();
                         let sv_before = self.snapshot_sv(&awareness);
+                        let ds_before = deleted_spans_by_client(&awareness.doc().transact());
                         let result =
                             protocol.handle_sync_step2(&mut awareness, Update::decode_v1(&update)?);
                         if result.is_ok() {
                             self.register_new_client_ids(&awareness, &sv_before);
+                            self.log_large_deletion(&ds_before, &awareness);
                         }
                         result
                     } else {
@@ -395,10 +460,12 @@ impl DocConnection {
                     if can_write {
                         let mut awareness = a.write().unwrap();
                         let sv_before = self.snapshot_sv(&awareness);
+                        let ds_before = deleted_spans_by_client(&awareness.doc().transact());
                         let result =
                             protocol.handle_update(&mut awareness, Update::decode_v1(&update)?);
                         if result.is_ok() {
                             self.register_new_client_ids(&awareness, &sv_before);
+                            self.log_large_deletion(&ds_before, &awareness);
                         }
                         result
                     } else {
@@ -421,7 +488,11 @@ impl DocConnection {
                     let client_id = update.clients.keys().next().unwrap();
                     self.client_id.get_or_init(|| *client_id);
                 } else {
-                    tracing::warn!(
+                    // Clients routinely relay the full awareness map on
+                    // reconnect; this is normal protocol behavior, not an
+                    // anomaly worth warning about.
+                    tracing::debug!(
+                        doc_id = ?self.doc_id,
                         user = ?self.user,
                         connection_client_id = ?self.client_id.get(),
                         update_client_ids = ?update.clients.keys().collect::<Vec<_>>(),
@@ -745,6 +816,42 @@ impl Drop for DocConnection {
 mod tests {
     use super::*;
     use crate::sync::{DefaultProtocol, EventMessage, Message, SyncMessage};
+
+    #[test]
+    fn test_deleted_spans_by_client_growth_measures_removed_text() {
+        use yrs::{Doc, GetString, Text};
+
+        let doc = Doc::new();
+        let client = doc.client_id();
+        let text = doc.get_or_insert_text("t");
+        {
+            let mut txn = doc.transact_mut();
+            text.insert(&mut txn, 0, &"x".repeat(500));
+        }
+        let before = deleted_spans_by_client(&doc.transact());
+        assert_eq!(before.get(&client), None);
+        {
+            let mut txn = doc.transact_mut();
+            text.remove_range(&mut txn, 0, 300);
+            assert_eq!(text.get_string(&txn).len(), 200);
+        }
+        let after = deleted_spans_by_client(&doc.transact());
+        assert_eq!(after.get(&client), Some(&300));
+
+        // Re-applying a full-state update (as SyncStep2 does) must not grow the spans.
+        {
+            let full_state = doc
+                .transact()
+                .encode_state_as_update_v1(&yrs::StateVector::default());
+            let mut txn = doc.transact_mut();
+            txn.apply_update(Update::decode_v1(&full_state).unwrap())
+                .unwrap();
+        }
+        assert_eq!(
+            deleted_spans_by_client(&doc.transact()).get(&client),
+            Some(&300)
+        );
+    }
 
     #[tokio::test]
     async fn test_query_subdocs_returns_snapshot_envelope() {
