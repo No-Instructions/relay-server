@@ -58,6 +58,10 @@ const PING_EVERY: Duration = Duration::from_secs(20);
 /// would-be keepalive reap. Observe-only: the connection is never closed for
 /// this; the metric exists to measure whether enforcement would be safe.
 const PONG_TIMEOUT: Duration = Duration::from_secs(40);
+/// How often to re-warn while a connection's outbound channel stays full. The
+/// full/recovered transition warns cover the common case; this distinguishes a
+/// client that is wedged for hours from one that stalled briefly.
+const CHANNEL_FULL_REWARN: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Debug)]
 pub struct AllowedHost {
@@ -1181,6 +1185,8 @@ async fn handle_socket_inner<S, T, E>(
     let awareness = guard.awareness();
     let sync_kv = guard.sync_kv();
     let (send, mut recv) = channel(1024);
+    let connected_at = std::time::Instant::now();
+    tracing::debug!(doc_id = %doc_id, user = ?user, "WebSocket connected");
 
     // Cancelled when the writer task exits (sink write failure) or when the
     // parent server token cancels. The read loop selects on it so the
@@ -1202,11 +1208,15 @@ async fn handle_socket_inner<S, T, E>(
     let metrics_clone = metrics.clone();
     let callback_doc_id = doc_id.clone();
     let callback_user = user.clone();
+    let log_user = user.clone();
     // A wedged client can stay full for hours; per-message warns have produced
     // millions of identical, contextless lines in one incident. Log the
-    // full/recovered transitions with identity, count drops in between.
+    // full/recovered transitions with identity, count drops in between, and
+    // re-warn periodically so a long wedge stays visible.
     let channel_full = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let dropped_while_full = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let full_since_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let last_warn_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut conn = DocConnection::new_with_expiration(
         awareness,
         authorization,
@@ -1220,6 +1230,11 @@ async fn handle_socket_inner<S, T, E>(
                             user = ?callback_user,
                             dropped = dropped_while_full
                                 .swap(0, std::sync::atomic::Ordering::Relaxed),
+                            full_secs = (connected_at.elapsed().as_millis() as u64)
+                                .saturating_sub(
+                                    full_since_ms.load(std::sync::atomic::Ordering::Relaxed),
+                                )
+                                / 1000,
                             "Outbound channel recovered; messages were dropped while full"
                         );
                     }
@@ -1235,12 +1250,32 @@ async fn handle_socket_inner<S, T, E>(
                     // A dropped update silently desyncs this client until it
                     // reconnects; the metric tracks how often that happens.
                     metrics_clone.record_websocket_send_failure("full");
-                    dropped_while_full.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let dropped =
+                        dropped_while_full.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    let now_ms = connected_at.elapsed().as_millis() as u64;
                     if !channel_full.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        full_since_ms.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+                        last_warn_ms.store(now_ms, std::sync::atomic::Ordering::Relaxed);
                         tracing::warn!(
                             doc_id = %callback_doc_id,
                             user = ?callback_user,
                             "Outbound channel full; dropping messages until it recovers"
+                        );
+                    } else if now_ms
+                        .saturating_sub(last_warn_ms.load(std::sync::atomic::Ordering::Relaxed))
+                        >= CHANNEL_FULL_REWARN.as_millis() as u64
+                    {
+                        last_warn_ms.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+                        tracing::warn!(
+                            doc_id = %callback_doc_id,
+                            user = ?callback_user,
+                            dropped,
+                            full_secs = now_ms
+                                .saturating_sub(
+                                    full_since_ms.load(std::sync::atomic::Ordering::Relaxed),
+                                )
+                                / 1000,
+                            "Outbound channel still full; dropping messages"
                         );
                     }
                 }
@@ -1248,6 +1283,7 @@ async fn handle_socket_inner<S, T, E>(
         },
     );
     conn.set_sync_kv(sync_kv);
+    conn.set_doc_id(doc_id.clone());
     if let Some(user) = user {
         conn.set_user(user);
     }
@@ -1298,7 +1334,12 @@ async fn handle_socket_inner<S, T, E>(
                         continue;
                     }
                     msg => {
-                        tracing::warn!(?msg, "Received non-binary message");
+                        tracing::warn!(
+                            doc_id = %doc_id,
+                            user = ?log_user,
+                            ?msg,
+                            "Received non-binary message"
+                        );
                         continue;
                     }
                 };
@@ -1323,7 +1364,12 @@ async fn handle_socket_inner<S, T, E>(
                         break "token_expired";
                     }
                     Err(e) => {
-                        tracing::warn!(?e, "Error handling message");
+                        tracing::warn!(
+                            doc_id = %doc_id,
+                            user = ?log_user,
+                            ?e,
+                            "Error handling message"
+                        );
                     }
                 }
             }
@@ -1356,6 +1402,13 @@ async fn handle_socket_inner<S, T, E>(
     };
 
     metrics.record_websocket_close(close_reason);
+    tracing::info!(
+        doc_id = %doc_id,
+        user = ?log_user,
+        close_reason,
+        duration_secs = connected_at.elapsed().as_secs(),
+        "WebSocket disconnected"
+    );
 
     // Teardown is pure RAII: dropping the guard detaches this connection
     // from the doc's lifecycle actor, and if it was the last one, the
