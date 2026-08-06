@@ -234,6 +234,57 @@ pub struct PrefixPermission {
     pub user: Option<String>,
 }
 
+/// The kv grant carried by private CWT claim -80203: access to every
+/// blind-store namespace under a prefix, with an optional byte limit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KvGrant {
+    pub prefix: String,
+    pub authorization: Authorization,
+    pub limit_bytes: Option<u64>,
+    pub user: Option<String>,
+}
+
+impl KvGrant {
+    /// Parse "kv:<ns-prefix>:<r|rw>[:<limit-bytes>]".
+    pub fn parse(raw: &str, user: Option<String>) -> Option<Self> {
+        let mut parts = raw.split(':');
+        if parts.next()? != "kv" {
+            return None;
+        }
+        let prefix = parts.next()?.to_string();
+        if prefix.is_empty() {
+            return None;
+        }
+        let authorization = match parts.next()? {
+            "r" => Authorization::ReadOnly,
+            "rw" => Authorization::Full,
+            _ => return None,
+        };
+        let limit_bytes = match parts.next() {
+            Some(v) => Some(v.parse().ok()?),
+            None => None,
+        };
+        if parts.next().is_some() {
+            return None;
+        }
+        Some(KvGrant {
+            prefix,
+            authorization,
+            limit_bytes,
+            user,
+        })
+    }
+
+    /// Exact-or-dash coverage: the grant for "kv-u1" covers "kv-u1"
+    /// and "kv-u1-g2", never "kv-u12".
+    pub fn covers(&self, namespace: &str) -> bool {
+        namespace == self.prefix
+            || namespace
+                .strip_prefix(&self.prefix)
+                .is_some_and(|rest| rest.starts_with('-'))
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub enum Permission {
     Server,
@@ -942,6 +993,98 @@ impl Authenticator {
         }
     }
 
+    /// Mint a bare kv token: no doc scope, just the -80203 grant.
+    /// (Doc tokens gain the grant at their own mint sites; this exists
+    /// for stores accessed without any doc context.)
+    pub fn gen_kv_token_cwt(
+        &self,
+        grant: &KvGrant,
+        expiration_time: ExpirationTimeEpochMillis,
+    ) -> Result<String, AuthError> {
+        let cwt_auth = self
+            .create_cwt_authenticator()
+            .map_err(|_| AuthError::NoSigningKey)?;
+        let mut grant_str = format!(
+            "kv:{}:{}",
+            grant.prefix,
+            match grant.authorization {
+                Authorization::ReadOnly => "r",
+                Authorization::Full => "rw",
+            }
+        );
+        if let Some(limit) = grant.limit_bytes {
+            grant_str.push_str(&format!(":{}", limit));
+        }
+        let claims = crate::cwt::CwtClaims {
+            issuer: Some("relay-server".to_string()),
+            subject: grant.user.clone(),
+            audience: self.expected_audience.clone(),
+            expiration: Some(expiration_time.0 / 1000),
+            issued_at: Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            ),
+            scope: "none".to_string(),
+            channel: None,
+            kv_grant: Some(grant_str),
+        };
+        let token_bytes = cwt_auth
+            .create_cwt(claims)
+            .map_err(|_| AuthError::CannotSignWithPublicKey)?;
+        Ok(b64_encode(&token_bytes))
+    }
+
+    /// Verify a CWT and return its kv grant claim (-80203), checking
+    /// signature, expiry, and audience exactly like any other token
+    /// (same key-id lookup and multi-key fallback as scope tokens).
+    /// The grant grammar is "kv:<ns-prefix>:<r|rw>[:<limit-bytes>]".
+    pub fn verify_kv_grant(&self, token: &str, current_time: u64) -> Result<KvGrant, AuthError> {
+        // CWT verification is audience-bound throughout this codebase;
+        // kv grants are no exception (the audience IS the assigned
+        // backup server).
+        let Some(expected_audience) = self.expected_audience.clone() else {
+            tracing::warn!("kv grant verification requires a configured audience (server.url)");
+            return Err(AuthError::InvalidToken);
+        };
+        let token_bytes = b64_decode(token)?;
+
+        let verify_with = |key_entry: &AuthKeyEntry| -> Result<crate::cwt::CwtClaims, AuthError> {
+            let cwt_auth = self
+                .create_cwt_authenticator_for_key(key_entry)
+                .map_err(|_| AuthError::InvalidToken)?;
+            cwt_auth
+                .verify_cwt(&token_bytes, &expected_audience)
+                .map_err(|_| AuthError::SignatureVerificationFailed)
+        };
+
+        let claims = match extract_cwt_key_id(token)
+            .as_deref()
+            .and_then(|kid| self.key_lookup.get(kid))
+        {
+            Some(&index) => verify_with(&self.keys[index])?,
+            None => {
+                let mut result = Err(AuthError::SignatureVerificationFailed);
+                for key_entry in &self.keys {
+                    if let Ok(claims) = verify_with(key_entry) {
+                        result = Ok(claims);
+                        break;
+                    }
+                }
+                result?
+            }
+        };
+
+        if let Some(exp) = claims.expiration {
+            if exp < current_time {
+                return Err(AuthError::Expired);
+            }
+        }
+        let raw = claims.kv_grant.ok_or(AuthError::InvalidResource)?;
+        KvGrant::parse(&raw, claims.subject).ok_or(AuthError::InvalidResource)
+    }
+
     pub fn verify_server_token(
         &self,
         token: &str,
@@ -1145,6 +1288,7 @@ impl Authenticator {
             ),
             scope: permission_to_scope(&permission),
             channel,
+            kv_grant: None,
         };
 
         let token_bytes = cwt_auth
@@ -3688,6 +3832,48 @@ mod tests {
             eprintln!("Server verification error: {:?}", server_result);
         }
         assert!(server_result.is_ok());
+    }
+
+    #[test]
+    fn test_kv_grant_roundtrip() {
+        let mut authenticator = Authenticator::gen_key().unwrap();
+        authenticator.set_expected_audience(Some("test-server".to_string()));
+        let grant = KvGrant {
+            prefix: "kv-u1".to_string(),
+            authorization: Authorization::Full,
+            limit_bytes: Some(1024),
+            user: Some("u1".to_string()),
+        };
+        let token = authenticator
+            .gen_kv_token_cwt(&grant, ExpirationTimeEpochMillis(u64::MAX / 2))
+            .unwrap();
+        let verified = authenticator.verify_kv_grant(&token, 0).unwrap();
+        assert_eq!(verified.prefix, "kv-u1");
+        assert_eq!(verified.authorization, Authorization::Full);
+        assert_eq!(verified.limit_bytes, Some(1024));
+        assert!(verified.covers("kv-u1"));
+        assert!(verified.covers("kv-u1-g2"));
+        assert!(!verified.covers("kv-u12"));
+        assert!(!verified.covers("kv-u1x"));
+
+        // Tokens without the claim are refused.
+        let doc = authenticator
+            .gen_doc_token_cwt(
+                "d1",
+                Authorization::Full,
+                ExpirationTimeEpochMillis(u64::MAX / 2),
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(authenticator.verify_kv_grant(&doc, 0).is_err());
+        // Expired grants are refused.
+        let expired = authenticator
+            .gen_kv_token_cwt(&grant, ExpirationTimeEpochMillis(1000))
+            .unwrap();
+        assert!(authenticator
+            .verify_kv_grant(&expired, u64::MAX / 4)
+            .is_err());
     }
 
     #[test]

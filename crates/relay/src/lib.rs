@@ -5,6 +5,8 @@ pub mod convert;
 pub mod doc_inspect;
 pub mod doc_restore;
 pub mod doc_versions;
+pub mod iroh_peer;
+pub mod kv;
 pub mod migrations;
 pub mod server;
 pub mod stores;

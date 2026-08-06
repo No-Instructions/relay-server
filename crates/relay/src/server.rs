@@ -18,7 +18,7 @@ use axum::{
 };
 use axum_extra::typed_header::TypedHeader;
 use dashmap::{mapref::one::MappedRef, DashMap};
-use futures::{SinkExt, StreamExt, TryStreamExt};
+use futures::{Sink, SinkExt, Stream, StreamExt, TryStreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -31,7 +31,7 @@ use tempfile::NamedTempFile;
 use tokio::{
     net::TcpListener,
     sync::{
-        mpsc::{channel, Receiver},
+        mpsc::{channel, error::TrySendError, Receiver},
         Mutex as AsyncMutex,
     },
 };
@@ -59,6 +59,13 @@ use y_sweet_core::{
 };
 
 const RELAY_SERVER_VERSION: &str = env!("GIT_VERSION");
+
+/// How often the server pings each WebSocket connection.
+const PING_EVERY: Duration = Duration::from_secs(20);
+/// How long a connection may go silent (no pong) before it is counted as a
+/// would-be keepalive reap. Observe-only: the connection is never closed for
+/// this; the metric exists to measure whether enforcement would be safe.
+const PONG_TIMEOUT: Duration = Duration::from_secs(40);
 
 #[derive(Clone, Debug)]
 pub struct AllowedHost {
@@ -237,7 +244,7 @@ pub struct Server {
     /// Whether to garbage collect docs that are no longer in use.
     doc_gc: bool,
     event_dispatcher: Option<Arc<dyn EventDispatcher>>,
-    sync_protocol_event_sender: Arc<SyncProtocolEventSender>,
+    pub(crate) sync_protocol_event_sender: Arc<SyncProtocolEventSender>,
     metrics: Arc<RelayMetrics>,
 }
 
@@ -743,6 +750,16 @@ impl Server {
         resp
     }
 
+    /// Store handle for the blind block-store surface (kv module).
+    pub(crate) fn kv_store(&self) -> Option<Arc<Box<dyn Store>>> {
+        self.store.clone()
+    }
+
+    /// Authenticator for the blind block-store surface (kv module).
+    pub(crate) fn kv_authenticator(&self) -> Option<&Authenticator> {
+        self.authenticator.as_ref()
+    }
+
     pub fn routes_with_metrics(self: &Arc<Self>) -> Router {
         self.routes().layer(middleware::from_fn_with_state(
             self.clone(),
@@ -796,7 +813,9 @@ impl Server {
             }
         }
 
-        router.with_state(self.clone())
+        router
+            .with_state(self.clone())
+            .merge(crate::kv::kv_routes(self.clone()))
     }
 
     pub fn metrics_routes(self: &Arc<Self>) -> Router {
@@ -1158,23 +1177,83 @@ async fn handle_socket(
     doc_id: String,
     metrics: Arc<RelayMetrics>,
 ) {
-    let (mut sink, mut stream) = socket.split();
+    let (sink, stream) = socket.split();
+    handle_socket_inner(
+        sink,
+        stream,
+        awareness,
+        sync_kv,
+        authorization,
+        expiration_time,
+        user,
+        cancellation_token,
+        sync_protocol_event_sender,
+        doc_id,
+        metrics,
+    )
+    .await
+}
+
+/// Generic over the socket halves so teardown behavior can be tested without
+/// a real WebSocket upgrade.
+#[allow(clippy::too_many_arguments)]
+async fn handle_socket_inner<S, T, E>(
+    mut sink: S,
+    mut stream: T,
+    awareness: Arc<RwLock<Awareness>>,
+    sync_kv: Arc<SyncKv>,
+    authorization: Authorization,
+    expiration_time: Option<u64>,
+    user: Option<String>,
+    cancellation_token: CancellationToken,
+    sync_protocol_event_sender: Arc<SyncProtocolEventSender>,
+    doc_id: String,
+    metrics: Arc<RelayMetrics>,
+) where
+    S: Sink<Message> + Send + Unpin + 'static,
+    T: Stream<Item = Result<Message, E>> + Unpin,
+    E: std::fmt::Debug,
+{
     let (send, mut recv) = channel(1024);
+
+    // Cancelled when the writer task exits (sink write failure) or when the
+    // parent server token cancels. The read loop selects on it so the
+    // connection is torn down instead of being held forever on a socket that
+    // can no longer be written to.
+    let conn_token = cancellation_token.child_token();
+    let sink_token = conn_token.clone();
 
     tokio::spawn(async move {
         while let Some(msg) = recv.recv().await {
-            let _ = sink.send(msg).await;
+            if sink.send(msg).await.is_err() {
+                break;
+            }
         }
+        sink_token.cancel();
     });
 
     let send_clone = send.clone();
+    let metrics_clone = metrics.clone();
     let mut conn = DocConnection::new_with_expiration(
         awareness,
         authorization,
         expiration_time,
         move |bytes| {
-            if let Err(e) = send_clone.try_send(Message::Binary(bytes.to_vec())) {
-                tracing::warn!(?e, "Error sending message");
+            match send_clone.try_send(Message::Binary(bytes.to_vec())) {
+                Ok(()) => {}
+                Err(TrySendError::Closed(_)) => {
+                    // The writer task has exited; the read loop tears the
+                    // connection down as soon as it sees the cancelled token,
+                    // so this is a brief race, not an error.
+                    metrics_clone.record_websocket_send_failure("closed");
+                    tracing::debug!("Dropping outbound message: writer task exited");
+                }
+                Err(e @ TrySendError::Full(_)) => {
+                    // A dropped update silently desyncs this client until it
+                    // reconnects; the metric tracks how often that happens.
+                    metrics_clone.record_websocket_send_failure("full");
+                    tracing::warn!(?e, "Outbound channel full; dropping message");
+                }
             }
         },
     );
@@ -1187,12 +1266,42 @@ async fn handle_socket(
     // Register the connection with the sync protocol event sender
     sync_protocol_event_sender.register_doc_connection(doc_id.clone(), Arc::downgrade(&connection));
 
-    loop {
+    // Observe-only keepalive: ping on an interval and record would-be reaps
+    // (silent past PONG_TIMEOUT) and recoveries (a pong after the timeout,
+    // i.e. a live connection enforcement would have killed). Nothing is
+    // closed on timeout until the soak metrics show enforcement is safe.
+    let mut ticker = tokio::time::interval(PING_EVERY);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_pong = tokio::time::Instant::now();
+    let mut pong_timed_out = false;
+
+    let close_reason = loop {
         tokio::select! {
-            Some(msg) = stream.next() => {
+            msg = stream.next() => {
+                let Some(msg) = msg else {
+                    // The stream ended without a close handshake.
+                    break "stream_eof";
+                };
                 let msg = match msg {
                     Ok(Message::Binary(bytes)) => bytes,
-                    Ok(Message::Close(_)) => break,
+                    Ok(Message::Close(_)) => break "close_frame",
+                    Ok(Message::Pong(_)) => {
+                        if pong_timed_out {
+                            pong_timed_out = false;
+                            metrics.record_pong_recovery();
+                            tracing::info!(
+                                doc_id = %doc_id,
+                                silent_secs = last_pong.elapsed().as_secs(),
+                                "Connection recovered after pong timeout; a keepalive reaper would have closed it"
+                            );
+                        }
+                        last_pong = tokio::time::Instant::now();
+                        continue;
+                    }
+                    Ok(Message::Ping(_)) => {
+                        // The transport replies with a pong automatically.
+                        continue;
+                    }
                     Err(_e) => {
                         // The stream will complain about things like
                         // connections being lost without handshake.
@@ -1221,19 +1330,36 @@ async fn handle_socket(
                             code: 1008, // Policy Violation - indicates a policy violation
                             reason: "Token expired".into(),
                         })));
-                        break;
+                        break "token_expired";
                     }
                     Err(e) => {
                         tracing::warn!(?e, "Error handling message");
                     }
                 }
             }
-            _ = cancellation_token.cancelled() => {
-                tracing::debug!("Closing doc connection due to server cancel...");
-                break;
+            _ = ticker.tick() => {
+                if last_pong.elapsed() > PONG_TIMEOUT && !pong_timed_out {
+                    pong_timed_out = true;
+                    metrics.record_pong_timeout();
+                    tracing::info!(
+                        doc_id = %doc_id,
+                        "Pong timeout (observe-only): a keepalive reaper would close this connection"
+                    );
+                }
+                let _ = send.try_send(Message::Ping(vec![]));
+            }
+            _ = conn_token.cancelled() => {
+                if cancellation_token.is_cancelled() {
+                    tracing::debug!("Closing doc connection due to server cancel...");
+                    break "server_shutdown";
+                }
+                // The child token only cancels from the writer task.
+                break "sink_error";
             }
         }
-    }
+    };
+
+    metrics.record_websocket_close(close_reason);
 }
 
 async fn check_store(
@@ -3084,6 +3210,203 @@ mod test {
             wait_result.is_ok(),
             "Persistence workers should terminate after GC, but they hung"
         );
+    }
+
+    mod socket_teardown {
+        use super::*;
+        use futures::channel::mpsc as futures_mpsc;
+        use tokio_stream::wrappers::ReceiverStream;
+        use y_sweet_core::sync::Message as SyncMessage;
+        use yrs::updates::encoder::Encode;
+
+        struct SocketHarness {
+            to_server: tokio::sync::mpsc::Sender<Result<Message, axum::Error>>,
+            from_server: futures_mpsc::UnboundedReceiver<Message>,
+            awareness: Arc<RwLock<Awareness>>,
+            metrics: Arc<RelayMetrics>,
+            task: tokio::task::JoinHandle<()>,
+        }
+
+        /// Run handle_socket_inner against in-memory socket halves so
+        /// teardown behavior is observable without a WebSocket upgrade.
+        async fn spawn_socket(server_token: CancellationToken) -> SocketHarness {
+            let (to_server, stream_rx) =
+                tokio::sync::mpsc::channel::<Result<Message, axum::Error>>(64);
+            let (sink_tx, from_server) = futures_mpsc::unbounded::<Message>();
+            let awareness = Arc::new(RwLock::new(Awareness::new(yrs::Doc::new())));
+            let metrics = RelayMetrics::new_with_registry(&prometheus::Registry::new()).unwrap();
+            let sync_kv = Arc::new(SyncKv::new(None, "test_doc", || ()).await.unwrap());
+
+            let task = tokio::spawn(handle_socket_inner(
+                sink_tx,
+                ReceiverStream::new(stream_rx),
+                awareness.clone(),
+                sync_kv,
+                Authorization::Full,
+                None,
+                None,
+                server_token,
+                Arc::new(SyncProtocolEventSender::new()),
+                "test_doc".to_string(),
+                metrics.clone(),
+            ));
+
+            SocketHarness {
+                to_server,
+                from_server,
+                awareness,
+                metrics,
+                task,
+            }
+        }
+
+        /// A y-sync awareness update announcing one client, as a client
+        /// connection would send it.
+        fn awareness_update_message() -> Vec<u8> {
+            let mut client = Awareness::new(yrs::Doc::new());
+            client.set_local_state(r#"{"user":"test"}"#);
+            let update = client.update().unwrap();
+            SyncMessage::Awareness(update).encode_v1()
+        }
+
+        fn closes(metrics: &RelayMetrics, reason: &str) -> f64 {
+            metrics
+                .websocket_closes_total
+                .with_label_values(&[reason])
+                .get()
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn stream_eof_tears_down_connection_and_clears_awareness() {
+            let harness = spawn_socket(CancellationToken::new()).await;
+            let base_clients = harness.awareness.read().unwrap().clients().len();
+
+            harness
+                .to_server
+                .send(Ok(Message::Binary(awareness_update_message())))
+                .await
+                .unwrap();
+
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if harness.awareness.read().unwrap().clients().len() == base_clients + 1 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("client awareness state was never applied");
+
+            // End the stream without a close handshake, as a vanished client
+            // whose TCP connection got reset would.
+            drop(harness.to_server);
+
+            tokio::time::timeout(Duration::from_secs(5), harness.task)
+                .await
+                .expect("read loop kept running after stream EOF")
+                .unwrap();
+
+            assert_eq!(
+                harness.awareness.read().unwrap().clients().len(),
+                base_clients,
+                "DocConnection drop should remove the client's awareness state"
+            );
+            assert_eq!(closes(&harness.metrics, "stream_eof"), 1.0);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn sink_error_tears_down_connection() {
+            let harness = spawn_socket(CancellationToken::new()).await;
+
+            // Kill the outbound half; the next write (initial sync or the
+            // first keepalive ping) fails, and the writer task must cancel
+            // the read loop rather than leave it parked forever.
+            drop(harness.from_server);
+
+            tokio::time::timeout(Duration::from_secs(60), harness.task)
+                .await
+                .expect("read loop kept running after sink write failure")
+                .unwrap();
+
+            assert_eq!(closes(&harness.metrics, "sink_error"), 1.0);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn server_cancel_closes_connection() {
+            let server_token = CancellationToken::new();
+            let harness = spawn_socket(server_token.clone()).await;
+
+            server_token.cancel();
+
+            tokio::time::timeout(Duration::from_secs(5), harness.task)
+                .await
+                .expect("read loop kept running after server cancel")
+                .unwrap();
+
+            assert_eq!(closes(&harness.metrics, "server_shutdown"), 1.0);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn pong_timeout_is_observe_only() {
+            let mut harness = spawn_socket(CancellationToken::new()).await;
+
+            // Stay silent long past PONG_TIMEOUT: the would-be reap is
+            // recorded exactly once and the connection stays open.
+            tokio::time::sleep(Duration::from_secs(130)).await;
+            assert_eq!(
+                harness
+                    .metrics
+                    .websocket_pong_timeouts_total
+                    .with_label_values(&[])
+                    .get(),
+                1.0,
+                "one silent stretch should count as one would-be reap, not one per tick"
+            );
+            assert!(
+                !harness.task.is_finished(),
+                "observe-only keepalive must not close the connection"
+            );
+
+            // The server should still be probing.
+            let mut pings = 0;
+            while let Ok(Some(msg)) = harness.from_server.try_next() {
+                if matches!(msg, Message::Ping(_)) {
+                    pings += 1;
+                }
+            }
+            assert!(pings > 0, "server should send keepalive pings");
+
+            // A late pong is a live connection enforcement would have killed.
+            harness
+                .to_server
+                .send(Ok(Message::Pong(vec![])))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert_eq!(
+                harness
+                    .metrics
+                    .websocket_pong_recoveries_total
+                    .with_label_values(&[])
+                    .get(),
+                1.0
+            );
+
+            // A second silent stretch counts as a new would-be reap.
+            tokio::time::sleep(Duration::from_secs(130)).await;
+            assert_eq!(
+                harness
+                    .metrics
+                    .websocket_pong_timeouts_total
+                    .with_label_values(&[])
+                    .get(),
+                2.0
+            );
+            assert!(!harness.task.is_finished());
+
+            harness.task.abort();
+        }
     }
 }
 

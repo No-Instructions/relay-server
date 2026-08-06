@@ -39,6 +39,8 @@ pub struct CwtClaims {
     pub issued_at: Option<u64>,
     pub scope: String,
     pub channel: Option<String>,
+    /// The kv grant (private claim -80203): "kv:<ns-prefix>:<r|rw>[:<limit-bytes>]".
+    pub kv_grant: Option<String>,
 }
 
 pub struct CwtAuthenticator {
@@ -852,6 +854,14 @@ impl CwtAuthenticator {
             ));
         }
 
+        // Custom kv grant claim (private use claim -80203)
+        if let Some(kv_grant) = claims.kv_grant {
+            map.push((
+                ciborium::Value::Integer((-80203_i64).into()),
+                ciborium::Value::Text(kv_grant),
+            ));
+        }
+
         Ok(ciborium::Value::Map(map))
     }
 
@@ -871,6 +881,7 @@ impl CwtAuthenticator {
         let mut issued_at = None;
         let mut scope = None;
         let mut channel = None;
+        let mut kv_grant = None;
 
         for (key, value) in map {
             match (key, value) {
@@ -881,6 +892,7 @@ impl CwtAuthenticator {
                         Ok(3) => audience = Some(s),
                         Ok(-80201) => scope = Some(s),
                         Ok(-80202) => channel = Some(s),
+                        Ok(-80203) => kv_grant = Some(s),
                         _ => {} // Ignore unknown claims
                     }
                 }
@@ -905,6 +917,7 @@ impl CwtAuthenticator {
             issued_at,
             scope,
             channel,
+            kv_grant,
         })
     }
 
@@ -1096,6 +1109,7 @@ mod tests {
             issued_at: Some(1443944944),
             scope: "server".to_string(),
             channel: None,
+            kv_grant: None,
         };
 
         let token = authenticator.create_cwt(claims).unwrap();
@@ -1124,6 +1138,7 @@ mod tests {
             issued_at: Some(1443944944),
             scope: "doc:test_doc_123:rw".to_string(),
             channel: None,
+            kv_grant: None,
         };
 
         let token = authenticator.create_cwt(claims).unwrap();
@@ -1147,6 +1162,7 @@ mod tests {
             issued_at: None,
             scope: "file:abcdef1234567890:doc123:r".to_string(),
             channel: None,
+            kv_grant: None,
         };
 
         let token = authenticator.create_cwt(claims).unwrap();
@@ -1230,6 +1246,7 @@ mod tests {
             issued_at: Some(1443944944),
             scope: "prefix:org123-:rw".to_string(),
             channel: None,
+            kv_grant: None,
         };
 
         let token = authenticator.create_cwt(claims).unwrap();
@@ -1267,6 +1284,7 @@ mod tests {
             issued_at: Some(1443944944),
             scope: "server".to_string(), // Using our custom scope claim
             channel: None,
+            kv_grant: None,
         };
 
         // Test COSE_Mac0 token creation and verification
@@ -1354,6 +1372,7 @@ mod tests {
                     issued_at: Some(1443944944),
                     scope: "server".to_string(),
                     channel: None,
+                    kv_grant: None,
                 };
                 cwt_auth.create_cwt_mac0(test_claims).unwrap()
             });
@@ -1376,6 +1395,7 @@ mod tests {
             issued_at: Some(1000000000),
             scope: "test:scope".to_string(),
             channel: None,
+            kv_grant: None,
         };
 
         // Test HMAC_256_64 (8-byte MAC)
@@ -1427,6 +1447,7 @@ mod tests {
             issued_at: Some(1443944944),
             scope: "doc:test_doc:rw".to_string(),
             channel: Some("team-updates".to_string()),
+            kv_grant: None,
         };
 
         let token_bytes = cwt_auth.create_cwt(claims_with_channel.clone()).unwrap();
@@ -1446,6 +1467,7 @@ mod tests {
             issued_at: Some(1443944944),
             scope: "doc:test_doc:rw".to_string(),
             channel: None,
+            kv_grant: None,
         };
 
         let token_bytes = cwt_auth.create_cwt(claims_without_channel.clone()).unwrap();
@@ -1471,6 +1493,7 @@ mod tests {
             issued_at: None,
             scope: "server".to_string(),
             channel: None,
+            kv_grant: None,
         };
 
         let token = authenticator.create_cwt(claims).unwrap();
@@ -1502,6 +1525,7 @@ mod tests {
             issued_at: None,
             scope: "server".to_string(),
             channel: None,
+            kv_grant: None,
         };
 
         // Should create COSE_Mac0 token with symmetric key
@@ -1584,6 +1608,7 @@ mod tests {
             issued_at: Some(1000000000),
             scope: "doc:test-ed25519:rw".to_string(),
             channel: Some("ed25519-channel".to_string()),
+            kv_grant: None,
         };
 
         // Create token with private key
@@ -1630,6 +1655,7 @@ mod tests {
             issued_at: None,
             scope: "server".to_string(),
             channel: None,
+            kv_grant: None,
         };
 
         // Create tokens with different key types
@@ -1678,6 +1704,7 @@ mod tests {
             issued_at: Some(1000000000),
             scope: "test:ed25519".to_string(),
             channel: None,
+            kv_grant: None,
         };
 
         // Test create_cwt (wrapped in CWT tag)
@@ -1716,6 +1743,7 @@ mod tests {
             issued_at: Some(1443944944),
             scope: "server".to_string(),
             channel: None,
+            kv_grant: None,
         };
 
         // Test 1: Create a proper CWT (should include CWT tag 61 and COSE tag)

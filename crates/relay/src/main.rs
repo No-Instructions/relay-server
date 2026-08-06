@@ -933,6 +933,8 @@ async fn main() -> Result<()> {
             let redact_errors = config.server.redact_errors;
             let server = Arc::new(server);
 
+            relay::iroh_peer::spawn_if_configured(server.clone());
+
             let main_handle = tokio::spawn({
                 let server = server.clone();
                 let token = token.clone();
