@@ -117,6 +117,9 @@ pub struct SyncKv {
     created_at: Option<u64>,
     write_lease: Arc<Mutex<Option<WriteLease>>>,
     metadata: Arc<RwLock<Option<BTreeMap<String, ciborium::value::Value>>>>,
+    /// True when the backing store held no snapshot for this key at load -
+    /// i.e. this is the first time this server has seen the doc.
+    created: bool,
 }
 
 impl SyncKv {
@@ -129,6 +132,7 @@ impl SyncKv {
         let mut created_at = None;
         let mut metadata = None;
         let mut write_lease = None;
+        let mut created = false;
 
         let data = if let Some(store) = &store {
             let leased = store
@@ -166,6 +170,7 @@ impl SyncKv {
                     }
                 }
             } else {
+                created = true;
                 BTreeMap::new()
             }
         } else {
@@ -182,6 +187,7 @@ impl SyncKv {
             created_at,
             write_lease: Arc::new(Mutex::new(write_lease)),
             metadata: Arc::new(RwLock::new(metadata)),
+            created,
         })
     }
 
@@ -224,8 +230,15 @@ impl SyncKv {
             created_at,
             write_lease: Arc::new(Mutex::new(None)),
             metadata: Arc::new(RwLock::new(metadata)),
+            created: false,
         };
         Ok((inst, modified_at))
+    }
+
+    /// True when the backing store held no snapshot for this key at load -
+    /// the doc is brand new to this server.
+    pub fn created(&self) -> bool {
+        self.created
     }
 
     fn mark_dirty(&self) {

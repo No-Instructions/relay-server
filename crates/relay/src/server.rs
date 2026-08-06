@@ -523,6 +523,19 @@ impl Server {
         )
         .await?;
 
+        // First receipt of a brand-new doc: nothing in the store held state
+        // for this id. Logged with the authenticated user so surprise
+        // identities (e.g. republished deletions) are attributable from
+        // server logs alone.
+        if dwskv.sync_kv().created() {
+            tracing::info!(
+                doc_id = ?doc_id,
+                user = ?user,
+                channel = ?routing_channel_name,
+                "New doc created: first receipt of this id"
+            );
+        }
+
         // If channel is provided in token, store it in document metadata
         if let Some(channel_name) = routing_channel {
             dwskv.set_channel(&channel_name);
