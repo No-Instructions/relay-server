@@ -63,6 +63,20 @@ pub struct EventMessage {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub update: Option<Vec<u8>>, // Yjs update data for document.updated events
+
+    /// The authenticated connection that applied this update. Unlike `user`,
+    /// which names whoever caused the doc to load and is then repeated for that
+    /// doc's lifetime, this is per update - and it is the only identity a
+    /// deletion has, since removed blocks record nothing about who removed them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer: Option<String>,
+
+    /// Users whose content this update deleted, most removed first, as
+    /// (user, clock units). Absent when the update deleted nothing. Clock units
+    /// count operations rather than characters, so they rank the affected
+    /// people rather than measuring how much text went.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deleted_from: Vec<(String, u32)>,
 }
 
 impl EventMessage {
@@ -147,7 +161,24 @@ pub trait Protocol {
         awareness: &mut Awareness,
         update: Update,
     ) -> Result<Option<Message>, Error> {
-        let mut txn = awareness.doc().transact_mut();
+        self.handle_sync_step2_by(awareness, update, None)
+    }
+
+    /// As `handle_sync_step2`, tagging the transaction with the author.
+    ///
+    /// The origin is the only channel by which a deletion can be attributed:
+    /// removed content leaves nothing behind that names who removed it, so an
+    /// observer that reads the applied transaction has no other source.
+    fn handle_sync_step2_by(
+        &self,
+        awareness: &mut Awareness,
+        update: Update,
+        author: Option<&str>,
+    ) -> Result<Option<Message>, Error> {
+        let mut txn = match author {
+            Some(author) => awareness.doc().transact_mut_with(author.to_string()),
+            None => awareness.doc().transact_mut(),
+        };
         txn.apply_update(update)?;
         block_file_metadata_path_traversal(&mut txn);
         Ok(None)
@@ -161,6 +192,16 @@ pub trait Protocol {
         update: Update,
     ) -> Result<Option<Message>, Error> {
         self.handle_sync_step2(awareness, update)
+    }
+
+    /// As `handle_update`, tagging the transaction with the author.
+    fn handle_update_by(
+        &self,
+        awareness: &mut Awareness,
+        update: Update,
+        author: Option<&str>,
+    ) -> Result<Option<Message>, Error> {
+        self.handle_sync_step2_by(awareness, update, author)
     }
 
     /// Handle authorization message. By default, if reason for auth denial has been provided,
@@ -752,6 +793,8 @@ mod test {
                 "changes": ["text", "formatting"]
             })),
             update: None,
+            writer: None,
+            deleted_from: Vec::new(),
         };
 
         // Test serialization
@@ -773,6 +816,8 @@ mod test {
             user: None,
             metadata: None,
             update: None,
+            writer: None,
+            deleted_from: Vec::new(),
         };
 
         let cbor_bytes = event.to_cbor().unwrap();
@@ -829,6 +874,8 @@ mod test {
             user: Some("test@example.com".to_string()),
             metadata: Some(serde_json::json!({"test": true})),
             update: None,
+            writer: None,
+            deleted_from: Vec::new(),
         };
 
         let cbor_data = event.to_cbor().unwrap();
@@ -909,6 +956,8 @@ mod test {
             user: None,
             metadata: None,
             update: None,
+            writer: None,
+            deleted_from: Vec::new(),
         };
         let cbor_data = event.to_cbor().unwrap();
         let result = protocol.handle_event(&awareness, cbor_data);
@@ -947,6 +996,8 @@ mod test {
             user: Some("test@example.com".to_string()),
             metadata: Some(serde_json::json!({"test": "data"})),
             update: None,
+            writer: None,
+            deleted_from: Vec::new(),
         };
         let cbor_data = event.to_cbor().unwrap();
 
@@ -1072,5 +1123,113 @@ mod test {
         } else {
             panic!("Expected Subdocs message");
         }
+    }
+}
+
+#[cfg(test)]
+mod event_message_compat_tests {
+    use super::*;
+
+    /// The shape of EventMessage before `writer` and `deleted_from` existed.
+    /// Stands in for a client built against the older protocol.
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    struct LegacyEventMessage {
+        event_id: String,
+        event_type: String,
+        doc_id: String,
+        timestamp: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        user: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        metadata: Option<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        update: Option<Vec<u8>>,
+    }
+
+    fn current(writer: Option<&str>, deleted_from: Vec<(String, u32)>) -> EventMessage {
+        EventMessage {
+            event_id: "evt_1".to_string(),
+            event_type: "document.updated".to_string(),
+            doc_id: "doc-1".to_string(),
+            timestamp: 1_786_745_000_000,
+            user: Some("first-loader".to_string()),
+            metadata: None,
+            update: Some(vec![1, 2, 3]),
+            writer: writer.map(str::to_string),
+            deleted_from,
+        }
+    }
+
+    /// A client on the older protocol must keep working against a server that
+    /// sends the new fields. This is the direction a rollout hits first, and
+    /// breaking it would take out every plugin in the fleet at once.
+    #[test]
+    fn test_old_client_reads_a_message_carrying_the_new_fields() {
+        let bytes = current(Some("actual-deleter"), vec![("victim".to_string(), 20)])
+            .to_cbor()
+            .unwrap();
+
+        let legacy: LegacyEventMessage =
+            ciborium::from_reader(&bytes[..]).expect("an unknown field must not break decoding");
+
+        assert_eq!(legacy.user.as_deref(), Some("first-loader"));
+        assert_eq!(legacy.update, Some(vec![1, 2, 3]));
+        assert_eq!(legacy.doc_id, "doc-1");
+    }
+
+    /// And the reverse, for the window where a new client meets an old server.
+    #[test]
+    fn test_new_client_reads_a_message_without_the_new_fields() {
+        let legacy = LegacyEventMessage {
+            event_id: "evt_2".to_string(),
+            event_type: "document.updated".to_string(),
+            doc_id: "doc-2".to_string(),
+            timestamp: 1_786_745_000_001,
+            user: Some("someone".to_string()),
+            metadata: None,
+            update: None,
+        };
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&legacy, &mut bytes).unwrap();
+
+        let current = EventMessage::from_cbor(&bytes).expect("missing fields must default");
+
+        assert_eq!(current.writer, None);
+        assert!(current.deleted_from.is_empty());
+        assert_eq!(current.user.as_deref(), Some("someone"));
+    }
+
+    /// An ordinary edit deletes nothing, so neither key should reach the wire.
+    #[test]
+    fn test_an_update_that_deletes_nothing_adds_no_bytes() {
+        let without = LegacyEventMessage {
+            event_id: "evt_3".to_string(),
+            event_type: "document.updated".to_string(),
+            doc_id: "doc-3".to_string(),
+            timestamp: 7,
+            user: None,
+            metadata: None,
+            update: None,
+        };
+        let mut legacy_bytes = Vec::new();
+        ciborium::into_writer(&without, &mut legacy_bytes).unwrap();
+
+        let quiet = EventMessage {
+            event_id: "evt_3".to_string(),
+            event_type: "document.updated".to_string(),
+            doc_id: "doc-3".to_string(),
+            timestamp: 7,
+            user: None,
+            metadata: None,
+            update: None,
+            writer: None,
+            deleted_from: Vec::new(),
+        };
+
+        assert_eq!(
+            quiet.to_cbor().unwrap(),
+            legacy_bytes,
+            "a non-deleting update must encode byte-identically to the old shape"
+        );
     }
 }

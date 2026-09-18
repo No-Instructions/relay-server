@@ -10,6 +10,32 @@ use yrs::{
 };
 use yrs_kvstore::DocOps;
 
+/// Users whose content this transaction deleted, most removed first.
+///
+/// Reads the transaction's own delete set rather than the doc's cumulative one,
+/// so it reports what this update removed and not everything ever removed.
+/// Clients with no PUD entry are dropped: an unresolvable id names nobody.
+fn deleted_from_users(txn: &yrs::TransactionMut) -> Vec<(String, u32)> {
+    let deleted = txn.delete_set();
+    if deleted.is_empty() {
+        return Vec::new();
+    }
+
+    let users = crate::permanent_user_data::user_by_client(txn);
+    let mut by_user: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    for (client, ranges) in deleted.iter() {
+        let Some(user) = users.get(&client.get()) else {
+            continue;
+        };
+        let span: u32 = ranges.iter().map(|r| r.end - r.start).sum();
+        *by_user.entry(user.clone()).or_default() += span;
+    }
+
+    let mut ranked: Vec<(String, u32)> = by_user.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked
+}
+
 pub struct DocWithSyncKv {
     awareness: Arc<RwLock<Awareness>>,
     sync_kv: Arc<SyncKv>,
@@ -70,12 +96,32 @@ impl DocWithSyncKv {
                     // state, and no throwaway doc to decode it back into.
                     let author = crate::edit_author::user_for_update(txn, &event.update);
 
+                    // A yrs Snapshot is a state vector plus delete set - a
+                    // marker, not content - so it cannot be decoded back into a
+                    // readable doc. Consumers that need to read the post-update
+                    // state get the encoded document instead.
+                    let state = txn.encode_state_as_update_v1(&StateVector::default());
+
                     // Create the event payload with business data, metadata, update, and snapshot
                     let mut doc_event = DocumentUpdatedEvent::new(doc_key.clone())
                         .with_metadata(&sync_kv)
                         .with_update(event.update.to_vec())
-                        .with_snapshot(snapshot);
+                        .with_snapshot(snapshot)
+                        .with_state(state)
+                        .with_deleted_from(deleted_from_users(txn));
                     doc_event.user = author;
+
+                    // The writing connection tags its transaction with the
+                    // authenticated user. SERVER_ORIGIN marks the server's own
+                    // PUD bookkeeping, which has no author to report.
+                    if let Some(writer) = txn.origin() {
+                        match std::str::from_utf8(writer.as_ref()) {
+                            Ok(user) if user != crate::doc_connection::SERVER_ORIGIN => {
+                                doc_event = doc_event.with_writer(user.to_string());
+                            }
+                            _ => {}
+                        }
+                    }
 
                     // Callback handles envelope creation and dispatch
                     callback(doc_event);
@@ -205,7 +251,7 @@ impl DocWithSyncKv {
         }
 
         ids_arr.push_back(&mut txn, yrs::Any::Number(client_id as f64));
-        tracing::info!(
+        tracing::debug!(
             user_id,
             client_id,
             "Registered client_id for user via server-driven PUD"
@@ -894,5 +940,119 @@ mod tests {
         } else {
             panic!("Expected user map for bob");
         }
+    }
+}
+
+#[cfg(test)]
+mod deleted_from_tests {
+    use super::*;
+    use yrs::{Doc, GetString, Map, MapPrelim, Text};
+
+    /// Register `client` under `user` in the PUD "users" map.
+    fn register(doc: &Doc, user: &str, client: u64) {
+        let users = doc.get_or_insert_map("users");
+        let mut txn = doc.transact_mut();
+        let entry = match users.get(&txn, user) {
+            Some(Out::YMap(m)) => m,
+            _ => users.insert(&mut txn, user, MapPrelim::default()),
+        };
+        let ids = match entry.get(&txn, "ids") {
+            Some(Out::YArray(a)) => a,
+            _ => entry.insert(&mut txn, "ids", yrs::ArrayPrelim::default()),
+        };
+        ids.push_back(&mut txn, yrs::Any::Number(client as f64));
+    }
+
+    /// Deleting `range` from a doc whose text was written by `writers`, as the
+    /// observer sees it.
+    fn deleted_from_after_removing(
+        writers: &[(&str, &str)],
+        range: (u32, u32),
+    ) -> Vec<(String, u32)> {
+        let doc = Doc::new();
+        let text = doc.get_or_insert_text("contents");
+        // Each writer contributes a chunk under its own client id.
+        for (i, (user, chunk)) in writers.iter().enumerate() {
+            let contributor = Doc::with_client_id(100 + i as u64);
+            let ctext = contributor.get_or_insert_text("contents");
+            {
+                let mut txn = contributor.transact_mut();
+                txn.apply_update(
+                    Update::decode_v1(
+                        &doc.transact()
+                            .encode_state_as_update_v1(&StateVector::default()),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                let at = ctext.get_string(&txn).chars().count() as u32;
+                ctext.insert(&mut txn, at, chunk);
+            }
+            let update = contributor
+                .transact()
+                .encode_state_as_update_v1(&doc.transact().state_vector());
+            let mut txn = doc.transact_mut();
+            txn.apply_update(Update::decode_v1(&update).unwrap())
+                .unwrap();
+            drop(txn);
+            register(&doc, user, 100 + i as u64);
+        }
+
+        let captured = Arc::new(RwLock::new(Vec::new()));
+        let sink = captured.clone();
+        let _sub = doc
+            .observe_update_v1(move |txn, _| {
+                let found = deleted_from_users(txn);
+                if !found.is_empty() {
+                    *sink.write().unwrap() = found;
+                }
+            })
+            .unwrap();
+
+        {
+            let mut txn = doc.transact_mut();
+            let t = txn.get_text("contents").unwrap();
+            t.remove_range(&mut txn, range.0, range.1);
+        }
+        let result = captured.read().unwrap().clone();
+        result
+    }
+
+    #[test]
+    fn test_deleting_one_users_text_names_that_user() {
+        let victims = deleted_from_after_removing(&[("user-ada", "aaaaaaaaaa")], (0, 6));
+        assert_eq!(victims, vec![("user-ada".to_string(), 6)]);
+    }
+
+    #[test]
+    fn test_deleting_across_two_users_ranks_them_by_amount() {
+        // ada wrote chars 0-9, bob wrote 10-19; remove 8..16 -> 2 of ada's, 6 of bob's
+        let victims = deleted_from_after_removing(
+            &[("user-ada", "aaaaaaaaaa"), ("user-bob", "bbbbbbbbbb")],
+            (8, 8),
+        );
+        assert_eq!(
+            victims,
+            vec![("user-bob".to_string(), 6), ("user-ada".to_string(), 2)],
+            "most-deleted first, so a trailer names the main victim first"
+        );
+    }
+
+    #[test]
+    fn test_update_that_deletes_nothing_reports_no_victims() {
+        let doc = Doc::new();
+        let text = doc.get_or_insert_text("contents");
+        let captured = Arc::new(RwLock::new(Vec::new()));
+        let sink = captured.clone();
+        let _sub = doc
+            .observe_update_v1(move |txn, _| {
+                *sink.write().unwrap() = deleted_from_users(txn);
+            })
+            .unwrap();
+        {
+            let mut txn = doc.transact_mut();
+            text.insert(&mut txn, 0, "purely additive");
+        }
+        assert!(captured.read().unwrap().is_empty());
     }
 }

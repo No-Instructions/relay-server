@@ -44,6 +44,13 @@ const SYNC_STATUS_MESSAGE: u8 = 102;
 /// entirely already applied.
 const LARGE_DELETION_CLOCK_SPAN: u32 = 200;
 
+/// Transaction origin for the server's own PermanentUserData bookkeeping.
+///
+/// An update observer cannot otherwise tell a server-generated write from an
+/// unattributable user edit, and reporting the former as the latter would name
+/// a writer for a write no person made.
+pub const SERVER_ORIGIN: &str = "relay:server";
+
 /// Total deleted clock span per client in the doc's current delete set.
 fn deleted_spans_by_client<T: ReadTxn>(txn: &T) -> std::collections::HashMap<ClientID, u32> {
     txn.snapshot()
@@ -1252,6 +1259,8 @@ mod tests {
             user: Some("test@example.com".to_string()),
             metadata: Some(serde_json::json!({"version": 2})),
             update: None,
+            writer: None,
+            deleted_from: Vec::new(),
         };
 
         // Send the event
@@ -1298,6 +1307,8 @@ mod tests {
             user: None,
             metadata: None,
             update: None,
+            writer: None,
+            deleted_from: Vec::new(),
         };
 
         // Send the event - should succeed but not send anything
@@ -1330,6 +1341,8 @@ mod tests {
             user: None,
             metadata: None,
             update: None,
+            writer: None,
+            deleted_from: Vec::new(),
         };
 
         let cbor_data = event.to_cbor().unwrap();

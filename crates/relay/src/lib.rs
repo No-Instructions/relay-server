@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 
 pub mod cli;
+pub mod client_versions;
 pub mod convert;
 pub mod doc_inspect;
 pub mod doc_lifecycle;
