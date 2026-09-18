@@ -149,6 +149,9 @@ pub struct SyncKv {
     created_at: Option<u64>,
     write_lease: Arc<Mutex<Option<WriteLease>>>,
     metadata: Arc<RwLock<Option<BTreeMap<String, ciborium::value::Value>>>>,
+    /// True when the backing store held no snapshot for this key at load -
+    /// i.e. this is the first time this server has seen the doc.
+    created: bool,
 }
 
 impl SyncKv {
@@ -159,6 +162,7 @@ impl SyncKv {
     ) -> Result<Self> {
         let key = format!("{}/data.ysweet", key);
         let mut created_at = None;
+        let mut created = false;
         let mut metadata = None;
         let mut write_lease = None;
 
@@ -198,6 +202,7 @@ impl SyncKv {
                     }
                 }
             } else {
+                created = true;
                 BTreeMap::new()
             }
         } else {
@@ -214,6 +219,7 @@ impl SyncKv {
             created_at,
             write_lease: Arc::new(Mutex::new(write_lease)),
             metadata: Arc::new(RwLock::new(metadata)),
+            created,
         })
     }
 
@@ -256,8 +262,15 @@ impl SyncKv {
             created_at,
             write_lease: Arc::new(Mutex::new(None)),
             metadata: Arc::new(RwLock::new(metadata)),
+            created: false,
         };
         Ok((inst, modified_at))
+    }
+
+    /// True when the backing store held no snapshot for this key at load -
+    /// the doc is brand new to this server.
+    pub fn created(&self) -> bool {
+        self.created
     }
 
     fn mark_dirty(&self) {
@@ -664,6 +677,44 @@ mod test {
                 .unwrap();
 
             assert_eq!(sync_kv.get(b"foo"), Some(b"bar".to_vec()));
+        }
+    }
+
+    #[tokio::test]
+    async fn created_is_true_only_on_first_receipt() {
+        let store = MemoryStore::default();
+
+        {
+            let sync_kv = SyncKv::new(Some(Arc::new(Box::new(store.clone()))), "foo", || ())
+                .await
+                .unwrap();
+
+            assert!(sync_kv.created(), "store held nothing for this key");
+
+            sync_kv.set(b"foo", b"bar");
+            sync_kv.persist().await.unwrap();
+        }
+
+        {
+            let sync_kv = SyncKv::new(Some(Arc::new(Box::new(store.clone()))), "foo", || ())
+                .await
+                .unwrap();
+
+            assert!(
+                !sync_kv.created(),
+                "a reload of a persisted doc is not a first receipt"
+            );
+        }
+
+        {
+            let sync_kv = SyncKv::new(Some(Arc::new(Box::new(store.clone()))), "other", || ())
+                .await
+                .unwrap();
+
+            assert!(
+                sync_kv.created(),
+                "a different key is still its own first receipt"
+            );
         }
     }
 

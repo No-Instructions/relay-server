@@ -507,6 +507,19 @@ impl Server {
         // this doc's lifecycle actor and points the edge at its mailbox.
         let dwskv = DocWithSyncKv::new(doc_id, self.store.clone(), || (), event_callback).await?;
 
+        // First receipt of a brand-new doc: nothing in the store held state for this
+        // id. Logged with the authenticated user so a surprise identity - a deletion
+        // republished under a fresh id - is attributable from server logs alone,
+        // without collecting logs from every machine in the fleet.
+        if dwskv.sync_kv().created() {
+            tracing::info!(
+                doc_id = ?doc_id,
+                user = ?user,
+                channel = ?routing_channel_name,
+                "New doc created: first receipt of this id"
+            );
+        }
+
         // If channel is provided in token, store it in document metadata
         if let Some(channel_name) = routing_channel {
             dwskv.set_channel(&channel_name);
