@@ -655,6 +655,10 @@ impl Server {
             .route("/doc/:doc_id/as-update", get(get_doc_as_update_deprecated))
             .route("/doc/:doc_id/update", post(update_doc_deprecated))
             .route("/d/:doc_id/as-update", get(get_doc_as_update))
+            .route(
+                "/d/:doc_id/attributed-content",
+                get(get_doc_attributed_content),
+            )
             .route("/d/:doc_id/update", post(update_doc))
             .route("/d/:doc_id/versions", get(handle_doc_versions))
             .route(
@@ -831,6 +835,41 @@ async fn get_doc_as_update_deprecated(
 ) -> Result<Response, AppError> {
     tracing::warn!("/doc/:doc_id/as-update is deprecated; call /doc/:doc_id/auth instead and then call as-update on the returned base URL.");
     get_doc_as_update(State(server_state), Path(doc_id), auth_header).await
+}
+
+#[derive(Deserialize)]
+struct AttributedContentParams {
+    root: Option<String>,
+}
+
+async fn get_doc_attributed_content(
+    State(server_state): State<Arc<Server>>,
+    Path(doc_id): Path<String>,
+    Query(params): Query<AttributedContentParams>,
+    auth_header: Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>>,
+) -> Result<Response, AppError> {
+    server_state.check_auth(auth_header)?;
+
+    let guard = server_state
+        .attach_doc(&doc_id, AttachKind::Http, None, None)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let root = params.root.as_deref().unwrap_or("contents");
+    let awareness = guard.awareness();
+    let awareness = awareness.read().unwrap();
+    match crate::attributed_content::attributed_content(awareness.doc(), root) {
+        Some(content) => Ok(Json(json!({
+            "doc_id": doc_id,
+            "root": content.root,
+            "spans": content.spans,
+        }))
+        .into_response()),
+        None => Err(AppError::new(
+            StatusCode::NOT_FOUND,
+            anyhow!("doc has no text root named {root}"),
+        )),
+    }
 }
 
 async fn update_doc_deprecated(
