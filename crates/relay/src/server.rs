@@ -547,7 +547,7 @@ impl Server {
                 let routing_channel = routing_channel.clone();
                 let user = user.clone();
                 async move {
-                    tracing::info!(doc_id=?doc_id, channel=?routing_channel, user=?user, "Loading doc");
+                    tracing::debug!(doc_id=?doc_id, channel=?routing_channel, user=?user, "Loading doc");
                     self.build_doc(doc_id, routing_channel, user).await
                 }
             })
@@ -571,7 +571,7 @@ impl Server {
                 let routing_channel = routing_channel.clone();
                 let user = user.clone();
                 async move {
-                    tracing::info!(doc_id=?doc_id, channel=?routing_channel, user=?user, "Loading doc");
+                    tracing::debug!(doc_id=?doc_id, channel=?routing_channel, user=?user, "Loading doc");
                     self.build_doc(doc_id, routing_channel, user).await
                 }
             })
@@ -1366,7 +1366,7 @@ async fn handle_socket_inner<S, T, E>(
                 if last_pong.elapsed() > PONG_TIMEOUT && !pong_timed_out {
                     pong_timed_out = true;
                     metrics.record_pong_timeout();
-                    tracing::info!(
+                    tracing::debug!(
                         doc_id = %doc_id,
                         "Pong timeout (observe-only): a keepalive reaper would close this connection"
                     );
@@ -1391,13 +1391,29 @@ async fn handle_socket_inner<S, T, E>(
     };
 
     metrics.record_websocket_close(close_reason);
-    tracing::info!(
-        doc_id = %doc_id,
-        user = ?log_user,
-        close_reason,
-        duration_secs = connected_at.elapsed().as_secs(),
-        "WebSocket disconnected"
-    );
+    // Clients cycle a websocket per open document every minute or two, so a
+    // clean close is background noise - measured at ~190 per 10 minutes across
+    // 25 docs, which drowned everything else in the log. Only a close the
+    // client did not ask for says anything an operator would act on; the rest
+    // is available at debug and in the close metric.
+    let duration_secs = connected_at.elapsed().as_secs();
+    if close_reason == "close_frame" {
+        tracing::debug!(
+            doc_id = %doc_id,
+            user = ?log_user,
+            close_reason,
+            duration_secs,
+            "WebSocket disconnected"
+        );
+    } else {
+        tracing::info!(
+            doc_id = %doc_id,
+            user = ?log_user,
+            close_reason,
+            duration_secs,
+            "WebSocket disconnected"
+        );
+    }
 
     // Teardown is pure RAII: dropping the guard detaches this connection
     // from the doc's lifecycle actor, and if it was the last one, the
@@ -1685,7 +1701,7 @@ async fn handle_file_upload_url(
     TypedHeader(host): TypedHeader<headers::Host>,
     auth_header: Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>>,
 ) -> Result<Json<FileUploadUrlResponse>, AppError> {
-    tracing::info!(doc_id = %doc_id, "Generating file upload URL");
+    tracing::debug!(doc_id = %doc_id, "Generating file upload URL");
 
     // Get token and extract metadata
     let token = get_token_from_header(auth_header);
@@ -1809,7 +1825,7 @@ async fn handle_file_download_url(
     Query(params): Query<FileDownloadQueryParams>,
     auth_header: Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>>,
 ) -> Result<Json<FileDownloadUrlResponse>, AppError> {
-    tracing::info!(doc_id = %doc_id, hash = ?params.hash, "Generating file download URL");
+    tracing::debug!(doc_id = %doc_id, hash = ?params.hash, "Generating file download URL");
 
     // Get token
     let token = get_token_from_header(auth_header);

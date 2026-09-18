@@ -483,7 +483,7 @@ impl WebhookSender {
             Ok(response) => {
                 if response.status().is_success() {
                     metrics.record_webhook_request(&config.prefix, "success", duration);
-                    info!(
+                    debug!(
                         "Webhook sent successfully for event {} (channel {}) to prefix '{}'",
                         envelope.event_id, envelope.channel, config.prefix
                     );

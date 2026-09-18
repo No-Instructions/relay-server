@@ -661,7 +661,7 @@ impl DocActor {
         if let Some(inflight) = self.persist_inflight.take() {
             let _ = inflight.await;
         }
-        tracing::info!(doc_id = %self.doc_id, "evicting doc");
+        tracing::debug!(doc_id = %self.doc_id, "evicting doc");
         // Compact PUD before exit: dedup ids, clear ds. The mutations
         // create tombstones which yrs GC will clean up, and the update
         // observer marks SyncKv dirty so the compacted state persists in

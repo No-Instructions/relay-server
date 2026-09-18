@@ -426,7 +426,7 @@ impl DocConnection {
         }
 
         ids_arr.push_back(&mut txn, yrs::Any::Number(client_id.get() as f64));
-        tracing::info!(
+        tracing::debug!(
             user_id,
             client_id = client_id.get(),
             "Registered client_id for user via server-driven PUD"
