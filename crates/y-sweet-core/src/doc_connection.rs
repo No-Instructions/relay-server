@@ -37,12 +37,15 @@ type Callback = Arc<dyn Fn(&[u8]) + 'static + Send + Sync>;
 const SYNC_STATUS_MESSAGE: u8 = 102;
 
 /// An incoming update that grows the doc's delete set by at least this many
-/// clock units is logged. Clock units roughly correspond to characters for
-/// text content, so this catches section-or-larger deletions while ignoring
-/// ordinary editing. Growth is measured across the apply because SyncStep2
-/// always carries the sender's full historical delete set, which is almost
-/// entirely already applied.
-const LARGE_DELETION_CLOCK_SPAN: u32 = 200;
+/// clock units is logged. Clock units count operations, not characters: a
+/// character edited several times accumulates one per edit, so an ordinary
+/// text deletion can already span hundreds. The cases this targets are mass
+/// reverts, which run to five figures.
+///
+/// Growth is measured across the apply because SyncStep2 always carries the
+/// sender's full historical delete set, which is almost entirely already
+/// applied.
+const LARGE_DELETION_CLOCK_SPAN: u32 = 5000;
 
 /// Total deleted clock span per client in the doc's current delete set.
 fn deleted_spans_by_client<T: ReadTxn>(txn: &T) -> std::collections::HashMap<ClientID, u32> {
@@ -328,7 +331,7 @@ impl DocConnection {
         if deleted_clock_span >= LARGE_DELETION_CLOCK_SPAN {
             newly_deleted.sort_by_key(|(_, growth)| std::cmp::Reverse(*growth));
             newly_deleted.truncate(10);
-            tracing::debug!(
+            tracing::info!(
                 doc_id = ?self.doc_id,
                 user = ?self.user,
                 deleted_clock_span,
