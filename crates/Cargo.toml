@@ -20,5 +20,19 @@ strip = true     # Strip symbols
 
 [patch.crates-io]
 rusty-s3 = { git = "https://github.com/dtkav/rusty-s3", branch = "main" }
-yrs = { git = "https://github.com/dtkav/y-crdt", rev = "4adcaa62a251bfde5f0ae9b11148413d78d60cd0" }
+# yrs 0.26.0 plus two patches (petergaultney/y-crdt thds/0.26.0-patched).
+#
+# What still keeps us pinned: find_index underflows when a queried clock
+# precedes the first block, indexing far out of range. Proposed upstream as
+# y-crdt/y-crdt#648, still open. attributed_content's catch_unwind is the
+# fallback without it, which silently returns content unattributed.
+#
+# The other two find_index cases the patch covers (a clock past the last
+# block, and a last-block range of (0, 0)) are fixed upstream by #647, and
+# the delete-set-loss fix (dtkav/y-crdt@4adcaa6) by #628. Both are merged
+# and both are in yrs 0.27.4, which this pin predates - moving to a 0.27
+# line would drop them from the patch, but the crates declare 0.26.0.
+#
+# Drop this pin once a released yrs carries #648.
+yrs = { git = "https://github.com/petergaultney/y-crdt", rev = "4996719" }
 yrs-kvstore = { path = "yrs-kvstore" }

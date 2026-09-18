@@ -31,34 +31,11 @@
 
 use std::collections::{HashMap, HashSet};
 use yrs::updates::decoder::Decode;
-use yrs::{Array, Map, Out, ReadTxn, Transact, Update};
+use yrs::{ReadTxn, Transact, Update};
 
 /// Reverse the PUD "users" map (user -> {ids: [client_id]}) into client -> user.
 fn _user_by_client<T: ReadTxn>(txn: &T) -> HashMap<u64, String> {
-    let mut result = HashMap::new();
-    let Some(users_map) = txn.get_map("users") else {
-        return result;
-    };
-
-    for (user_id, user_val) in users_map.iter(txn) {
-        let Out::YMap(user_map) = user_val else {
-            continue;
-        };
-        let Some(Out::YArray(ids_arr)) = user_map.get(txn, "ids") else {
-            continue;
-        };
-        for item in ids_arr.iter(txn) {
-            let client_id = match item {
-                Out::Any(yrs::Any::Number(n)) => Some(n as u64),
-                Out::Any(yrs::Any::BigInt(n)) => Some(n as u64),
-                _ => None,
-            };
-            if let Some(cid) = client_id {
-                result.insert(cid, user_id.to_string());
-            }
-        }
-    }
-    result
+    crate::permanent_user_data::user_by_client(txn)
 }
 
 /// Clients that wrote new blocks in `update`: the actors behind it.
@@ -211,7 +188,7 @@ fn _doc_from(snapshot: &[u8]) -> Option<yrs::Doc> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yrs::{Map, Text, Transact};
+    use yrs::{Array, Map, Text, Transact};
 
     fn register(doc: &yrs::Doc, user_id: &str, client_ids: &[u64]) {
         let users = doc.get_or_insert_map("users");

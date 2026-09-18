@@ -305,6 +305,22 @@ pub struct ServerConfig {
 
     #[serde(default = "default_redact_errors")]
     pub redact_errors: bool,
+
+    /// Enables edit attribution logging, vpath resolution, folder membership
+    /// change tracking, the /client-versions endpoint, and user display names
+    /// in log lines. Default false: without it the server logs only opaque ids
+    /// and behavioral events. Self-hosters who want operational visibility into
+    /// who edited what opt in here.
+    #[serde(default)]
+    pub semantic_logging: bool,
+
+    /// Relay user id -> display name, for log readability only. The server has
+    /// no other source for a name: tokens carry an opaque id and nothing else.
+    /// Ids absent from the map log `name=<none>`, and an empty map behaves the
+    /// same as not configuring one. Never consulted for authorization.
+    /// Only takes effect when `semantic_logging` is true.
+    #[serde(default)]
+    pub user_names: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -611,6 +627,8 @@ impl Default for ServerConfig {
             checkpoint_freq_seconds: default_checkpoint_freq_seconds(),
             doc_gc: default_doc_gc(),
             redact_errors: default_redact_errors(),
+            semantic_logging: false,
+            user_names: HashMap::new(),
         }
     }
 }
@@ -1333,5 +1351,37 @@ probe_prefix = "relay-probe/"
             Some("/dev/shm/aws-credentials.json")
         );
         assert_eq!(s3.probe_prefix.as_deref(), Some("relay-probe/"));
+    }
+    #[test]
+    fn user_names_parse_from_a_server_subtable() {
+        let config: Config = toml::from_str(
+            r#"
+[server]
+url = "https://example.com"
+
+[server.user_names]
+"abc123" = "Ada Lovelace"
+"#,
+        )
+        .expect("config with a user_names table must parse");
+
+        assert_eq!(
+            config.server.user_names.get("abc123").map(String::as_str),
+            Some("Ada Lovelace")
+        );
+        assert_eq!(config.server.user_names.get("nobody"), None);
+    }
+
+    #[test]
+    fn user_names_are_optional() {
+        let config: Config = toml::from_str(
+            r#"
+[server]
+url = "https://example.com"
+"#,
+        )
+        .expect("a config with no user_names must still parse");
+
+        assert!(config.server.user_names.is_empty());
     }
 }

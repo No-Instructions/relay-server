@@ -6,6 +6,15 @@ url = "https://api.example.com"  # RELAY_SERVER_URL
 host = "0.0.0.0"                 # RELAY_SERVER_HOST
 port = 8080                      # PORT
 
+# Enables edit attribution logging, vpath resolution, folder membership
+# change tracking, the /client-versions endpoint, and user display names
+# in log lines. Default false.
+# semantic_logging = true
+
+# Display names for log readability. Only used when semantic_logging = true.
+# [server.user_names]
+# "relay_user_id_here" = "Ada Lovelace"
+
 [metrics]
 port = 9090                      # METRICS_PORT
 

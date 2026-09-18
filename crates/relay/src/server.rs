@@ -1,4 +1,7 @@
+use crate::client_versions::{self, ClientVersions, Observation};
 use crate::doc_lifecycle::{AttachGuard, AttachKind, DocRegistry, LifecycleConfig};
+use crate::edit_bursts::{self, Edit, EditBursts, Verdict};
+use crate::vpath_index::VPathIndex;
 use anyhow::{anyhow, Result};
 use axum::{
     body::Bytes,
@@ -22,7 +25,7 @@ use futures::{Sink, SinkExt, Stream, StreamExt, TryStreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{io::Write, sync::Arc, time::Duration};
+use std::{collections::HashMap, io::Write, sync::Arc, time::Duration};
 use tempfile::NamedTempFile;
 use tokio::{
     net::TcpListener,
@@ -30,6 +33,8 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use url::Url;
+use y_sweet_core::doc_connection::AwarenessEntryFacts;
+use y_sweet_core::edit_author;
 use y_sweet_core::{
     api_types::{
         validate_doc_name, validate_file_hash, AuthDocRequest, Authorization, ClientToken,
@@ -238,7 +243,17 @@ pub struct Server {
     event_dispatcher: Option<Arc<dyn EventDispatcher>>,
     sync_protocol_event_sender: Arc<SyncProtocolEventSender>,
     metrics: Arc<RelayMetrics>,
+    client_versions: Arc<ClientVersions>,
+    vpath_index: Arc<VPathIndex>,
+    /// Relay user id -> display name, for log readability only.
+    user_names: Arc<HashMap<String, String>>,
+    edit_bursts: Arc<EditBursts>,
+    semantic_logging: bool,
 }
+
+/// Notified for each awareness entry, so a client id can be bound to the
+/// plugin build that sent it.
+type ClientVersionRecorder = Arc<dyn Fn(&AwarenessEntryFacts) + Send + Sync>;
 
 impl Server {
     pub async fn new(
@@ -306,7 +321,32 @@ impl Server {
             event_dispatcher,
             sync_protocol_event_sender,
             metrics,
+            client_versions: Arc::new(ClientVersions::new()),
+            vpath_index: Arc::new(VPathIndex::default()),
+            user_names: Arc::new(HashMap::new()),
+            edit_bursts: Arc::new(EditBursts::new()),
+            semantic_logging: false,
         })
+    }
+    /// Display names for log readability. Never consulted for authorization.
+    pub fn with_user_names(mut self, names: impl IntoIterator<Item = (String, String)>) -> Self {
+        let names: HashMap<String, String> = names.into_iter().collect();
+        if !names.is_empty() {
+            tracing::info!("Loaded display names for {} user id(s)", names.len());
+        }
+        self.user_names = Arc::new(names);
+        self
+    }
+
+    pub fn with_semantic_logging(mut self, enabled: bool) -> Self {
+        self.semantic_logging = enabled;
+        if enabled {
+            tracing::info!(
+                "Semantic logging enabled: edit attribution, vpath resolution, \
+                 and /client-versions endpoint are active"
+            );
+        }
+        self
     }
 
     /// Close every doc WebSocket: each socket loop breaks, sends its
@@ -445,6 +485,12 @@ impl Server {
             let routing_channel_for_callback = routing_channel_name.clone();
             let user_for_callback = user.clone();
             let doc_id_for_callback = doc_id.to_string();
+            let registry = self.registry.clone();
+            let vpath_index = self.vpath_index.clone();
+            let user_names = self.user_names.clone();
+            let edit_bursts = self.edit_bursts.clone();
+            let client_versions = self.client_versions.clone();
+            let semantic = self.semantic_logging;
             // The parent pin lives in this closure, which the doc owns via
             // its SyncKv observer: the guard detaches when the doc drops.
             let parent_guard = parent_guard;
@@ -479,23 +525,139 @@ impl Server {
                         }
                     }
 
-                    // Log the full event payload as JSON after user assignment
-                    match serde_json::to_string(&event) {
-                        Ok(json_str) => {
-                            tracing::trace!("Document updated event dispatched: {}", json_str);
+                    // The server's own PermanentUserData bookkeeping is not
+                    // an edit anyone made; dispatch it without logging one.
+                    if event
+                        .update
+                        .as_deref()
+                        .is_some_and(edit_author::is_server_only_update)
+                    {
+                        dispatcher.send_event(EventEnvelope::new(
+                            routing_channel_for_callback.clone(),
+                            event,
+                        ));
+                        return;
+                    }
+
+                    if semantic {
+                        let edited_doc_id = event.doc_id.as_str();
+                        let channel = event
+                            .metadata
+                            .get("channel")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or(&routing_channel_for_callback);
+
+                        // `writer` names the connection that applied this
+                        // update, so it is right even for a deletion - the one
+                        // case `user` cannot answer, because a deletion names
+                        // no author for the observer to resolve.
+                        let user_id = event.writer.as_deref().or(event.user.as_deref());
+                        let name_of = |id: Option<&str>| {
+                            id.and_then(|id| user_names.get(id))
+                                .map(String::as_str)
+                                .unwrap_or("<none>")
+                                .to_string()
+                        };
+
+                        let editing_folder_doc = channel == edited_doc_id;
+                        if editing_folder_doc {
+                            if let Some(delta) = event.state.as_deref().and_then(|state| {
+                                vpath_index.sync_membership_from_snapshot(channel, state)
+                            }) {
+                                // Whose entries were removed - the owner of the
+                                // deleted blocks. yjs records nothing about who
+                                // removed them, so a removed= line with user=-
+                                // is attributable no further.
+                                let deleted_by = match (&event.update, &event.state) {
+                                    (Some(update), Some(state)) => {
+                                        edit_author::deleted_user_from_snapshot(state, update)
+                                    }
+                                    _ => None,
+                                };
+
+                                tracing::info!(
+                                    added = %delta.added.join(","),
+                                    removed = %delta.removed.join(","),
+                                    moved = %delta
+                                        .moved
+                                        .iter()
+                                        .map(|(from, to)| format!("{from}->{to}"))
+                                        .collect::<Vec<_>>()
+                                        .join(","),
+                                    name = %name_of(user_id),
+                                    user = %user_id.unwrap_or("-"),
+                                    clients = %event
+                                        .update
+                                        .as_deref()
+                                        .map(edit_author::clients_for_update)
+                                        .unwrap_or_else(|| "-".to_string()),
+                                    deleted_name = %name_of(deleted_by.as_deref()),
+                                    deleted_user = %deleted_by.as_deref().unwrap_or("-"),
+                                    deleted_clients = %event
+                                        .update
+                                        .as_deref()
+                                        .map(edit_author::deleted_clients_for_update)
+                                        .unwrap_or_else(|| "-".to_string()),
+                                    channel = %channel,
+                                    "Folder membership changed"
+                                );
+                            }
                         }
-                        Err(e) => {
-                            tracing::trace!(
-                                "Document updated event dispatched for doc_id: {} (JSON serialization failed: {})",
-                                event.doc_id, e
+
+                        let vpath = registry
+                            .peek(channel)
+                            .filter(|_| !editing_folder_doc)
+                            .and_then(|folder| {
+                                vpath_index.resolve(channel, &folder, edited_doc_id)
+                            });
+                        let vpath_str = vpath.as_deref().unwrap_or("-");
+                        let update_bytes = event.update.as_ref().map_or(0, Vec::len);
+                        let edit_clients = event
+                            .update
+                            .as_deref()
+                            .map(edit_author::clients_in_update)
+                            .unwrap_or_default();
+
+                        if let Verdict::Leading = edit_bursts.record(Edit {
+                            doc_id: edited_doc_id,
+                            user: user_id.unwrap_or("-"),
+                            vpath: vpath_str,
+                            channel,
+                            clients: &edit_clients,
+                            bytes: update_bytes,
+                        }) {
+                            tracing::info!(
+                                vpath = %vpath_str,
+                                name = %name_of(user_id),
+                                user = %user_id.unwrap_or("-"),
+                                version = %client_versions.describe(&edit_clients),
+                                clients = %edit_clients
+                                    .iter()
+                                    .map(u64::to_string)
+                                    .collect::<Vec<_>>()
+                                    .join(","),
+                                update_bytes,
+                                doc_id = %edited_doc_id,
+                                channel = %channel,
+                                "Doc edited"
                             );
+                        }
+                    } else {
+                        // Log the full event payload as JSON after user assignment
+                        match serde_json::to_string(&event) {
+                            Ok(json_str) => {
+                                tracing::trace!("Document updated event dispatched: {}", json_str);
+                            }
+                            Err(e) => {
+                                tracing::trace!(
+                                    "Document updated event dispatched for doc_id: {} (JSON serialization failed: {})",
+                                    event.doc_id, e
+                                );
+                            }
                         }
                     }
 
-                    // Step 1: Create the envelope with predetermined routing channel
                     let envelope = EventEnvelope::new(routing_channel_for_callback.clone(), event);
-
-                    // Step 2: Send via dispatcher
                     dispatcher.send_event(envelope);
                 }) as y_sweet_core::webhook::WebhookCallback)
             } else {
@@ -547,7 +709,7 @@ impl Server {
                 let routing_channel = routing_channel.clone();
                 let user = user.clone();
                 async move {
-                    tracing::info!(doc_id=?doc_id, channel=?routing_channel, user=?user, "Loading doc");
+                    tracing::debug!(doc_id=?doc_id, channel=?routing_channel, user=?user, "Loading doc");
                     self.build_doc(doc_id, routing_channel, user).await
                 }
             })
@@ -571,7 +733,7 @@ impl Server {
                 let routing_channel = routing_channel.clone();
                 let user = user.clone();
                 async move {
-                    tracing::info!(doc_id=?doc_id, channel=?routing_channel, user=?user, "Loading doc");
+                    tracing::debug!(doc_id=?doc_id, channel=?routing_channel, user=?user, "Loading doc");
                     self.build_doc(doc_id, routing_channel, user).await
                 }
             })
@@ -658,6 +820,10 @@ impl Server {
             .route("/d/:doc_id/update", post(update_doc))
             .route("/d/:doc_id/versions", get(handle_doc_versions))
             .route(
+                "/d/:doc_id/attributed-content",
+                get(get_doc_attributed_content),
+            )
+            .route(
                 "/d/:doc_id/ws/:doc_id2",
                 get(handle_socket_upgrade_full_path),
             )
@@ -690,6 +856,10 @@ impl Server {
             }
         }
 
+        if self.semantic_logging {
+            router = router.route("/client-versions", get(get_client_versions));
+        }
+
         router.with_state(self.clone())
     }
 
@@ -713,6 +883,50 @@ impl Server {
         } else {
             app.layer(middleware::from_fn(Self::redact_error_middleware))
         };
+
+        if self.semantic_logging {
+            let bursts = self.edit_bursts.clone();
+            let burst_token = self.cancellation_token.clone();
+            let burst_user_names = self.user_names.clone();
+            let burst_client_versions = self.client_versions.clone();
+            let log_edit_bursts = move |finished: Vec<edit_bursts::FinishedBurst>| {
+                for burst in finished {
+                    tracing::info!(
+                        vpath = %burst.vpath,
+                        name = %burst_user_names
+                            .get(&burst.user)
+                            .map(String::as_str)
+                            .unwrap_or("<none>"),
+                        user = %burst.user,
+                        version = %burst_client_versions.describe(&burst.clients),
+                        clients = %burst
+                            .clients
+                            .iter()
+                            .map(u64::to_string)
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        edits = burst.edits,
+                        update_bytes = burst.bytes,
+                        span_ms = burst.span.as_millis(),
+                        doc_id = %burst.doc_id,
+                        channel = %burst.channel,
+                        "Doc edit burst"
+                    );
+                }
+            };
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(edit_bursts::BURST_QUIET / 4);
+                loop {
+                    tokio::select! {
+                        _ = ticker.tick() => log_edit_bursts(bursts.take_finished()),
+                        _ = burst_token.cancelled() => {
+                            log_edit_bursts(bursts.drain_all());
+                            break;
+                        }
+                    }
+                }
+            });
+        }
 
         tracing::info!("Starting HTTP server...");
         axum::serve(listener, app.into_make_service())
@@ -802,6 +1016,23 @@ impl Server {
 #[derive(Deserialize)]
 struct HandlerParams {
     token: Option<String>,
+    /// Plugin version the connecting client reports (clients >= 0.8.8).
+    v: Option<String>,
+    /// Client ids the connection declares as its own, comma-separated.
+    cid: Option<String>,
+}
+
+impl HandlerParams {
+    fn declared_client_ids(&self) -> Vec<u64> {
+        self.cid
+            .as_deref()
+            .map(|ids| {
+                ids.split(',')
+                    .filter_map(|id| id.trim().parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 async fn get_doc_as_update(
@@ -883,6 +1114,7 @@ async fn update_doc_inner(
     Ok(StatusCode::OK.into_response())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_socket_upgrade_with_channel_and_user(
     ws: WebSocketUpgrade,
     Path(doc_id): Path<String>,
@@ -890,6 +1122,8 @@ async fn handle_socket_upgrade_with_channel_and_user(
     routing_channel: Option<String>,
     user: Option<String>,
     token: Option<String>,
+    version: Option<String>,
+    declared_client_ids: Vec<u64>,
     State(server_state): State<Arc<Server>>,
 ) -> Result<Response, AppError> {
     server_state
@@ -912,10 +1146,84 @@ async fn handle_socket_upgrade_with_channel_and_user(
     };
 
     let user_for_pud = user.clone();
+    let channel_for_vpath = routing_channel.clone();
     let guard = server_state
         .attach_doc(&doc_id, AttachKind::Socket, routing_channel, user)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let user_name = user_for_pud
+        .as_deref()
+        .and_then(|id| server_state.user_names.get(id))
+        .cloned();
+    let vpath = server_state.semantic_logging.then(|| ()).and_then(|_| {
+        let channel = channel_for_vpath.as_deref()?;
+        let folder = server_state.registry.peek(channel)?;
+        server_state.vpath_index.resolve(channel, &folder, &doc_id)
+    });
+
+    // A client that names its own ids lets us bind them to the version it
+    // reported, rather than inferring from whichever connection was seen
+    // first. Register them under the user at the same time: doing it here,
+    // once per connection, keeps PermanentUserData writes off the awareness
+    // path, where a write lock per message serialized against sync.
+    if let (Some(v), Some(user_id)) = (version.as_deref(), user_for_pud.as_deref()) {
+        for client_id in declared_client_ids {
+            if let Some(recorded) =
+                server_state
+                    .client_versions
+                    .declare(client_id, v, user_name.as_deref())
+            {
+                tracing::debug!(
+                    client_id,
+                    version = %recorded.version,
+                    previous = %recorded.previous.as_deref().unwrap_or(client_versions::UNKNOWN),
+                    name = %user_name.as_deref().unwrap_or("<none>"),
+                    doc_id = %doc_id,
+                    "Recorded client version"
+                );
+            }
+            // Server-generated ids are 53-bit; a real client id is not.
+            if client_id >> 53 == 0 {
+                if let Ok(awareness) = guard.doc().awareness().read() {
+                    DocConnection::register_pud_client_id_on_doc(
+                        awareness.doc(),
+                        user_id,
+                        yrs::block::ClientID::new(client_id),
+                    );
+                }
+            }
+        }
+    }
+
+    let record_client_version: ClientVersionRecorder = {
+        let client_versions = server_state.client_versions.clone();
+        let connection_version = version.clone();
+        let doc_id_for_log = doc_id.clone();
+        Arc::new(move |facts: &AwarenessEntryFacts| {
+            if let Some(recorded) = client_versions.observe(Observation {
+                client_id: facts.client_id,
+                declared: facts.declared_version.as_deref(),
+                name: facts.user_name.as_deref(),
+                solo_live: facts.solo_live,
+                connection_version: connection_version.as_deref(),
+            }) {
+                tracing::debug!(
+                    client_id = facts.client_id,
+                    version = %recorded.version,
+                    previous = %recorded.previous.as_deref().unwrap_or(client_versions::UNKNOWN),
+                    name = %facts.user_name.as_deref().unwrap_or("<none>"),
+                    doc_id = %doc_id_for_log,
+                    "Recorded client version"
+                );
+            }
+            if let Some(declared) = facts.declared_version.as_deref() {
+                for extra in &facts.extra_client_ids {
+                    client_versions.declare(*extra, declared, facts.user_name.as_deref());
+                }
+            }
+        })
+    };
     // Socket loops watch the doc-close token (a child of the server token)
     // so shutdown can close them ahead of the graceful drain.
     let cancellation_token = server_state.doc_close_token.clone();
@@ -936,8 +1244,64 @@ async fn handle_socket_upgrade_with_channel_and_user(
             sync_protocol_event_sender,
             doc_id_clone,
             metrics,
+            vpath,
+            user_name,
+            record_client_version,
         )
     }))
+}
+
+#[derive(Deserialize)]
+struct AttributedContentParams {
+    root: Option<String>,
+}
+
+async fn get_doc_attributed_content(
+    State(server_state): State<Arc<Server>>,
+    Path(doc_id): Path<String>,
+    Query(params): Query<AttributedContentParams>,
+    auth_header: Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>>,
+) -> Result<Response, AppError> {
+    server_state.check_auth(auth_header)?;
+
+    let guard = server_state
+        .attach_doc(&doc_id, AttachKind::Http, None, None)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let root = params.root.as_deref().unwrap_or("contents");
+    let awareness = guard.awareness();
+    let awareness = awareness.read().unwrap();
+    match crate::attributed_content::attributed_content(awareness.doc(), root) {
+        Some(content) => Ok(Json(json!({
+            "doc_id": doc_id,
+            "root": content.root,
+            "spans": content.spans,
+        }))
+        .into_response()),
+        None => Err(AppError::new(
+            StatusCode::NOT_FOUND,
+            anyhow!("doc has no text root named {root}"),
+        )),
+    }
+}
+
+async fn get_client_versions(
+    auth_header: Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>>,
+    State(server_state): State<Arc<Server>>,
+) -> Result<Json<Value>, AppError> {
+    server_state.check_auth(auth_header)?;
+
+    let entries = server_state.client_versions.snapshot();
+    Ok(Json(json!({
+        "count": entries.len(),
+        "client_versions": entries
+            .into_iter()
+            .map(|(client_id, version, name)| {
+                (client_id.to_string(), json!({"version": version, "name": name}))
+            })
+            .collect::<serde_json::Map<String, Value>>(),
+    })))
 }
 
 fn verify_socket_token(
@@ -1010,6 +1374,7 @@ async fn handle_socket_upgrade_deprecated(
     let (authorization, channel, user) =
         verify_socket_token(&server_state, &doc_id, params.token.as_deref())?;
 
+    let declared_client_ids = params.declared_client_ids();
     handle_socket_upgrade_with_channel_and_user(
         ws,
         Path(doc_id),
@@ -1017,6 +1382,8 @@ async fn handle_socket_upgrade_deprecated(
         channel,
         user,
         params.token.clone(), // Pass the token from query params
+        params.v.clone(),
+        declared_client_ids,
         State(server_state),
     )
     .await
@@ -1041,6 +1408,7 @@ async fn handle_socket_upgrade_full_path(
     let (authorization, channel, user) =
         verify_socket_token(&server_state, &doc_id, params.token.as_deref())?;
 
+    let declared_client_ids = params.declared_client_ids();
     handle_socket_upgrade_with_channel_and_user(
         ws,
         Path(doc_id),
@@ -1048,11 +1416,14 @@ async fn handle_socket_upgrade_full_path(
         channel,
         user,
         params.token.clone(), // Pass the token from query params
+        params.v.clone(),
+        declared_client_ids,
         State(server_state),
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_socket(
     socket: WebSocket,
     guard: AttachGuard,
@@ -1063,6 +1434,9 @@ async fn handle_socket(
     sync_protocol_event_sender: Arc<SyncProtocolEventSender>,
     doc_id: String,
     metrics: Arc<RelayMetrics>,
+    vpath: Option<String>,
+    user_name: Option<String>,
+    record_client_version: ClientVersionRecorder,
 ) {
     let (sink, stream) = socket.split();
     handle_socket_inner(
@@ -1076,12 +1450,16 @@ async fn handle_socket(
         sync_protocol_event_sender,
         doc_id,
         metrics,
+        vpath,
+        user_name,
+        record_client_version,
     )
     .await
 }
 
 /// Generic over the socket halves so teardown behavior can be tested without
 /// a real WebSocket upgrade.
+#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 async fn handle_socket_inner<S, T, E>(
     mut sink: S,
@@ -1094,6 +1472,9 @@ async fn handle_socket_inner<S, T, E>(
     sync_protocol_event_sender: Arc<SyncProtocolEventSender>,
     doc_id: String,
     metrics: Arc<RelayMetrics>,
+    vpath: Option<String>,
+    user_name: Option<String>,
+    record_client_version: ClientVersionRecorder,
 ) where
     S: Sink<Message> + Send + Unpin + 'static,
     T: Stream<Item = Result<Message, E>> + Unpin,
@@ -1201,6 +1582,13 @@ async fn handle_socket_inner<S, T, E>(
     );
     conn.set_sync_kv(sync_kv);
     conn.set_doc_id(doc_id.clone());
+    conn.set_on_client_version(Box::new(move |facts| record_client_version(facts)));
+    if let Some(vpath) = vpath {
+        conn.set_vpath(vpath);
+    }
+    if let Some(user_name) = user_name {
+        conn.set_user_name(user_name);
+    }
     if let Some(user) = user {
         conn.set_user(user);
     }
@@ -1366,7 +1754,7 @@ async fn handle_socket_inner<S, T, E>(
                 if last_pong.elapsed() > PONG_TIMEOUT && !pong_timed_out {
                     pong_timed_out = true;
                     metrics.record_pong_timeout();
-                    tracing::info!(
+                    tracing::debug!(
                         doc_id = %doc_id,
                         "Pong timeout (observe-only): a keepalive reaper would close this connection"
                     );
@@ -1391,13 +1779,31 @@ async fn handle_socket_inner<S, T, E>(
     };
 
     metrics.record_websocket_close(close_reason);
-    tracing::info!(
-        doc_id = %doc_id,
-        user = ?log_user,
-        close_reason,
-        duration_secs = connected_at.elapsed().as_secs(),
-        "WebSocket disconnected"
-    );
+    // A client closing cleanly is the common case: Obsidian closes and
+    // reopens sockets as the user moves between files, which on a busy vault
+    // is a steady stream that drowns everything else. A stream that just ends
+    // is the same churn seen from the other side - the client went away
+    // without a handshake, and the reconnect handles it. Neither says
+    // anything an operator would act on, and both stay available at debug and
+    // in the close metric. token_expired, sink_error and server_shutdown do.
+    let duration_secs = connected_at.elapsed().as_secs();
+    if close_reason == "close_frame" || close_reason == "stream_eof" {
+        tracing::debug!(
+            doc_id = %doc_id,
+            user = ?log_user,
+            close_reason,
+            duration_secs,
+            "WebSocket disconnected"
+        );
+    } else {
+        tracing::info!(
+            doc_id = %doc_id,
+            user = ?log_user,
+            close_reason,
+            duration_secs,
+            "WebSocket disconnected"
+        );
+    }
 
     // Teardown is pure RAII: dropping the guard detaches this connection
     // from the doc's lifecycle actor, and if it was the last one, the
@@ -1685,7 +2091,7 @@ async fn handle_file_upload_url(
     TypedHeader(host): TypedHeader<headers::Host>,
     auth_header: Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>>,
 ) -> Result<Json<FileUploadUrlResponse>, AppError> {
-    tracing::info!(doc_id = %doc_id, "Generating file upload URL");
+    tracing::debug!(doc_id = %doc_id, "Generating file upload URL");
 
     // Get token and extract metadata
     let token = get_token_from_header(auth_header);
@@ -1809,7 +2215,7 @@ async fn handle_file_download_url(
     Query(params): Query<FileDownloadQueryParams>,
     auth_header: Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>>,
 ) -> Result<Json<FileDownloadUrlResponse>, AppError> {
-    tracing::info!(doc_id = %doc_id, hash = ?params.hash, "Generating file download URL");
+    tracing::debug!(doc_id = %doc_id, hash = ?params.hash, "Generating file download URL");
 
     // Get token
     let token = get_token_from_header(auth_header);
@@ -3742,6 +4148,9 @@ mod test {
                 Arc::new(SyncProtocolEventSender::new()),
                 "test_doc".to_string(),
                 metrics.clone(),
+                None,
+                None,
+                Arc::new(|_| {}),
             ));
 
             SocketHarness {

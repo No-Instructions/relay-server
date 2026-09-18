@@ -1,5 +1,33 @@
-use std::collections::HashSet;
-use yrs::{Array, ArrayRef, Doc, Map, Out, Transact};
+use std::collections::{HashMap, HashSet};
+use yrs::{Array, ArrayRef, Doc, Map, Out, ReadTxn, Transact};
+
+/// Reverse the PUD "users" map (user -> {ids: [client_id]}) into client -> user.
+pub fn user_by_client<T: ReadTxn>(txn: &T) -> HashMap<u64, String> {
+    let mut result = HashMap::new();
+    let Some(users_map) = txn.get_map("users") else {
+        return result;
+    };
+
+    for (user_id, user_val) in users_map.iter(txn) {
+        let Out::YMap(user_map) = user_val else {
+            continue;
+        };
+        let Some(Out::YArray(ids_arr)) = user_map.get(txn, "ids") else {
+            continue;
+        };
+        for item in ids_arr.iter(txn) {
+            let client_id = match item {
+                Out::Any(yrs::Any::Number(n)) => Some(n as u64),
+                Out::Any(yrs::Any::BigInt(n)) => Some(n as u64),
+                _ => None,
+            };
+            if let Some(cid) = client_id {
+                result.insert(cid, user_id.to_string());
+            }
+        }
+    }
+    result
+}
 
 /// Compact the "users" Y-Map in a document by deduplicating `ids` arrays and
 /// clearing `ds` arrays.

@@ -992,7 +992,15 @@ async fn main() -> Result<()> {
                 config.server.doc_gc,
                 webhook_configs,
             )
-            .await?;
+            .await?
+            .with_semantic_logging(config.server.semantic_logging)
+            .with_user_names(
+                config
+                    .server
+                    .user_names
+                    .iter()
+                    .map(|(id, name)| (id.clone(), name.clone())),
+            );
 
             let redact_errors = config.server.redact_errors;
             let server = Arc::new(server);
