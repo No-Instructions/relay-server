@@ -444,6 +444,8 @@ impl Decode for SyncMessage {
         let tag: u8 = decoder.read_var()?;
         match tag {
             MSG_SYNC_STEP_1 => {
+                // read_buf checks framing before any payload allocation; the yrs decoder
+                // bounds internal reservations by the bytes present in this slice.
                 let buf = decoder.read_buf()?;
                 let sv = StateVector::decode_v1(buf)?;
                 Ok(SyncMessage::SyncStep1(sv))
