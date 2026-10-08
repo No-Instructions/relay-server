@@ -6,6 +6,7 @@ pub mod doc_inspect;
 pub mod doc_lifecycle;
 pub mod doc_restore;
 pub mod doc_versions;
+mod load_dependencies;
 pub mod migrations;
 pub mod server;
 pub mod stores;
