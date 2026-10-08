@@ -370,6 +370,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn js_surrogate_split_survives_persist_and_reload() {
+        use yrs::GetString;
+
+        // Actual Yjs 13.6.14 updates: "a🚀b", delete low surrogate, append "Z".
+        let updates: [&[u8]; 3] = [
+            &[
+                1, 1, 5, 0, 4, 1, 8, 99, 111, 110, 116, 101, 110, 116, 115, 6, 97, 240, 159, 154,
+                128, 98, 0,
+            ],
+            &[0, 1, 5, 1, 2, 1],
+            &[1, 1, 5, 4, 132, 5, 3, 1, 90, 0],
+        ];
+        let store: Arc<Box<dyn Store>> = Arc::new(Box::new(MemoryStore::default()));
+        let doc = DocWithSyncKv::new("surrogate", Some(store.clone()), || (), None)
+            .await
+            .unwrap();
+        for (update, expected) in updates.iter().zip(["a🚀b", "a\u{FFFD}b", "a\u{FFFD}bZ"]) {
+            doc.apply_update(update).unwrap();
+            // The real observer calls push_update + flush_doc_with after every update.
+            doc.sync_kv().persist().await.unwrap();
+            let reloaded = DocWithSyncKv::new("surrogate", Some(store.clone()), || (), None)
+                .await
+                .unwrap();
+            for state in [&doc, &reloaded] {
+                let awareness = state.awareness();
+                let guard = awareness.read().unwrap();
+                let txn = guard.doc().transact();
+                assert_eq!(txn.get_text("contents").unwrap().get_string(&txn), expected);
+            }
+        }
+        drop(doc);
+        for _ in 0..2 {
+            let reloaded = DocWithSyncKv::new("surrogate", Some(store.clone()), || (), None)
+                .await
+                .unwrap();
+            {
+                let awareness = reloaded.awareness();
+                let guard = awareness.read().unwrap();
+                let txn = guard.doc().transact();
+                assert_eq!(
+                    txn.get_text("contents").unwrap().get_string(&txn),
+                    "a\u{FFFD}bZ"
+                );
+                assert_eq!(txn.state_vector().get(&yrs::block::ClientID::new(5)), 5);
+            }
+            // Re-encode through the same KV path before the next reload.
+            let sync_kv = reloaded.sync_kv();
+            sync_kv
+                .push_update(DOC_NAME, &reloaded.as_update())
+                .unwrap();
+            assert!(sync_kv
+                .flush_doc_with(DOC_NAME, Default::default())
+                .unwrap()
+                .is_some());
+            sync_kv.persist().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn setting_an_unchanged_channel_does_not_persist() {
         let store = MemoryStore::default();
         let doc = DocWithSyncKv::new(

@@ -83,7 +83,7 @@ where
 // -- Shared helpers --
 
 /// Parse `.ysweet` bytes into the KV map (tries CBOR then bincode).
-fn parse_ysweet_bytes(bytes: &[u8]) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
+pub(crate) fn parse_ysweet_bytes(bytes: &[u8]) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
     match ciborium::de::from_reader::<YSweetDataDump, _>(bytes) {
         Ok(doc) => Ok(doc.data),
         Err(cbor_err) => match bincode::deserialize::<BTreeMap<Vec<u8>, Vec<u8>>>(bytes) {
@@ -1565,17 +1565,19 @@ fn dump_yrs_doc(map: &BTreeMap<Vec<u8>, Vec<u8>>) {
 // -- v1 update binary decoder for filename resolution --
 
 #[derive(Debug)]
-struct DecodedItemMeta {
-    client: u64,
-    clock: u32,
-    len: u32,
-    parent_named: Option<String>,
-    parent_id: Option<(u64, u32)>,
-    parent_sub: Option<String>,
-    origin: Option<(u64, u32)>,
+pub(crate) struct DecodedItemMeta {
+    pub(crate) client: u64,
+    pub(crate) clock: u32,
+    pub(crate) len: u32,
+    pub(crate) parent_named: Option<String>,
+    pub(crate) parent_id: Option<(u64, u32)>,
+    pub(crate) parent_sub: Option<String>,
+    pub(crate) origin: Option<(u64, u32)>,
+    pub(crate) right_origin: Option<(u64, u32)>,
+    pub(crate) content_ref: u8,
 }
 
-fn decode_v1_item_parents(bytes: &[u8]) -> Result<Vec<DecodedItemMeta>, String> {
+pub(crate) fn decode_v1_item_parents(bytes: &[u8]) -> Result<Vec<DecodedItemMeta>, String> {
     use lib0::decoding::{Cursor, Read};
 
     let mut cursor = Cursor::new(bytes);
@@ -1588,23 +1590,29 @@ fn decode_v1_item_parents(bytes: &[u8]) -> Result<Vec<DecodedItemMeta>, String> 
         let num_blocks: u32 = cursor
             .read_var()
             .map_err(|e| format!("num_blocks: {:?}", e))?;
-        let client: u32 = cursor.read_var().map_err(|e| format!("client: {:?}", e))?;
+        let client: u64 = cursor.read_var().map_err(|e| format!("client: {:?}", e))?;
         let mut clock: u32 = cursor.read_var().map_err(|e| format!("clock: {:?}", e))?;
 
         for block_idx in 0..num_blocks {
             let info = cursor.read_u8().map_err(|e| format!("info: {:?}", e))?;
             let content_ref = info & 0x0F;
 
-            if content_ref == 10 {
+            if content_ref == 10 || content_ref == 0 {
                 let len: u32 = cursor
                     .read_var()
-                    .map_err(|e| format!("skip len: {:?}", e))?;
-                clock += len;
-                continue;
-            }
-            if content_ref == 0 {
-                let len: u32 = cursor.read_var().map_err(|e| format!("gc len: {:?}", e))?;
-                clock += len;
+                    .map_err(|e| format!("block len: {:?}", e))?;
+                items.push(DecodedItemMeta {
+                    client,
+                    clock,
+                    len,
+                    content_ref,
+                    parent_named: None,
+                    parent_id: None,
+                    parent_sub: None,
+                    origin: None,
+                    right_origin: None,
+                });
+                clock = clock.checked_add(len).ok_or("clock overflow")?;
                 continue;
             }
 
@@ -1613,7 +1621,7 @@ fn decode_v1_item_parents(bytes: &[u8]) -> Result<Vec<DecodedItemMeta>, String> 
             let cant_copy_parent = !has_origin && !has_right_origin;
 
             let origin = if has_origin {
-                let c: u32 = cursor
+                let c: u64 = cursor
                     .read_var()
                     .map_err(|e| format!("origin client: {:?}", e))?;
                 let k: u32 = cursor
@@ -1624,14 +1632,17 @@ fn decode_v1_item_parents(bytes: &[u8]) -> Result<Vec<DecodedItemMeta>, String> 
                 None
             };
 
-            if has_right_origin {
-                let _: u32 = cursor
+            let right_origin = if has_right_origin {
+                let c: u64 = cursor
                     .read_var()
                     .map_err(|e| format!("right client: {:?}", e))?;
-                let _: u32 = cursor
+                let k: u32 = cursor
                     .read_var()
                     .map_err(|e| format!("right clock: {:?}", e))?;
-            }
+                Some((c, k))
+            } else {
+                None
+            };
 
             let mut parent_named = None;
             let mut parent_id = None;
@@ -1645,7 +1656,7 @@ fn decode_v1_item_parents(bytes: &[u8]) -> Result<Vec<DecodedItemMeta>, String> 
                         .map_err(|e| format!("parent name: {:?}", e))?;
                     parent_named = Some(name.to_string());
                 } else {
-                    let c: u32 = cursor
+                    let c: u64 = cursor
                         .read_var()
                         .map_err(|e| format!("parent id client: {:?}", e))?;
                     let k: u32 = cursor
@@ -1679,9 +1690,11 @@ fn decode_v1_item_parents(bytes: &[u8]) -> Result<Vec<DecodedItemMeta>, String> 
                 parent_id,
                 parent_sub,
                 origin,
+                right_origin,
+                content_ref,
             });
 
-            clock += content_len;
+            clock = clock.checked_add(content_len).ok_or("clock overflow")?;
         }
     }
 
@@ -1698,10 +1711,10 @@ fn skip_v1_content(cursor: &mut lib0::decoding::Cursor, content_ref: u8) -> Resu
         }
         2 => {
             let count: u32 = cursor.read_var().map_err(|e| format!("{:?}", e))?;
-            for _ in 0..=count {
+            for _ in 0..count {
                 cursor.read_buf().map_err(|e| format!("{:?}", e))?;
             }
-            Ok(count + 1)
+            Ok(count)
         }
         3 => {
             cursor.read_buf().map_err(|e| format!("{:?}", e))?;
@@ -1709,7 +1722,8 @@ fn skip_v1_content(cursor: &mut lib0::decoding::Cursor, content_ref: u8) -> Resu
         }
         4 => {
             let buf = cursor.read_buf().map_err(|e| format!("{:?}", e))?;
-            Ok(buf.len() as u32)
+            let text = std::str::from_utf8(buf).map_err(|_| "invalid UTF-8 string")?;
+            Ok(text.encode_utf16().count() as u32)
         }
         5 => {
             cursor.read_buf().map_err(|e| format!("{:?}", e))?;
