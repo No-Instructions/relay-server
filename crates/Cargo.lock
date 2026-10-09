@@ -3200,6 +3200,7 @@ dependencies = [
 [[package]]
 name = "yrs"
 version = "0.26.0"
+source = "git+https://github.com/dtkav/y-crdt?rev=f3e0cac0c2d43ed4ead2678556bdeca4df82fb4f#f3e0cac0c2d43ed4ead2678556bdeca4df82fb4f"
 dependencies = [
  "arc-swap",
  "async-lock",
