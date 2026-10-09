@@ -1,12 +1,18 @@
+# syntax=docker/dockerfile:1.7
 FROM rust:1.89-slim-trixie AS builder
 
 WORKDIR /build
 
 ARG RELAY_VERSION
+ARG TARGETARCH
 ENV RELAY_VERSION=${RELAY_VERSION}
 
 COPY . .
-RUN cargo build --release
+RUN --mount=type=cache,id=relay-public-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=relay-public-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=relay-public-target-rust1.89-release-${TARGETARCH},target=/build/target,sharing=locked \
+    cargo build --release --locked --package relay && \
+    install -Dm755 /build/target/release/relay /out/relay
 
 FROM debian:trixie-slim
 
@@ -21,7 +27,7 @@ RUN mkdir -p /var/run/tailscale /var/cache/tailscale /var/lib/tailscale
 RUN apt-get update && apt-get install -y ca-certificates
 
 # Add relay binary
-COPY --from=builder /build/target/release/relay /app/relay
+COPY --from=builder /out/relay /app/relay
 COPY ./run.sh /app/run.sh
 COPY ./relay.toml /app/relay.toml
 RUN chmod +x /app/run.sh

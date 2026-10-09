@@ -20,6 +20,5 @@ strip = true     # Strip symbols
 
 [patch.crates-io]
 rusty-s3 = { git = "https://github.com/dtkav/rusty-s3", branch = "main" }
-# Local verification only; replace with the fork git revision after approval to push.
 yrs = { git = "https://github.com/dtkav/y-crdt", rev = "f3e0cac0c2d43ed4ead2678556bdeca4df82fb4f" }
 yrs-kvstore = { path = "yrs-kvstore" }
