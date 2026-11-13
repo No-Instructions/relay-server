@@ -11,7 +11,14 @@ use yrs::{
 use yrs_kvstore::DocOps;
 
 pub struct DocWithSyncKv {
+    doc_id: String,
     awareness: Arc<RwLock<Awareness>>,
+    /// Where update events go. Replaceable so a resident document can take
+    /// the channel of a later attachment.
+    event_callback: Arc<RwLock<Option<WebhookCallback>>>,
+    /// Serializes a resident document's channel assignment, including
+    /// loading the parent it will route through.
+    pub channel_assignment: tokio::sync::Mutex<()>,
     sync_kv: Arc<SyncKv>,
     #[allow(unused)] // acts as RAII guard
     subscription: Subscription,
@@ -49,9 +56,10 @@ impl DocWithSyncKv {
                 .map_err(|_| anyhow!("Failed to load doc"))?;
         }
 
+        let event_callback = Arc::new(RwLock::new(webhook_callback));
         let subscription = {
             let sync_kv = sync_kv.clone();
-            let webhook_callback = webhook_callback.clone();
+            let event_callback = event_callback.clone();
             let doc_key = key.to_string();
             doc.observe_update_v1(move |txn, event| {
                 sync_kv.push_update(DOC_NAME, &event.update).unwrap();
@@ -60,7 +68,8 @@ impl DocWithSyncKv {
                     .unwrap();
 
                 // Trigger webhook if callback is configured
-                if let Some(ref callback) = webhook_callback {
+                let callback = event_callback.read().unwrap();
+                if let Some(ref callback) = *callback {
                     // Extract the full snapshot from the transaction (post-update).
                     let snapshot = txn.snapshot().encode_v1();
 
@@ -86,7 +95,10 @@ impl DocWithSyncKv {
 
         let awareness = Arc::new(RwLock::new(Awareness::new(doc)));
         Ok(Self {
+            doc_id: key.to_string(),
             awareness,
+            event_callback,
+            channel_assignment: tokio::sync::Mutex::new(()),
             sync_kv,
             subscription,
         })
@@ -116,8 +128,22 @@ impl DocWithSyncKv {
         Ok(())
     }
 
+    /// Give a resident document a channel: store it and replace the event
+    /// route as one step with respect to event delivery. The caller holds
+    /// `channel_assignment` and has already loaded the parent.
+    pub fn assign_channel_route(&self, channel: &str, callback: Option<WebhookCallback>) {
+        let mut route = self.event_callback.write().unwrap();
+        self.set_channel(channel);
+        *route = callback;
+    }
+
     /// Set the channel for this document in metadata
     pub fn set_channel(&self, channel: &str) {
+        // Routing to this document is implicit. Persisting its own ID here
+        // would prevent a later folder channel from becoming authoritative.
+        if channel == self.doc_id {
+            return;
+        }
         self.sync_kv.with_metadata_if_changed(|metadata| {
             if matches!(
                 metadata.get("channel"),
@@ -466,6 +492,27 @@ mod tests {
         assert!(doc.sync_kv().is_dirty());
         doc.sync_kv().persist().await.unwrap();
         assert_eq!(store.writes.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn self_channel_remains_unassigned_for_a_later_folder() {
+        let store = MemoryStore::default();
+        let doc = DocWithSyncKv::new("note", Some(Arc::new(Box::new(store.clone()))), || (), None)
+            .await
+            .unwrap();
+
+        doc.set_channel("note");
+        assert_eq!(doc.get_channel(), None);
+        assert!(!doc.sync_kv().is_dirty());
+
+        doc.set_channel("folder");
+        doc.sync_kv().persist().await.unwrap();
+        drop(doc);
+
+        let reloaded = DocWithSyncKv::new("note", Some(Arc::new(Box::new(store))), || (), None)
+            .await
+            .unwrap();
+        assert_eq!(reloaded.get_channel().as_deref(), Some("folder"));
     }
 
     #[tokio::test]

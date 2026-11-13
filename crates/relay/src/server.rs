@@ -422,6 +422,78 @@ impl Server {
         Ok(())
     }
 
+    /// The event route a document owns through its update observer. An unset
+    /// `routing` means the document routes to itself; a set one names its
+    /// channel and holds the parent pin, which detaches when the route drops.
+    fn event_callback(
+        &self,
+        doc_id: &str,
+        user: Option<String>,
+        routing: Arc<OnceLock<DocRouting>>,
+    ) -> Option<y_sweet_core::webhook::WebhookCallback> {
+        let event_dispatcher = self.event_dispatcher.clone();
+        let routing_for_callback = routing;
+        let user_for_callback = user;
+        let doc_id_for_callback = doc_id.to_string();
+
+        if let Some(dispatcher) = event_dispatcher {
+            Some(Arc::new(move |mut event: DocumentUpdatedEvent| {
+                let (routing_channel_for_callback, parent_guard) = match routing_for_callback.get()
+                {
+                    Some(routing) => (routing.channel.clone(), routing.parent_guard.as_ref()),
+                    None => (doc_id_for_callback.clone(), None),
+                };
+
+                // The doc's update observer already resolved the editing
+                // user from the update itself. The identity captured when
+                // this doc was first loaded is only a stand-in for updates
+                // that name no author, and only when nothing was deleted:
+                // a deletion names no actor at all, so falling back there
+                // would pin one person's removal on whoever happened to
+                // load the doc first. See `edit_author`'s trap 3.
+                if event.user.is_none()
+                    && !event
+                        .update
+                        .as_deref()
+                        .is_some_and(y_sweet_core::edit_author::update_deletes)
+                {
+                    event.user = user_for_callback.clone();
+                }
+
+                // Route this subdoc's snapshot through the parent's
+                // actor mailbox — cross-doc mutation stays with the
+                // owner. The guard doubles as the parent pin.
+                if let Some(parent_guard) = parent_guard {
+                    if let Some(snapshot) = &event.snapshot {
+                        parent_guard
+                            .send_subdoc_snapshot(doc_id_for_callback.clone(), snapshot.clone());
+                    }
+                }
+
+                // Log the full event payload as JSON after user assignment
+                match serde_json::to_string(&event) {
+                    Ok(json_str) => {
+                        tracing::trace!("Document updated event dispatched: {}", json_str);
+                    }
+                    Err(e) => {
+                        tracing::trace!(
+                            "Document updated event dispatched for doc_id: {} (JSON serialization failed: {})",
+                            event.doc_id, e
+                        );
+                    }
+                }
+
+                // Step 1: Create the envelope with predetermined routing channel
+                let envelope = EventEnvelope::new(routing_channel_for_callback.clone(), event);
+
+                // Step 2: Send via dispatcher
+                dispatcher.send_event(envelope);
+            }) as y_sweet_core::webhook::WebhookCallback)
+        } else {
+            None
+        }
+    }
+
     /// Construct a doc instance and spawn its workers. Runs under the
     /// registry's slot lock (as a `get_or_load` loader); the registry
     /// installs the result.
@@ -436,73 +508,7 @@ impl Server {
         // after loading metadata, before publishing the resident instance.
         let routing: Arc<OnceLock<DocRouting>> = Arc::new(OnceLock::new());
 
-        // Create event callback with the determined routing channel and user
-        let event_callback = {
-            let event_dispatcher = self.event_dispatcher.clone();
-            let routing_for_callback = routing.clone();
-            let user_for_callback = user.clone();
-            let doc_id_for_callback = doc_id.to_string();
-
-            if let Some(dispatcher) = event_dispatcher {
-                Some(Arc::new(move |mut event: DocumentUpdatedEvent| {
-                    let (routing_channel_for_callback, parent_guard) = match routing_for_callback
-                        .get()
-                    {
-                        Some(routing) => (routing.channel.clone(), routing.parent_guard.as_ref()),
-                        None => (doc_id_for_callback.clone(), None),
-                    };
-
-                    // The doc's update observer already resolved the editing
-                    // user from the update itself. The identity captured when
-                    // this doc was first loaded is only a stand-in for updates
-                    // that name no author, and only when nothing was deleted:
-                    // a deletion names no actor at all, so falling back there
-                    // would pin one person's removal on whoever happened to
-                    // load the doc first. See `edit_author`'s trap 3.
-                    if event.user.is_none()
-                        && !event
-                            .update
-                            .as_deref()
-                            .is_some_and(y_sweet_core::edit_author::update_deletes)
-                    {
-                        event.user = user_for_callback.clone();
-                    }
-
-                    // Route this subdoc's snapshot through the parent's
-                    // actor mailbox — cross-doc mutation stays with the
-                    // owner. The guard doubles as the parent pin.
-                    if let Some(parent_guard) = parent_guard {
-                        if let Some(snapshot) = &event.snapshot {
-                            parent_guard.send_subdoc_snapshot(
-                                doc_id_for_callback.clone(),
-                                snapshot.clone(),
-                            );
-                        }
-                    }
-
-                    // Log the full event payload as JSON after user assignment
-                    match serde_json::to_string(&event) {
-                        Ok(json_str) => {
-                            tracing::trace!("Document updated event dispatched: {}", json_str);
-                        }
-                        Err(e) => {
-                            tracing::trace!(
-                                "Document updated event dispatched for doc_id: {} (JSON serialization failed: {})",
-                                event.doc_id, e
-                            );
-                        }
-                    }
-
-                    // Step 1: Create the envelope with predetermined routing channel
-                    let envelope = EventEnvelope::new(routing_channel_for_callback.clone(), event);
-
-                    // Step 2: Send via dispatcher
-                    dispatcher.send_event(envelope);
-                }) as y_sweet_core::webhook::WebhookCallback)
-            } else {
-                None
-            }
-        };
+        let event_callback = self.event_callback(doc_id, user.clone(), routing.clone());
 
         // The dirty callback is a placeholder until the registry spawns
         // this doc's lifecycle actor and points the edge at its mailbox.
@@ -543,8 +549,22 @@ impl Server {
             parent_guard,
         });
 
-        // If channel is provided in token, store it in document metadata
+        // If channel is provided in token, store it in document metadata.
+        // Self-routing is implicit; set_channel stores only folder channels.
         if let Some(channel_name) = routing_channel {
+            if channel_name != doc_id {
+                if let Some(previous_channel) = dwskv
+                    .get_channel()
+                    .filter(|previous| *previous != channel_name)
+                {
+                    tracing::warn!(
+                        doc_id,
+                        channel = %channel_name,
+                        previous_channel,
+                        "Token channel replaced the stored channel"
+                    );
+                }
+            }
             dwskv.set_channel(&channel_name);
         }
 
@@ -555,6 +575,59 @@ impl Server {
             .map_err(|e| anyhow!("Error persisting: {:?}", e))?;
 
         Ok(dwskv)
+    }
+
+    /// Apply an attachment's channel to a document that is already resident,
+    /// as a load would have. A document loaded without a channel (a prefix
+    /// or server token reading it before any folder member arrives) routes
+    /// to itself, and one loaded under another channel routes there; either
+    /// way the token's channel is stored and the document's events move to
+    /// it without waiting for an eviction.
+    ///
+    /// A token without a channel, or naming the document itself, changes
+    /// nothing.
+    async fn assign_resident_channel(
+        &self,
+        doc_id: &str,
+        channel: Option<&str>,
+        user: Option<String>,
+        doc: &DocWithSyncKv,
+    ) -> Result<()> {
+        let Some(channel) = channel.filter(|channel| *channel != doc_id) else {
+            return Ok(());
+        };
+        if doc.get_channel().as_deref() == Some(channel) {
+            return Ok(());
+        }
+
+        let _assignment = doc.channel_assignment.lock().await;
+        let previous_channel = doc.get_channel();
+        if previous_channel.as_deref() == Some(channel) {
+            // Another attachment assigned it while this one waited.
+            return Ok(());
+        }
+        // The document is resident, so no loader holds its slot and this
+        // wait on the parent cannot close a load cycle.
+        let parent_guard = self.attach_doc_boxed(channel, AttachKind::Subdoc).await?;
+        let routing = Arc::new(OnceLock::new());
+        let _ = routing.set(DocRouting {
+            channel: channel.to_string(),
+            parent_guard: Some(parent_guard),
+        });
+        doc.assign_channel_route(channel, self.event_callback(doc_id, user, routing));
+        if let Some(previous_channel) = previous_channel {
+            tracing::warn!(
+                doc_id,
+                channel,
+                previous_channel,
+                "Token channel replaced the stored channel; rerouted resident document"
+            );
+        }
+        doc.sync_kv()
+            .persist()
+            .await
+            .map_err(|e| anyhow!("Error persisting channel: {:?}", e))?;
+        Ok(())
     }
 
     pub async fn get_or_create_doc(&self, doc_id: &str) -> Result<Arc<DocWithSyncKv>> {
@@ -578,7 +651,8 @@ impl Server {
         user: Option<String>,
     ) -> Result<Arc<DocWithSyncKv>> {
         Self::validate_doc_id(doc_id)?;
-        self.registry
+        let doc = self
+            .registry
             .get_or_load(doc_id, || {
                 let routing_channel = routing_channel.clone();
                 let user = user.clone();
@@ -587,7 +661,10 @@ impl Server {
                     self.build_doc(doc_id, routing_channel, user, None).await
                 }
             })
-            .await
+            .await?;
+        self.assign_resident_channel(doc_id, routing_channel.as_deref(), user, &doc)
+            .await?;
+        Ok(doc)
     }
 
     /// Load (if needed) and attach to a doc. The guard is the unit of
@@ -602,7 +679,8 @@ impl Server {
         user: Option<String>,
     ) -> Result<AttachGuard> {
         Self::validate_doc_id(doc_id)?;
-        self.registry
+        let guard = self
+            .registry
             .attach(doc_id, kind, || {
                 let routing_channel = routing_channel.clone();
                 let user = user.clone();
@@ -611,7 +689,10 @@ impl Server {
                     self.build_doc(doc_id, routing_channel, user, Some(kind)).await
                 }
             })
-            .await
+            .await?;
+        self.assign_resident_channel(doc_id, routing_channel.as_deref(), user, guard.doc())
+            .await?;
+        Ok(guard)
     }
 
     /// Boxed form of [`Self::attach_doc`] for use inside `build_doc`,
@@ -3584,6 +3665,105 @@ mod test {
             settle().await;
             assert!(listener.heard("new-folder", NOTE));
             assert!(!listener.heard(FOLDER, NOTE));
+        }
+
+        /// A token's channel overrides the stored one for a resident note
+        /// too: the note moves to the new channel without an eviction.
+        #[tokio::test(start_paused = true)]
+        async fn a_resident_note_is_rerouted_by_a_different_token_channel() {
+            let (server, listener) = server_with_listener().await;
+            let first = server
+                .attach_doc(NOTE, AttachKind::Socket, Some(FOLDER.to_string()), None)
+                .await
+                .unwrap();
+            assert_eq!(first.doc().get_channel().as_deref(), Some(FOLDER));
+
+            let second = server
+                .attach_doc(NOTE, AttachKind::Http, Some("new-folder".to_string()), None)
+                .await
+                .unwrap();
+            assert_eq!(second.doc().get_channel().as_deref(), Some("new-folder"));
+            assert!(server.registry.is_resident("new-folder"));
+
+            listener.clear();
+            second
+                .doc()
+                .apply_update(&content_update("k", "second"))
+                .unwrap();
+            settle().await;
+            assert!(listener.heard("new-folder", NOTE));
+            assert!(!listener.heard(FOLDER, NOTE));
+        }
+
+        /// Git Sync reads a brand-new note before any folder member has
+        /// connected to it. The read assigns nothing, and the first folder
+        /// member to attach moves the resident note onto the folder channel.
+        #[tokio::test(start_paused = true)]
+        async fn a_resident_unassigned_note_takes_its_first_channel() {
+            let (server, listener) = server_with_listener().await;
+
+            let reader = server
+                .attach_doc(NOTE, AttachKind::Http, None, None)
+                .await
+                .unwrap();
+            assert_eq!(reader.doc().get_channel(), None);
+            assert!(!server.registry.is_resident(FOLDER));
+
+            let (heard, index_moved) = folder_member_edits(&server, &listener).await;
+            assert!(
+                heard,
+                "the folder channel must hear an edit to a note first read without a channel"
+            );
+            assert!(
+                index_moved,
+                "the folder's subdoc index must take an edit to a note first read without a channel"
+            );
+            assert!(!listener.heard(NOTE, NOTE));
+            assert_eq!(reader.doc().get_channel().as_deref(), Some(FOLDER));
+            assert!(server.registry.is_resident(FOLDER));
+
+            // The assignment is durable: a channel-less reload routes to the folder.
+            drop(reader);
+            settle().await;
+            assert_eq!(server.registry.evict(NOTE).await, EvictOutcome::Evicted);
+            settle().await;
+            let reloaded = server
+                .attach_doc(NOTE, AttachKind::Http, None, None)
+                .await
+                .unwrap();
+            assert_eq!(reloaded.doc().get_channel().as_deref(), Some(FOLDER));
+        }
+
+        /// A channel-less read says nothing about where a document belongs,
+        /// and a token naming the document itself is implicit routing.
+        /// Neither may store a channel, or a later folder could not claim it.
+        #[tokio::test(start_paused = true)]
+        async fn channel_less_and_self_channel_access_store_nothing() {
+            let (server, listener) = server_with_listener().await;
+
+            for channel in [None, Some(NOTE.to_string())] {
+                let guard = server
+                    .attach_doc(NOTE, AttachKind::Http, channel, None)
+                    .await
+                    .unwrap();
+                guard
+                    .doc()
+                    .apply_update(&content_update("k", "first"))
+                    .unwrap();
+                assert_eq!(guard.doc().get_channel(), None);
+                drop(guard);
+                settle().await;
+                assert_eq!(server.registry.evict(NOTE).await, EvictOutcome::Evicted);
+                settle().await;
+            }
+            assert!(listener.heard(NOTE, NOTE));
+
+            let (heard, _) = folder_member_edits(&server, &listener).await;
+            assert!(heard, "a later folder token must still claim the note");
+            assert_eq!(
+                server.registry.peek(NOTE).unwrap().get_channel().as_deref(),
+                Some(FOLDER)
+            );
         }
 
         /// A load that names one of its own subdocs as its channel pins that
