@@ -1,17 +1,24 @@
 name: Build Rust binary and create release
 
-# Note: If you add or remove binaries, you should also update the list in releaser/src/check_binaries.rs
+# Builds the standalone binaries for an existing release tag and attaches them
+# to that tag's GitHub release. Publish the release first, then dispatch this
+# workflow with the tag as the version.
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Release Version'
+        description: 'Existing release tag to build and attach binaries to'
         required: true
   pull_request:
     branches: [ "main" ]
     paths:
       - ".github/workflows/release.yml"
+
+env:
+  # The version the binaries report. Empty on pull requests, where the build
+  # falls back to the commit.
+  RELAY_VERSION: ${{ github.event.inputs.version }}
 
 jobs:
   build-macos-arm64:
@@ -19,11 +26,13 @@ jobs:
     steps:
     - name: Checkout
       uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.inputs.version || github.sha }}
 
     - name: Install latest rust toolchain
       uses: actions-rs/toolchain@v1
       with:
-        toolchain: beta
+        toolchain: stable
         target: aarch64-apple-darwin
         default: true
         override: true
@@ -32,7 +41,7 @@ jobs:
       uses: actions-rs/cargo@v1
       with:
         command: build
-        args: --manifest-path=crates/Cargo.toml --target aarch64-apple-darwin --release
+        args: --manifest-path=crates/Cargo.toml --target aarch64-apple-darwin --release --locked
 
     - name: strip binary
       run: strip ./crates/target/aarch64-apple-darwin/release/relay
@@ -48,11 +57,13 @@ jobs:
     steps:
     - name: Checkout
       uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.inputs.version || github.sha }}
 
     - name: Install latest rust toolchain
       uses: actions-rs/toolchain@v1
       with:
-        toolchain: beta
+        toolchain: stable
         target: x86_64-apple-darwin
         default: true
         override: true
@@ -61,7 +72,7 @@ jobs:
       uses: actions-rs/cargo@v1
       with:
         command: build
-        args: --release --manifest-path=crates/Cargo.toml --target x86_64-apple-darwin
+        args: --release --locked --manifest-path=crates/Cargo.toml --target x86_64-apple-darwin
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
@@ -74,6 +85,8 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v2
+      with:
+        ref: ${{ github.event.inputs.version || github.sha }}
       
     - name: Setup Rust
       uses: actions-rs/toolchain@v1
@@ -89,7 +102,7 @@ jobs:
       uses: actions-rs/cargo@v1
       with:
         command: build
-        args: --release --target x86_64-unknown-linux-musl --manifest-path=crates/Cargo.toml
+        args: --release --locked --target x86_64-unknown-linux-musl --manifest-path=crates/Cargo.toml
         
     - name: Upload artifact
       uses: actions/upload-artifact@v4
@@ -102,6 +115,8 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v2
+      with:
+        ref: ${{ github.event.inputs.version || github.sha }}
       
     - name: Setup Rust
       uses: actions-rs/toolchain@v1
@@ -122,7 +137,7 @@ jobs:
         CC: aarch64-linux-gnu-gcc
       with:
         command: build
-        args: --release --target aarch64-unknown-linux-musl --manifest-path=crates/Cargo.toml
+        args: --release --locked --target aarch64-unknown-linux-musl --manifest-path=crates/Cargo.toml
         
     - name: Upload artifact
       uses: actions/upload-artifact@v4
@@ -135,6 +150,8 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v2
+      with:
+        ref: ${{ github.event.inputs.version || github.sha }}
       
     - name: Setup Rust
       uses: actions-rs/toolchain@v1
@@ -155,7 +172,7 @@ jobs:
         CC: arm-linux-gnueabihf-gcc
       with:
         command: build
-        args: --release --target armv7-unknown-linux-musleabihf --manifest-path=crates/Cargo.toml
+        args: --release --locked --target armv7-unknown-linux-musleabihf --manifest-path=crates/Cargo.toml
         
     - name: Upload artifact
       uses: actions/upload-artifact@v4
@@ -167,7 +184,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout code
-      uses: actions/checkout@v2 
+      uses: actions/checkout@v2
+      with:
+        ref: ${{ github.event.inputs.version || github.sha }}
 
     - name: Setup Rust
       uses: actions-rs/toolchain@v1
@@ -183,7 +202,7 @@ jobs:
       uses: actions-rs/cargo@v1
       with:
         command: build
-        args: --release --target x86_64-pc-windows-gnu --manifest-path=crates/Cargo.toml
+        args: --release --locked --target x86_64-pc-windows-gnu --manifest-path=crates/Cargo.toml
 
     - name: ls
       run: ls ./crates/target/x86_64-pc-windows-gnu/release
@@ -198,6 +217,8 @@ jobs:
     needs: [build-linux, build-macos-arm64, build-macos-x64, build-windows, build-linux-arm64, build-linux-armv7]
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request'
+    permissions:
+      contents: write
     steps:
     - name: Download artifacts
       uses: actions/download-artifact@v4
@@ -220,15 +241,18 @@ jobs:
         mv macos-binary-arm64/relay.gz relay-macos-arm64.gz &&
         mv linux-binary-arm64/relay.gz relay-linux-arm64.gz &&
         mv linux-binary-armv7/relay.gz relay-linux-armv7.gz
-    - name: Release
-      uses: softprops/action-gh-release@v1
-      with:
-        name: ${{ github.event.inputs.version }}
-        draft: true
-        files: |
-            relay-win-x64.exe.gz
-            relay-linux-x64.gz
-            relay-macos-x64.gz
-            relay-macos-arm64.gz
-            relay-linux-arm64.gz
-            relay-linux-armv7.gz
+    - name: Checksums
+      run: sha256sum relay-*.gz > SHA256SUMS
+    - name: Attach to the release
+      env:
+        GH_TOKEN: ${{ github.token }}
+        VERSION: ${{ github.event.inputs.version }}
+      run: >
+        gh release upload "$VERSION" --repo "$GITHUB_REPOSITORY" --clobber
+        relay-win-x64.exe.gz
+        relay-linux-x64.gz
+        relay-macos-x64.gz
+        relay-macos-arm64.gz
+        relay-linux-arm64.gz
+        relay-linux-armv7.gz
+        SHA256SUMS
