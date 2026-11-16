@@ -39,6 +39,7 @@ fn create_authenticator_with_type(
                         key_lookup: std::collections::HashMap::new(),
                         keys_without_id: vec![0],
                         expected_audience: None,
+                        jwt_issuers: None,
                     })
                 }
             }
@@ -69,6 +70,7 @@ fn create_authenticator_with_type(
                         key_lookup: std::collections::HashMap::new(),
                         keys_without_id: vec![0],
                         expected_audience: None,
+                        jwt_issuers: None,
                     })
                 }
             }
@@ -92,6 +94,7 @@ fn create_authenticator_with_type(
                 key_lookup: std::collections::HashMap::new(),
                 keys_without_id: vec![0],
                 expected_audience: None,
+                jwt_issuers: None,
             })
         }
         "eddsa" => {
@@ -116,6 +119,7 @@ fn create_authenticator_with_type(
                 key_lookup: std::collections::HashMap::new(),
                 keys_without_id: vec![0],
                 expected_audience: None,
+                jwt_issuers: None,
             })
         }
         _ => anyhow::bail!("Invalid key type. Must be: hmac, legacy, es256, or eddsa"),
@@ -903,6 +907,7 @@ async fn decode_token(token: Option<&str>) -> Result<()> {
                     match format {
                         TokenFormat::Custom => "custom",
                         TokenFormat::Cwt => "cwt",
+                        TokenFormat::Jwt => "jwt",
                     }
                     .to_string(),
                 ),
@@ -972,6 +977,8 @@ async fn decode_token(token: Option<&str>) -> Result<()> {
                         ),
                     );
                 }
+                // A JWT contains dots, so it never decodes as one base64 string.
+                TokenFormat::Jwt => {}
             }
         }
         Err(e) => {

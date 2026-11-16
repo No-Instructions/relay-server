@@ -1071,7 +1071,7 @@ fn verify_socket_token(
         })?;
 
         authenticator
-            .verify_token_with_channel(token, current_time_epoch_millis())
+            .verify_token_for_doc(token, doc_id, current_time_epoch_millis())
             .map_err(|e| {
                 tracing::debug!("Token verification failed: {:?}", e);
                 AppError::auth(StatusCode::UNAUTHORIZED, e.into(), "invalid_token")
@@ -1571,8 +1571,8 @@ async fn new_doc(
             } else {
                 // Try prefix token - we need to check if the doc_id matches the prefix
                 if let Some(doc_id) = &body.doc_id {
-                    let permission = authenticator
-                        .verify_token_auto(token, current_time_epoch_millis())
+                    let (permission, _) = authenticator
+                        .verify_token_for_doc(token, doc_id, current_time_epoch_millis())
                         .map_err(|auth_error| {
                             AppError::auth(
                                 StatusCode::UNAUTHORIZED,

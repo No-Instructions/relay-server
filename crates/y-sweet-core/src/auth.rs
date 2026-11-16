@@ -1,11 +1,13 @@
 use crate::api_types::Authorization;
 use crate::config::TokenType;
+use crate::jwt::{authorization_of, JwtIssuers};
 use bincode::Options;
 use data_encoding::Encoding;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt::Display;
+use std::sync::Arc;
 use thiserror::Error;
 
 pub const DEFAULT_EXPIRATION_SECONDS: u64 = 60 * 60; // 60 minutes
@@ -115,6 +117,10 @@ pub enum AuthError {
     UnauthorizedTokenType(String),
     #[error("Invalid token type in configuration: {0}")]
     InvalidTokenType(String),
+    #[error("The token's issuer is not configured")]
+    UnknownIssuer,
+    #[error("The token is not yet valid")]
+    NotYetValid,
 }
 
 impl AuthError {
@@ -142,6 +148,8 @@ impl AuthError {
             AuthError::InsufficientPermissions(_) => "insufficient_permissions",
             AuthError::UnauthorizedTokenType(_) => "unauthorized_token_type",
             AuthError::InvalidTokenType(_) => "invalid_token_type",
+            AuthError::UnknownIssuer => "unknown_issuer",
+            AuthError::NotYetValid => "not_yet_valid",
         }
     }
 }
@@ -192,16 +200,19 @@ pub struct Authenticator {
     pub key_lookup: std::collections::HashMap<String, usize>,
     pub keys_without_id: Vec<usize>,
     pub expected_audience: Option<String>,
+    /// External issuers whose JWTs are accepted alongside Relay's own tokens.
+    #[serde(skip)]
+    pub jwt_issuers: Option<Arc<JwtIssuers>>,
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 pub struct DocPermission {
     pub doc_id: String,
     pub authorization: Authorization,
     pub user: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 pub struct FilePermission {
     pub file_hash: String,
     pub authorization: Authorization,
@@ -227,14 +238,14 @@ struct LegacyFilePermission {
     pub doc_id: String,
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 pub struct PrefixPermission {
     pub prefix: String,
     pub authorization: Authorization,
     pub user: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 pub enum Permission {
     Server,
     Doc(DocPermission),
@@ -518,10 +529,15 @@ impl TryFrom<&str> for KeyId {
 pub enum TokenFormat {
     Custom,
     Cwt,
+    Jwt,
 }
 
 /// Detect the format of a token based on its structure
 pub fn detect_token_format(token: &str) -> TokenFormat {
+    if is_jwt(token) {
+        return TokenFormat::Jwt;
+    }
+
     let token_data = token;
 
     // Try to decode as base64
@@ -542,6 +558,122 @@ pub fn detect_token_format(token: &str) -> TokenFormat {
 
     // Default to custom format for backward compatibility
     TokenFormat::Custom
+}
+
+/// A JWT is three base64url segments joined by two dots, the first a JSON
+/// header naming its `alg`. Relay's own tokens never contain a dot.
+fn is_jwt(token: &str) -> bool {
+    let mut parts = token.split('.');
+    let (Some(header), Some(payload), Some(_signature), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    if header.is_empty() || payload.is_empty() {
+        return false;
+    }
+    b64_decode(header)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .is_some_and(|header| header.get("alg").is_some_and(|alg| alg.is_string()))
+}
+
+/// Of a token's permissions, the one ranked highest, the first in
+/// configuration order on a tie.
+fn pick(permissions: Vec<Permission>, rank: impl Fn(&Permission) -> u8) -> Option<Permission> {
+    let mut best: Option<(u8, Permission)> = None;
+    for permission in permissions {
+        let r = rank(&permission);
+        if best.as_ref().map_or(true, |(b, _)| r > *b) {
+            best = Some((r, permission));
+        }
+    }
+    best.map(|(_, permission)| permission)
+}
+
+/// The most permissive: server, then full, then read-only.
+fn most_permissive(permissions: Vec<Permission>) -> Option<Permission> {
+    pick(permissions, |p| match p {
+        Permission::Server => 3,
+        p if authorization_of(p) == Authorization::Full => 2,
+        _ => 1,
+    })
+}
+
+/// For access to one document: full before read-only, and a grant naming
+/// the document before a server grant, which carries no user.
+fn best_for_doc(permissions: Vec<Permission>) -> Option<Permission> {
+    pick(permissions, |p| match p {
+        Permission::Server => 2,
+        p if authorization_of(p) == Authorization::Full => 3,
+        _ => 1,
+    })
+}
+
+/// Of the results of checking each of a token's permissions against one
+/// resource, the strongest success, or else the first failure.
+fn strongest(
+    results: impl IntoIterator<Item = Result<Authorization, AuthError>>,
+) -> Result<Authorization, AuthError> {
+    let mut best: Option<Result<Authorization, AuthError>> = None;
+    for result in results {
+        best = match (best, result) {
+            (_, Ok(Authorization::Full)) => return Ok(Authorization::Full),
+            (Some(Ok(current)), _) => Some(Ok(current)),
+            (_, Ok(authorization)) => Some(Ok(authorization)),
+            (None, Err(error)) => Some(Err(error)),
+            (current, Err(_)) => current,
+        };
+    }
+    best.unwrap_or(Err(AuthError::InvalidResource))
+}
+
+/// What a permission allows on a document.
+fn doc_authorization(permission: &Permission, doc: &str) -> Result<Authorization, AuthError> {
+    match permission {
+        Permission::Doc(doc_permission) => {
+            if doc_permission.doc_id == doc {
+                Ok(doc_permission.authorization)
+            } else {
+                Err(AuthError::InvalidResource)
+            }
+        }
+        Permission::File(file_permission) => {
+            // Only check for file tokens using doc_id, not file_hash
+            // This prevents document tokens from being misinterpreted
+            if file_permission.doc_id == doc {
+                Ok(file_permission.authorization)
+            } else {
+                Err(AuthError::InvalidResource)
+            }
+        }
+        Permission::Prefix(prefix_permission) => {
+            if doc.starts_with(&prefix_permission.prefix) {
+                Ok(prefix_permission.authorization)
+            } else {
+                Err(AuthError::InvalidResource)
+            }
+        }
+        Permission::Server => Ok(Authorization::Full), // Server tokens can access any doc.
+    }
+}
+
+/// What a permission allows on a file, by hash.
+fn file_authorization(
+    permission: &Permission,
+    file_hash: &str,
+) -> Result<Authorization, AuthError> {
+    match permission {
+        Permission::File(file_permission) => {
+            if file_permission.file_hash == file_hash {
+                Ok(file_permission.authorization)
+            } else {
+                Err(AuthError::InvalidResource)
+            }
+        }
+        Permission::Server => Ok(Authorization::Full), // Server tokens can access any file
+        _ => Err(AuthError::InvalidResource),
+    }
 }
 
 /// Extract key ID from CWT token COSE headers
@@ -680,6 +812,7 @@ impl Authenticator {
             key_lookup: std::collections::HashMap::new(),
             keys_without_id: vec![0],
             expected_audience: None,
+            jwt_issuers: None,
         })
     }
 
@@ -740,6 +873,7 @@ impl Authenticator {
             key_lookup,
             keys_without_id,
             expected_audience: None,
+            jwt_issuers: None,
         })
     }
 
@@ -831,6 +965,8 @@ impl Authenticator {
 
                 Err(AuthError::KeyMismatch)
             }
+            // JWTs are verified against their issuer's keys, not these.
+            TokenFormat::Jwt => Err(AuthError::KeyMismatch),
         }
     }
 
@@ -939,6 +1075,7 @@ impl Authenticator {
             key_lookup,
             keys_without_id,
             expected_audience: None,
+            jwt_issuers: None,
         }
     }
 
@@ -1162,34 +1299,8 @@ impl Authenticator {
         doc: &str,
         current_time_epoch_millis: u64,
     ) -> Result<Authorization, AuthError> {
-        let payload = self.verify_token_auto(token, current_time_epoch_millis)?;
-
-        match payload {
-            Permission::Doc(doc_permission) => {
-                if doc_permission.doc_id == doc {
-                    Ok(doc_permission.authorization)
-                } else {
-                    Err(AuthError::InvalidResource)
-                }
-            }
-            Permission::File(file_permission) => {
-                // Only check for file tokens using doc_id, not file_hash
-                // This prevents document tokens from being misinterpreted
-                if file_permission.doc_id == doc {
-                    Ok(file_permission.authorization)
-                } else {
-                    Err(AuthError::InvalidResource)
-                }
-            }
-            Permission::Prefix(prefix_permission) => {
-                if doc.starts_with(&prefix_permission.prefix) {
-                    Ok(prefix_permission.authorization)
-                } else {
-                    Err(AuthError::InvalidResource)
-                }
-            }
-            Permission::Server => Ok(Authorization::Full), // Server tokens can access any doc.
-        }
+        let permissions = self.token_permissions(token, current_time_epoch_millis)?;
+        strongest(permissions.iter().map(|p| doc_authorization(p, doc)))
     }
 
     pub fn verify_file_token(
@@ -1198,54 +1309,81 @@ impl Authenticator {
         file_hash: &str,
         current_time_epoch_millis: u64,
     ) -> Result<Authorization, AuthError> {
-        let payload = self.verify_token_auto(token, current_time_epoch_millis)?;
-
-        match payload {
-            Permission::File(file_permission) => {
-                if file_permission.file_hash == file_hash {
-                    Ok(file_permission.authorization)
-                } else {
-                    Err(AuthError::InvalidResource)
-                }
-            }
-            Permission::Server => Ok(Authorization::Full), // Server tokens can access any file
-            _ => Err(AuthError::InvalidResource),
-        }
+        let permissions = self.token_permissions(token, current_time_epoch_millis)?;
+        strongest(permissions.iter().map(|p| file_authorization(p, file_hash)))
     }
 
+    /// File operations scoped to a document. Doc and prefix tokens may
+    /// perform them for the documents they cover.
     pub fn verify_file_token_for_doc(
         &self,
         token: &str,
         doc_id: &str,
         current_time_epoch_millis: u64,
     ) -> Result<Authorization, AuthError> {
-        let payload = self.verify_token_auto(token, current_time_epoch_millis)?;
+        let permissions = self.token_permissions(token, current_time_epoch_millis)?;
+        strongest(permissions.iter().map(|p| doc_authorization(p, doc_id)))
+    }
 
-        match payload {
-            Permission::File(file_permission) => {
-                if file_permission.doc_id == doc_id {
-                    Ok(file_permission.authorization)
-                } else {
-                    Err(AuthError::InvalidResource)
-                }
+    /// Accept JWTs from these external issuers in addition to Relay's own tokens.
+    pub fn set_jwt_issuers(&mut self, issuers: Arc<JwtIssuers>) {
+        self.jwt_issuers = Some(issuers);
+    }
+
+    fn verify_jwt(
+        &self,
+        token: &str,
+        current_time: Option<u64>,
+    ) -> Result<Vec<Permission>, AuthError> {
+        match &self.jwt_issuers {
+            Some(issuers) => issuers.verify(token, current_time),
+            None => {
+                tracing::debug!("JWT rejected: no jwt_issuer configured");
+                Err(AuthError::InvalidToken)
             }
-            Permission::Doc(doc_permission) => {
-                // Allow Doc tokens to perform file operations for their doc_id
-                if doc_permission.doc_id == doc_id {
-                    Ok(doc_permission.authorization)
-                } else {
-                    Err(AuthError::InvalidResource)
-                }
-            }
-            Permission::Prefix(prefix_permission) => {
-                if doc_id.starts_with(&prefix_permission.prefix) {
-                    Ok(prefix_permission.authorization)
-                } else {
-                    Err(AuthError::InvalidResource)
-                }
-            }
-            Permission::Server => Ok(Authorization::Full), // Server tokens can access any doc
         }
+    }
+
+    /// Every permission a token confers. Relay's own tokens carry one; a JWT
+    /// carries one per matching grant.
+    fn token_permissions(
+        &self,
+        token: &str,
+        current_time: u64,
+    ) -> Result<Vec<Permission>, AuthError> {
+        match detect_token_format(token) {
+            TokenFormat::Jwt => self.verify_jwt(token, Some(current_time)),
+            _ => Ok(vec![self.verify_token_auto(token, current_time)?]),
+        }
+    }
+
+    /// Verify a token for access to one document, returning the permission to
+    /// check against it and the token's channel.
+    ///
+    /// Where a JWT carries several permissions, this is the strongest one that
+    /// covers `doc_id`, or the most permissive if none does. Other tokens
+    /// carry one permission, returned as is; the caller still checks it.
+    pub fn verify_token_for_doc(
+        &self,
+        token: &str,
+        doc_id: &str,
+        current_time: u64,
+    ) -> Result<(Permission, Option<String>), AuthError> {
+        if detect_token_format(token) != TokenFormat::Jwt {
+            return self.verify_token_with_channel(token, current_time);
+        }
+        let permissions = self.verify_jwt(token, Some(current_time))?;
+        let covering = permissions
+            .iter()
+            .filter(|p| doc_authorization(p, doc_id).is_ok())
+            .cloned()
+            .collect::<Vec<_>>();
+        let chosen = if covering.is_empty() {
+            most_permissive(permissions)
+        } else {
+            best_for_doc(covering)
+        };
+        Ok((chosen.ok_or(AuthError::InvalidResource)?, None))
     }
 
     pub fn file_token_metadata(
@@ -1298,6 +1436,7 @@ impl Authenticator {
             key_lookup: std::collections::HashMap::new(),
             keys_without_id: vec![0],
             expected_audience: None,
+            jwt_issuers: None,
         })
     }
 
@@ -1322,6 +1461,7 @@ impl Authenticator {
             key_lookup: std::collections::HashMap::new(),
             keys_without_id: vec![0],
             expected_audience: None,
+            jwt_issuers: None,
         })
     }
 
@@ -1343,6 +1483,7 @@ impl Authenticator {
             key_lookup: std::collections::HashMap::new(),
             keys_without_id: vec![0],
             expected_audience: None,
+            jwt_issuers: None,
         })
     }
 
@@ -1370,6 +1511,13 @@ impl Authenticator {
         token: &str,
         current_time: u64,
     ) -> Result<Permission, AuthError> {
+        // A JWT may carry several permissions; with no resource in hand, the
+        // most permissive stands for the token.
+        if detect_token_format(token) == TokenFormat::Jwt {
+            let permissions = self.verify_jwt(token, Some(current_time))?;
+            return most_permissive(permissions).ok_or(AuthError::InvalidToken);
+        }
+
         // First verify the token normally
         let permission = self.verify_token_internal(token, current_time)?;
 
@@ -1445,6 +1593,8 @@ impl Authenticator {
                     Err(AuthError::InvalidToken)
                 }
             }
+            TokenFormat::Jwt => most_permissive(self.verify_jwt(token, Some(current_time))?)
+                .ok_or(AuthError::InvalidToken),
         }
     }
 
@@ -1469,6 +1619,7 @@ impl Authenticator {
                     return Err(AuthError::InvalidToken);
                 }
             }
+            TokenFormat::Jwt => Err(AuthError::KeyMismatch),
         }
     }
 
@@ -1857,6 +2008,16 @@ impl Authenticator {
                     Permission::Server => Ok(None),
                 }
             }
+            TokenFormat::Jwt => {
+                // Every permission from one JWT carries the same user.
+                let permissions = self.verify_jwt(token, None)?;
+                Ok(match permissions.into_iter().next() {
+                    Some(Permission::Doc(doc_perm)) => doc_perm.user,
+                    Some(Permission::File(file_perm)) => file_perm.user,
+                    Some(Permission::Prefix(prefix_perm)) => prefix_perm.user,
+                    Some(Permission::Server) | None => None,
+                })
+            }
         }
     }
 
@@ -1932,6 +2093,7 @@ impl Authenticator {
                     return Err(AuthError::InvalidToken);
                 }
             }
+            TokenFormat::Jwt => Ok((self.verify_token_auto(token, current_time)?, None)),
         }
     }
 }

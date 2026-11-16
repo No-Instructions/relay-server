@@ -81,6 +81,31 @@ secret_access_key = "secret..."  # or set AWS_SECRET_ACCESS_KEY
 prefix = ""
 ```
 
+See [`crates/relay.toml.example`](crates/relay.toml.example) for every option.
+
+### External JWT issuers
+
+Relay can also accept JWTs from an OpenID Connect identity provider, and map
+their claims (roles, groups) to Relay scopes. Keys are fetched from the
+issuer's JWKS and kept fresh in the background.
+
+```toml
+[[jwt_issuer]]
+issuer = "https://login.example.com/tenant/v2.0"
+audience = "relay-client-id"
+
+[[jwt_issuer.grant]]
+claim = "roles"
+contains = "Relay.Write"
+scope = "prefix:<relay-id>-:rw"
+```
+
+A grant with `scope = "server"` gives matching JWTs full admin access, the
+same as a Relay server token, so only write one deliberately.
+
+See [`crates/specs/jwt-issuer-authentication.md`](crates/specs/jwt-issuer-authentication.md)
+for every option and how tokens are checked.
+
 
 ## Contact
 

@@ -21,6 +21,7 @@ use url::Url;
 use y_sweet_core::{
     auth::Authenticator,
     config::Config,
+    jwt::JwtIssuers,
     metrics::RelayMetrics,
     store::{
         s3::{
@@ -878,6 +879,20 @@ async fn main() -> Result<()> {
                     tracing::info!("CWT audience validation enabled for: {}", url);
                 } else {
                     return Err(anyhow::anyhow!("Server URL is required"));
+                }
+
+                if !config.jwt_issuer.is_empty() {
+                    let issuers = Arc::new(
+                        JwtIssuers::from_config(&config.jwt_issuer)
+                            .map_err(|e| anyhow::anyhow!(e))?,
+                    );
+                    for task in issuers.refresh_tasks() {
+                        tokio::spawn(task);
+                    }
+                    for issuer in &config.jwt_issuer {
+                        tracing::info!(issuer = %issuer.issuer, "Accepting JWTs from issuer");
+                    }
+                    authenticator.set_jwt_issuers(issuers);
                 }
             }
 

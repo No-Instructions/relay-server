@@ -269,6 +269,9 @@ pub struct Config {
     pub auth: Vec<AuthKeyConfig>,
 
     #[serde(default)]
+    pub jwt_issuer: Vec<JwtIssuerConfig>,
+
+    #[serde(default)]
     pub store: StoreConfig,
 
     #[serde(default)]
@@ -410,6 +413,85 @@ pub struct AuthKeyConfig {
 
     #[serde(default = "default_allowed_token_types")]
     pub allowed_token_types: Vec<TokenType>,
+}
+
+/// An external issuer whose JWTs Relay accepts, from a `[[jwt_issuer]]` block.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct JwtIssuerConfig {
+    /// Must equal the token's `iss` claim exactly.
+    pub issuer: String,
+
+    /// The token's `aud` claim must contain one of these.
+    pub audience: OneOrMany,
+
+    /// Where to fetch the signing keys. Defaults to the `jwks_uri` named by
+    /// `<issuer>/.well-known/openid-configuration`.
+    pub jwks_uri: Option<String>,
+
+    /// The claim whose value becomes the Relay user id.
+    #[serde(default = "default_jwt_user_claim")]
+    pub user_claim: String,
+
+    /// Accepted signature algorithms. Symmetric algorithms and `none` are refused.
+    #[serde(default = "default_jwt_algorithms")]
+    pub algorithms: Vec<String>,
+
+    /// Allowed clock skew, in seconds, when checking `exp` and `nbf`.
+    #[serde(default = "default_jwt_leeway_seconds")]
+    pub leeway_seconds: u64,
+
+    /// How often to refetch the signing keys, in seconds.
+    #[serde(default = "default_jwks_refresh_seconds")]
+    pub jwks_refresh_seconds: u64,
+
+    /// Rules mapping the token's claims to Relay scopes.
+    #[serde(default)]
+    pub grant: Vec<JwtGrantConfig>,
+}
+
+/// A `[[jwt_issuer.grant]]` rule: a token whose `claim` contains `contains`
+/// is granted `scope`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct JwtGrantConfig {
+    /// A top-level claim holding a string or an array of strings.
+    pub claim: String,
+    /// Matches the claim when equal to it, or to any member of it.
+    pub contains: String,
+    /// A Relay scope, e.g. `prefix:<id>:rw`. `server` gives full admin access.
+    pub scope: String,
+}
+
+/// A TOML value that may be written as one string or a list of strings.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum OneOrMany {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl OneOrMany {
+    pub fn to_vec(&self) -> Vec<String> {
+        match self {
+            OneOrMany::One(value) => vec![value.clone()],
+            OneOrMany::Many(values) => values.clone(),
+        }
+    }
+}
+
+fn default_jwt_user_claim() -> String {
+    "sub".to_string()
+}
+
+fn default_jwt_algorithms() -> Vec<String> {
+    vec!["RS256".to_string(), "ES256".to_string()]
+}
+
+fn default_jwt_leeway_seconds() -> u64 {
+    60
+}
+
+fn default_jwks_refresh_seconds() -> u64 {
+    60 * 60
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -876,6 +958,18 @@ impl Config {
             self.validate_multi_key_auth()?;
         }
 
+        if !self.jwt_issuer.is_empty() {
+            // Without an [[auth]] key the server runs with auth disabled, and
+            // a JWT would never be asked for.
+            if self.auth.is_empty() {
+                return Err(ConfigError::InvalidConfiguration(
+                    "[[jwt_issuer]] requires at least one [[auth]] key".to_string(),
+                ));
+            }
+            crate::jwt::JwtIssuers::from_config(&self.jwt_issuer)
+                .map_err(ConfigError::InvalidConfiguration)?;
+        }
+
         // Validate webhook configurations
         for (i, webhook) in self.webhooks.iter().enumerate() {
             if webhook.url.is_empty() {
@@ -1000,6 +1094,7 @@ impl Default for Config {
         Self {
             server: ServerConfig::default(),
             auth: Vec::new(),
+            jwt_issuer: Vec::new(),
             store: StoreConfig::default(),
             webhooks: Vec::new(),
             logging: LoggingConfig::default(),
@@ -1333,5 +1428,68 @@ probe_prefix = "relay-probe/"
             Some("/dev/shm/aws-credentials.json")
         );
         assert_eq!(s3.probe_prefix.as_deref(), Some("relay-probe/"));
+    }
+
+    const JWT_ISSUER_TOML: &str = r#"
+[[jwt_issuer]]
+issuer = "https://login.example.com/tenant/v2.0"
+audience = "relay-client-id"
+
+[[jwt_issuer.grant]]
+claim = "roles"
+contains = "Relay.Read"
+scope = "prefix:relay-1-:r"
+
+[[jwt_issuer]]
+issuer = "https://other.example.com"
+audience = ["a", "b"]
+jwks_uri = "https://other.example.com/keys"
+user_claim = "oid"
+algorithms = ["ES256"]
+leeway_seconds = 30
+
+[[jwt_issuer.grant]]
+claim = "groups"
+contains = "editors"
+scope = "prefix:relay-1-:rw"
+"#;
+
+    #[test]
+    fn test_jwt_issuer_toml() {
+        let config: Config = toml::from_str(JWT_ISSUER_TOML).unwrap();
+        assert_eq!(config.jwt_issuer.len(), 2);
+
+        let first = &config.jwt_issuer[0];
+        assert_eq!(first.audience.to_vec(), vec!["relay-client-id"]);
+        assert_eq!(first.jwks_uri, None);
+        assert_eq!(first.user_claim, "sub");
+        assert_eq!(first.algorithms, vec!["RS256", "ES256"]);
+        assert_eq!(first.leeway_seconds, 60);
+        assert_eq!(first.jwks_refresh_seconds, 3600);
+        assert_eq!(first.grant.len(), 1);
+
+        let second = &config.jwt_issuer[1];
+        assert_eq!(second.audience.to_vec(), vec!["a", "b"]);
+        assert_eq!(second.user_claim, "oid");
+        assert_eq!(second.grant[0].scope, "prefix:relay-1-:rw");
+    }
+
+    #[test]
+    fn test_jwt_issuer_requires_auth_key() {
+        let mut config: Config = toml::from_str(JWT_ISSUER_TOML).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("requires at least one [[auth]] key"),
+            "{}",
+            err
+        );
+
+        config.auth.push(AuthKeyConfig {
+            key_id: None,
+            private_key: Some("dGhpcy1pcy1leGFjdGx5LTMyLWJ5dGVzLWZvci10ZXN0".to_string()),
+            public_key: None,
+            allowed_token_types: default_allowed_token_types(),
+        });
+        config.validate().unwrap();
     }
 }

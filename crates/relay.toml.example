@@ -24,6 +24,32 @@ key_id = "relay_2025_10_23"
 public_key = "fbm9JLHrwPpST5HAYORTQR/i1VbZ1kdp2ZEy0XpMbf0="
 
 
+# ==== External JWT issuers (optional) ====
+# Accept JWTs from an OpenID Connect issuer alongside Relay's own tokens, and
+# map their claims to Relay scopes. Requires at least one [[auth]] key.
+# See specs/jwt-issuer-authentication.md.
+#
+# [[jwt_issuer]]
+# issuer = "https://login.example.com/tenant/v2.0"  # must equal the token's `iss`
+# audience = "relay-client-id"     # string or list; the token's `aud` must contain one
+# jwks_uri = "https://..."         # Optional; default: discovery at <issuer>/.well-known/openid-configuration
+# user_claim = "sub"               # Optional; claim used as the Relay user id
+# algorithms = ["RS256", "ES256"]  # Optional; HS* and "none" are refused
+# leeway_seconds = 60              # Optional; clock skew allowed for exp and nbf
+# jwks_refresh_seconds = 3600      # Optional; how often to refetch the keys
+#
+# [[jwt_issuer.grant]]
+# claim = "roles"                  # top-level claim: a string or an array of strings
+# contains = "Relay.Read"          # matches an equal string or an array member
+# scope = "prefix:<relay-id>-:r"   # any Relay scope. "server" gives the JWT full
+#                                  # admin access; only write one deliberately.
+#
+# [[jwt_issuer.grant]]
+# claim = "roles"
+# contains = "Relay.Write"
+# scope = "prefix:<relay-id>-:rw"
+
+
 # Storage backend configuration
 # NOTE: S3-compatible storage is required for attachment storage, and highly
 #       recommended for production use-cases.

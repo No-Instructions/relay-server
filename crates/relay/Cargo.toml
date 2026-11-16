@@ -44,6 +44,7 @@ tempfile = "3.8.1"
 
 [dev-dependencies]
 http = "1.1.0"
+jsonwebtoken = { version = "10.4.0", default-features = false, features = ["rust_crypto"] }
 tempfile = "3.8.1"
 tokio = { version = "1.29.1", features = ["test-util"] }
 tokio-tungstenite = "0.24.0"
