@@ -81,12 +81,34 @@ fn cbor_value_to_json_value(
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DocumentUpdatedEvent {
     pub doc_id: String,
+    /// Whoever caused this doc to be loaded, captured once at load time and
+    /// reported on every update for the doc's lifetime. A stand-in, not the
+    /// author of this update - prefer `writer`.
     pub user: Option<String>,
+    /// The authenticated connection that applied this update, from the yrs
+    /// origin its transaction was tagged with. Unlike `user` this is per
+    /// update, and it is the only identity available for a deletion: the
+    /// removed blocks record nothing about who removed them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer: Option<String>,
     pub metadata: BTreeMap<String, serde_json::Value>,
     #[serde(skip)] // Don't serialize the raw update data to JSON
     pub update: Option<Vec<u8>>,
     #[serde(skip)] // Internal use only: encoded snapshot after this update
     pub snapshot: Option<Vec<u8>>,
+    /// The whole document encoded as an update, post-change. Unlike
+    /// `snapshot` (a yrs Snapshot: state vector + delete set - a marker, not
+    /// content) this can be decoded back into a readable doc, which is what a
+    /// consumer needs to inspect content without touching the live doc's lock.
+    #[serde(skip)]
+    pub state: Option<Vec<u8>>,
+    /// Users whose content this update deleted, most removed first, as
+    /// (user, clock units). Empty when the update deleted nothing. Clock units
+    /// count operations rather than characters, so treat them as a ranking, not
+    /// a size. Only the update that performs a deletion can report this: the
+    /// removed items are gone from the document afterwards.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deleted_from: Vec<(String, u32)>,
 }
 
 impl DocumentUpdatedEvent {
@@ -95,15 +117,30 @@ impl DocumentUpdatedEvent {
         Self {
             doc_id,
             user: None,
+            writer: None,
             metadata: BTreeMap::new(),
             update: None,
             snapshot: None,
+            state: None,
+            deleted_from: Vec::new(),
         }
     }
 
     /// Builder method to add user
     pub fn with_user(mut self, user: String) -> Self {
         self.user = Some(user);
+        self
+    }
+
+    /// Builder method to record the connection that applied this update.
+    pub fn with_writer(mut self, writer: String) -> Self {
+        self.writer = Some(writer);
+        self
+    }
+
+    /// Builder method to record whose content this update removed.
+    pub fn with_deleted_from(mut self, deleted_from: Vec<(String, u32)>) -> Self {
+        self.deleted_from = deleted_from;
         self
     }
 
@@ -116,6 +153,12 @@ impl DocumentUpdatedEvent {
     /// Builder method to add encoded Yjs snapshot
     pub fn with_snapshot(mut self, snapshot: Vec<u8>) -> Self {
         self.snapshot = Some(snapshot);
+        self
+    }
+
+    /// Builder method to add the post-update document state
+    pub fn with_state(mut self, state: Vec<u8>) -> Self {
+        self.state = Some(state);
         self
     }
 
@@ -483,7 +526,7 @@ impl WebhookSender {
             Ok(response) => {
                 if response.status().is_success() {
                     metrics.record_webhook_request(&config.prefix, "success", duration);
-                    info!(
+                    debug!(
                         "Webhook sent successfully for event {} (channel {}) to prefix '{}'",
                         envelope.event_id, envelope.channel, config.prefix
                     );
@@ -542,6 +585,12 @@ pub struct DebouncedSyncProtocolEventSender {
 struct UserEventQueue {
     pending_updates: Arc<tokio::sync::Mutex<Vec<Vec<u8>>>>,
     base_event: Arc<tokio::sync::Mutex<Option<EventEnvelope>>>,
+    /// Attribution accumulated across the debounce window. The base event is
+    /// whichever arrived first, so anything that only some updates carry has to
+    /// be collected here or it is lost when they are merged - a deletion
+    /// following an insertion inside one window being the case that matters.
+    pending_writer: Arc<tokio::sync::Mutex<Option<String>>>,
+    pending_deleted_from: Arc<tokio::sync::Mutex<Vec<(String, u32)>>>,
     last_sent: Arc<tokio::sync::Mutex<Option<tokio::time::Instant>>>,
     debounce_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
@@ -551,6 +600,8 @@ impl UserEventQueue {
         Self {
             pending_updates: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             base_event: Arc::new(tokio::sync::Mutex::new(None)),
+            pending_writer: Arc::new(tokio::sync::Mutex::new(None)),
+            pending_deleted_from: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             last_sent: Arc::new(tokio::sync::Mutex::new(None)),
             debounce_handle: Arc::new(tokio::sync::Mutex::new(None)),
         }
@@ -668,6 +719,22 @@ impl DebouncedSyncProtocolEventSender {
                 let mut pending_updates = queue.pending_updates.lock().await;
                 pending_updates.push(update);
             }
+
+            // Carry attribution forward even when this event is not the base:
+            // a window that begins with an insertion and ends with a deletion
+            // would otherwise report the insertion's (absent) attribution.
+            if let Some(writer) = envelope.event.writer.as_ref() {
+                *queue.pending_writer.lock().await = Some(writer.clone());
+            }
+            if !envelope.event.deleted_from.is_empty() {
+                let mut deleted = queue.pending_deleted_from.lock().await;
+                for (user, span) in &envelope.event.deleted_from {
+                    match deleted.iter_mut().find(|(existing, _)| existing == user) {
+                        Some((_, total)) => *total = total.saturating_add(*span),
+                        None => deleted.push((user.clone(), *span)),
+                    }
+                }
+            }
         }
 
         // Check if we can send immediately (rate limit allows it)
@@ -722,8 +789,22 @@ impl DebouncedSyncProtocolEventSender {
             let mut base_event = queue.base_event.lock().await;
             let mut pending_updates = queue.pending_updates.lock().await;
 
-            let event = base_event.take();
+            let mut event = base_event.take();
             let updates = std::mem::take(&mut *pending_updates);
+
+            // Attribution belongs to whichever update in the window carried it,
+            // not to the one that happened to open the window.
+            let writer = queue.pending_writer.lock().await.take();
+            let deleted_from = std::mem::take(&mut *queue.pending_deleted_from.lock().await);
+            if let Some(event) = event.as_mut() {
+                if writer.is_some() {
+                    event.event.writer = writer;
+                }
+                if !deleted_from.is_empty() {
+                    event.event.deleted_from = deleted_from;
+                }
+            }
+
             (event, updates)
         };
 
@@ -882,6 +963,8 @@ impl SyncProtocolEventSender {
             user,
             metadata,
             update: envelope.event.update.clone(),
+            writer: envelope.event.writer.clone(),
+            deleted_from: envelope.event.deleted_from.clone(),
         })
     }
 }
@@ -1368,5 +1451,117 @@ mod tests {
                 "subdocs index must not leak into event payloads"
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod writer_vs_user_tests {
+    use super::*;
+
+    /// `user` is captured once when a doc loads, so it names whoever caused the
+    /// load - not the author of any later update. `writer` is per update. They
+    /// must stay separate: collapsing them is what made a deletion look like it
+    /// came from whoever opened the doc first.
+    #[test]
+    fn test_writer_and_user_are_independent() {
+        let event = DocumentUpdatedEvent::new("doc".to_string())
+            .with_user("first-loader".to_string())
+            .with_writer("actual-deleter".to_string());
+
+        assert_eq!(event.user.as_deref(), Some("first-loader"));
+        assert_eq!(event.writer.as_deref(), Some("actual-deleter"));
+    }
+
+    #[test]
+    fn test_writer_reaches_the_webhook_payload() {
+        let event = DocumentUpdatedEvent::new("doc".to_string())
+            .with_writer("actual-deleter".to_string())
+            .with_deleted_from(vec![("victim".to_string(), 20)]);
+        let payload: WebhookPayload = EventEnvelope::new("chan".to_string(), event).into();
+
+        assert_eq!(payload.payload["writer"], "actual-deleter");
+        assert_eq!(payload.payload["deleted_from"][0][0], "victim");
+    }
+
+    /// A doc that never had an authenticated writer must not invent one.
+    #[test]
+    fn test_absent_writer_is_omitted_entirely() {
+        let event = DocumentUpdatedEvent::new("doc".to_string());
+        let payload: WebhookPayload = EventEnvelope::new("chan".to_string(), event).into();
+
+        assert!(payload.payload.get("writer").is_none());
+    }
+}
+
+#[cfg(test)]
+mod debounce_attribution_tests {
+    use super::*;
+
+    fn envelope(writer: Option<&str>, deleted: Vec<(String, u32)>, update: &[u8]) -> EventEnvelope {
+        let mut event = DocumentUpdatedEvent::new("doc-1".to_string()).with_update(update.to_vec());
+        if let Some(w) = writer {
+            event = event.with_writer(w.to_string());
+        }
+        event.deleted_from = deleted;
+        EventEnvelope::new("chan".to_string(), event)
+    }
+
+    /// The window's base event is whichever arrived first, and only its update
+    /// bytes are merged. Typing a line and then deleting one inside the same
+    /// window put the insertion first, so the deletion's attribution was
+    /// dropped - which is why deletions kept committing as the sync bot even
+    /// once the server was resolving the deleter correctly.
+    #[tokio::test]
+    async fn test_a_deletion_after_an_insertion_keeps_its_attribution() {
+        let sender = DebouncedSyncProtocolEventSender::new(
+            Arc::new(SyncProtocolEventSender::new()),
+            RelayMetrics::new_for_test().unwrap(),
+        );
+        let queue = sender.get_or_create_queue("doc-1", None).await;
+
+        // Pretend the window is already open, so neither event sends immediately.
+        *queue.last_sent.lock().await = Some(tokio::time::Instant::now());
+
+        sender.queue_event(envelope(None, vec![], &[1, 2])).await;
+        sender
+            .queue_event(envelope(
+                Some("the-deleter"),
+                vec![("the-victim".to_string(), 20)],
+                &[3, 4],
+            ))
+            .await;
+
+        assert_eq!(
+            queue.pending_writer.lock().await.as_deref(),
+            Some("the-deleter"),
+            "the deleter must survive a window opened by an insertion"
+        );
+        assert_eq!(
+            *queue.pending_deleted_from.lock().await,
+            vec![("the-victim".to_string(), 20)]
+        );
+    }
+
+    /// Two deletions in one window report the total per victim, not only the last.
+    #[tokio::test]
+    async fn test_deletions_in_one_window_accumulate_per_victim() {
+        let sender = DebouncedSyncProtocolEventSender::new(
+            Arc::new(SyncProtocolEventSender::new()),
+            RelayMetrics::new_for_test().unwrap(),
+        );
+        let queue = sender.get_or_create_queue("doc-1", None).await;
+        *queue.last_sent.lock().await = Some(tokio::time::Instant::now());
+
+        sender
+            .queue_event(envelope(Some("d"), vec![("victim".to_string(), 20)], &[1]))
+            .await;
+        sender
+            .queue_event(envelope(Some("d"), vec![("victim".to_string(), 5)], &[2]))
+            .await;
+
+        assert_eq!(
+            *queue.pending_deleted_from.lock().await,
+            vec![("victim".to_string(), 25)]
+        );
     }
 }
