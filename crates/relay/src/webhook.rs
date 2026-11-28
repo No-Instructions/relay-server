@@ -9,9 +9,8 @@ pub fn load_webhook_configs() -> Option<Vec<WebhookConfig>> {
     let config_json = env::var("RELAY_SERVER_WEBHOOK_CONFIG").ok()?;
 
     let configs: Vec<WebhookConfig> = serde_json::from_str(&config_json)
-        .map_err(|e| {
-            tracing::error!("Failed to parse webhook config: {}", e);
-            e
+        .map_err(|_| {
+            tracing::error!("Invalid RELAY_SERVER_WEBHOOK_CONFIG: expected a JSON array of webhook objects");
         })
         .ok()?;
 
