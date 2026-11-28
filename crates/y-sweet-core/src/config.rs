@@ -235,8 +235,10 @@ static ENV_OVERRIDES: &[EnvOverride] = &[
         config_path: "webhooks",
         log_value: log_webhooks,
         apply: |config, value| {
-            let webhooks: Vec<CoreWebhookConfig> = serde_json::from_str(value).map_err(|e| {
-                ConfigError::InvalidConfiguration(format!("Invalid webhook config JSON: {}", e))
+            let webhooks: Vec<CoreWebhookConfig> = serde_json::from_str(value).map_err(|_| {
+                ConfigError::InvalidConfiguration(
+                    "Invalid RELAY_SERVER_WEBHOOK_CONFIG: expected a JSON array of webhook objects".to_string(),
+                )
             })?;
             config.webhooks = webhooks;
             Ok(())
@@ -419,11 +421,10 @@ fn parse_auth_env_value(value: &str) -> Result<(String, Vec<TokenType>), ConfigE
                     "document" => token_types.push(TokenType::Document),
                     "file" => token_types.push(TokenType::File),
                     "prefix" => token_types.push(TokenType::Prefix),
-                    other => {
-                        return Err(ConfigError::InvalidConfiguration(format!(
-                            "Unknown token type '{}' in RELAY_SERVER_AUTH scope. Valid types: server, document, file, prefix",
-                            other
-                        )));
+                    _ => {
+                        return Err(ConfigError::InvalidConfiguration(
+                            "Unknown token type in RELAY_SERVER_AUTH scope. Valid types: server, document, file, prefix".to_string(),
+                        ));
                     }
                 }
             }
